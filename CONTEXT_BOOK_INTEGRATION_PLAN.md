@@ -48,6 +48,10 @@ Repository: `zeroclaw`
 5. 인증 정보(access/refresh token, bootstrap secret)는 cache DB에 직접 저장하지 않고 기존 `auth` / `security::SecretStore` 경로를 재사용한다.
 6. worker와 tool이 공유하는 장수명 상태는 `Arc<RwLock<_>>` handle 패턴으로 주입한다.
 7. LLM wake-up은 기본 비활성(sync-only)로 유지한다.
+8. 현재 daemon shutdown 경로는 supervisor task를 `abort()`하는 구조이므로, graceful disconnect가 필요하면 `context_book`만의 우회 구현이 아니라 daemon 공통 종료 신호 계약(`CancellationToken` 또는 동등한 cooperative stop signal)을 먼저 정의한다.
+9. 현재 health registry는 일반 component 상태(`status`, `last_ok`, `last_error`, `restart_count`)만 제공하므로, Context Book의 상세 freshness/last_sync/connection_state는 health schema 확장 또는 `doctor`의 store/runtime snapshot 직접 조회 중 하나를 명시적으로 선택해 노출한다.
+10. persisted config schema는 기존 관례대로 `src/config/schema.rs`가 source of truth이며, `src/context_book/config.rs`는 별도 직렬화 루트가 아니라 runtime resolution/validation helper로 한정한다.
+11. auth 재사용은 "토큰 저장소 재사용"과 "refresh 책임 재사용"을 구분해서 설계한다. 일반 bearer token 조회는 기존 `AuthService`를 우선 활용하되, refresh가 필요한 경우 Context Book 전용 auth profile kind를 `AuthService`에 추가할지, `context_book::client`가 refresh protocol을 소유할지 명시한다.
 
 ## 5. Requirement Mapping (User Req 1~6)
 
@@ -84,7 +88,7 @@ Repository: `zeroclaw`
 
 `src/context_book/`
 - `mod.rs`: 공개 API 및 wiring
-- `config.rs`: Context Book 전용 설정 모델/검증
+- `config.rs`: persisted schema 정의가 아니라, `src/config/schema.rs`의 `ContextBookConfig`를 바탕으로 한 runtime resolution/validation helper
 - `handle.rs`: worker/tool/service 공유 상태 handle (`Arc<RwLock<_>>`)
 - `client.rs`: REST+SSE 클라이언트, 인증/리프레시/재시도
 - `events.rs`: 이벤트 파싱/분류(control/data/heartbeat)
@@ -106,6 +110,11 @@ Repository: `zeroclaw`
 - daemon 시작 메시지와 state snapshot의 component 목록에도 `context_book` 반영
 - shutdown 시 worker abort만 하지 말고 가능하면 best-effort graceful disconnect / lifecycle update 수행
 - `doctor` 진단에서 `context_book`의 freshness / last sync / connection error surface를 확인 가능하게 함
+- 이를 위해 Phase 2 전에 daemon 공통 종료 시그널 경로(`CancellationToken`, oneshot stop channel, 또는 동등한 cooperative shutdown 메커니즘)를 추가할지 여부를 먼저 확정한다
+- 또한 진단 노출 방식은 아래 둘 중 하나를 선택한다:
+  - health registry를 확장해 `context_book` 전용 상세 필드를 포함
+  - health는 일반 liveness만 유지하고, `doctor`는 `context_book` store/runtime snapshot을 직접 읽어 세부 진단
+- 첫 구현에서는 두 방식을 동시에 도입하지 않고 하나만 선택한다
 
 ### 6.3 Config Integration
 
@@ -130,6 +139,8 @@ Repository: `zeroclaw`
   - `agent_identity_override.display_name`
 
 설정 계약:
+- persisted serde/JsonSchema source of truth는 `src/config/schema.rs`의 `ContextBookConfig`이다
+- `src/context_book/config.rs`가 필요하다면 이는 endpoint resolution, identity resolution, auth selector resolution 같은 runtime helper만 담당한다
 - `agent_id`, `device_type`, `display_name`는 최상위에 흩뿌리지 말고 `agent_identity_override` 같은 명시적 하위 블록으로 묶는다.
 - identity 우선순위는 `manual override > workspace/profile 기반 값 > 안정적인 기본값`으로 고정한다.
 - 기존 ZeroClaw `identity` / workspace 개념과 충돌하지 않도록 "Context Book에 보고하는 런타임 식별자"와 "에이전트 페르소나/프롬프트 identity"를 분리한다.
@@ -174,6 +185,7 @@ Repository: `zeroclaw`
 주의:
 - heartbeat comment / bootstrap keepalive는 저장하지 않는다.
 - 메모리 테이블과 분리한다.
+- 기존 `memory::SqliteMemory::new_named()`를 재사용하지 않는다. 해당 구현은 `workspace/memory/*.db`와 memory schema를 전제로 하므로, Context Book은 별도 경로와 별도 schema를 갖는 독립 store를 구현한다.
 - access/refresh token은 여기에 저장하지 않는다. 자격 증명은 기존 `auth` / `SecretStore`에 저장하고, cache DB에는 식별자/커서/상태만 둔다.
 - `event dedup + snapshot upsert + cursor commit`은 하나의 transaction 경계 안에서 처리한다.
 - SQLite는 WAL 모드와 명시적 schema init을 사용하고, worker/tool 동시 접근을 전제로 lock contention을 줄인다.
@@ -189,7 +201,12 @@ Repository: `zeroclaw`
 - `404 AGENT_NOT_REGISTERED` 시 `POST /bootstrap/register/init`
 - 필요 시 request-scoped wait(`status` 또는 `watch`) 후 `complete`
 - 토큰 획득 후 `PATCH /agents/{agentId}/status` -> `Active`
-- 토큰 저장/갱신은 기존 auth/secrets 계층에서 수행하고, worker는 auth service를 통해 bearer token을 조회한다
+- 토큰 저장은 기존 auth/secrets 계층을 재사용한다
+- bearer token 조회는 기존 `AuthService` 경로를 우선 사용한다
+- refresh 책임은 구현 전에 명시적으로 둘 중 하나를 선택한다:
+  - `AuthService`에 Context Book용 profile kind/refresh 로직 추가
+  - `context_book::client`가 refresh protocol을 소유하되, 저장은 기존 auth/secrets 계층에 위임
+- 어떤 방식을 택하든 cache DB에는 token/refresh_token/bootstrap secret을 저장하지 않는다
 
 3. Runtime SSE
 - `GET /events/stream?agentId=...`
@@ -218,6 +235,7 @@ Repository: `zeroclaw`
 - daemon worker skeleton + health integration + doctor surface
 - no-op SSE loop/diagnostics 먼저 통과
 - shared handle/wiring 규약 확정
+- graceful shutdown, doctor 상세 노출, auth refresh 책임 중 무엇을 어디서 소유하는지 계약을 먼저 문서에 고정
 - config default / serde round-trip 테스트 추가
 
 ### Phase 2 (Connectivity)
@@ -278,6 +296,10 @@ Repository: `zeroclaw`
 
 ## 10. Risk & Mitigation
 
+리스크 티어:
+- **High risk**
+- 이유: 장수명 네트워크 worker, daemon supervisor 변경, tool registry 확장, auth/secrets 연동, 외부 상태 동기화가 함께 포함됨
+
 리스크:
 - SSE 재연결/커서 경계 버그로 중복 처리 가능
 - subscription 의도 손실
@@ -285,6 +307,9 @@ Repository: `zeroclaw`
 - memory 오염(요구사항 3 위반)
 - tool/worker shared state 경계 불명확으로 stale state 또는 multi-client 누수 발생 가능
 - SQLite write contention으로 partial sync / cursor commit skew 가능
+- daemon abort 기반 종료로 graceful disconnect 불능
+- health/doctor 진단 경계가 모호해 잘못된 정상 판정 또는 stale 판정 가능
+- auth 재사용 범위가 불명확해 token refresh 책임 중복 또는 누락 가능
 
 완화:
 - dedup + idempotent upsert
@@ -293,6 +318,9 @@ Repository: `zeroclaw`
 - context_book cache와 memory 경로 물리 분리
 - auth/secrets 재사용으로 credential 저장 중복 제거
 - handle pattern + explicit transaction boundary + WAL 사용
+- cooperative shutdown contract 명시 후 구현
+- health와 doctor의 역할 분리를 먼저 고정
+- auth 저장/조회/refresh 책임을 한 계층에만 두고 중복 구현 금지
 
 ## 11. Scope Control
 
@@ -302,6 +330,7 @@ Repository: `zeroclaw`
 - 기존 memory backend 구조 변경
 - host live forwarding 기본 활성화
 - tool execution context 전면 개편(`ClientId` 도입 자체)은 이번 작업 범위에서 제외
+- 범용 daemon framework 대수술은 제외하되, `context_book` graceful shutdown에 필수적인 최소한의 cooperative stop signal 추가는 범위에 포함
 
 ## 12. Documentation & Contract Update
 
@@ -327,6 +356,6 @@ Repository: `zeroclaw`
 
 1. 이 문서(`CONTEXT_BOOK_INTEGRATION_PLAN.md`) 확인
 2. `Phase 1`부터 순차 구현
-3. 구현 전에 `auth/secrets 재사용`, `shared handle`, `identity precedence` 세 항목이 코드 구조에 반영되는지 먼저 확인
+3. 구현 전에 `auth/secrets 재사용`, `shared handle`, `identity precedence`, `graceful shutdown 계약`, `doctor/health 경계` 다섯 항목이 코드 구조에 반영되는지 먼저 확인
 4. 각 Phase 종료 시 체크리스트와 테스트 결과 업데이트
 5. 변경된 파일/동작/리스크를 문서에 즉시 반영

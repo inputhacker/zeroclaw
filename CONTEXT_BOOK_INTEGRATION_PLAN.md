@@ -24,6 +24,10 @@ Repository: `zeroclaw`
 5. `ctxbk/docs/CONTEXT_BOOK_DISCOVERY_SPEC.md` (discovery 사용 시)
 6. `ctxbk/docs/EXTERNAL_AGENT_SSE_ADAPTER_TASKS.md` (task skeleton)
 
+전제:
+- Phase 2 이상 구현에 들어가기 전에 위 `ctxbk/docs/*` 문서가 현재 작업 트리 또는 팀이 합의한 참조 경로에서 실제로 접근 가능해야 한다.
+- spec 원문 접근 경로가 없는 상태에서는 네트워크/protocol 세부 구현을 진행하지 않는다.
+
 ## 3. Non-Negotiable Contract Requirements
 
 - `lifecycleState`와 `connectionState`를 분리 처리
@@ -52,6 +56,10 @@ Repository: `zeroclaw`
 9. 현재 health registry는 일반 component 상태(`status`, `last_ok`, `last_error`, `restart_count`)만 제공하므로, Context Book의 상세 freshness/last_sync/connection_state는 health schema 확장 또는 `doctor`의 store/runtime snapshot 직접 조회 중 하나를 명시적으로 선택해 노출한다.
 10. persisted config schema는 기존 관례대로 `src/config/schema.rs`가 source of truth이며, `src/context_book/config.rs`는 별도 직렬화 루트가 아니라 runtime resolution/validation helper로 한정한다.
 11. auth 재사용은 "토큰 저장소 재사용"과 "refresh 책임 재사용"을 구분해서 설계한다. 일반 bearer token 조회는 기존 `AuthService`를 우선 활용하되, refresh가 필요한 경우 Context Book 전용 auth profile kind를 `AuthService`에 추가할지, `context_book::client`가 refresh protocol을 소유할지 명시한다.
+12. `ContextBookHandle`과 로컬 store/service 상태는 process-scoped singleton으로 생성하고, daemon/agent/tool 경로에 주입한다. tool이 자체적으로 별도 worker/store/client를 lazy-init하는 패턴은 금지한다.
+13. 장수명 subscription worker의 소유권은 daemon에 둔다. daemon이 없는 one-shot CLI/isolated agent 경로는 기본적으로 service-only 모드로 동작하며, on-demand read/write는 허용하되 SSE subscription loop를 자동 기동하지 않는다.
+14. 일반 사용자 요청에 대한 Context Book 활용은 Phase 1~5 기본 정책으로 "명시적 tool 호출"에 한정한다. 일반 chat turn의 system prompt / reference block 자동 주입은 별도 평가 전까지 도입하지 않는다.
+15. `context_book::client`는 기존 ZeroClaw의 runtime proxy/egress 정책을 따라야 하며, 별도 우회 네트워크 경로를 만들지 않는다. outbound endpoint 검증은 connect/discovery 직후, 실제 I/O 전에 수행한다.
 
 ## 5. Requirement Mapping (User Req 1~6)
 
@@ -101,6 +109,8 @@ Repository: `zeroclaw`
 - `Tool` 구현체는 직접 전역 상태를 만들지 않고 `ContextBookHandle`을 생성자 인자로 받는다.
 - worker가 수집한 최신 runtime 상태(연결 상태, 마지막 sync 시각, 캐시 freshness)는 handle과 store를 통해 tool/doctor 경로에 노출한다.
 - 필요 이상으로 새로운 trait를 만들지 말고, 실제 재사용 지점이 생길 때만 추상화한다.
+- `ContextBookHandle` 생성 책임은 app bootstrap/wiring 레이어에 두고, `all_tools_with_runtime(...)`, daemon worker, 관련 service가 같은 handle/store를 공유한다.
+- handle이 없다고 해서 tool 내부에서 새로운 worker/store를 만들지 않는다. handle 미주입 경로는 명시적으로 unavailable/read-only degraded 모드로 처리한다.
 
 ### 6.2 Daemon Integration
 
@@ -110,6 +120,7 @@ Repository: `zeroclaw`
 - daemon 시작 메시지와 state snapshot의 component 목록에도 `context_book` 반영
 - shutdown 시 worker abort만 하지 말고 가능하면 best-effort graceful disconnect / lifecycle update 수행
 - `doctor` 진단에서 `context_book`의 freshness / last sync / connection error surface를 확인 가능하게 함
+- `context_book` SSE/poll worker는 daemon supervisor가 소유하는 유일한 장수명 subscription owner로 정의한다
 - 이를 위해 Phase 2 전에 daemon 공통 종료 시그널 경로(`CancellationToken`, oneshot stop channel, 또는 동등한 cooperative shutdown 메커니즘)를 추가할지 여부를 먼저 확정한다
 - 또한 진단 노출 방식은 아래 둘 중 하나를 선택한다:
   - health registry를 확장해 `context_book` 전용 상세 필드를 포함
@@ -134,6 +145,8 @@ Repository: `zeroclaw`
   - `cursor_not_found_policy` (`reset|fail`)
   - `bootstrap_secret_env_key` (default `CONTEXT_BOOK_BOOTSTRAP_SECRET`)
   - `auth_profile` 또는 동등한 credential selector
+  - `allowed_hosts` (default `[]`; 빈 값은 명시적으로 비활성 상태로 간주하거나 manual/discovery 성공 전 validation 단계에서 실패 처리)
+  - `allow_private_hosts` (default `false`)
   - `agent_identity_override.agent_id`
   - `agent_identity_override.device_type`
   - `agent_identity_override.display_name`
@@ -145,6 +158,8 @@ Repository: `zeroclaw`
 - identity 우선순위는 `manual override > workspace/profile 기반 값 > 안정적인 기본값`으로 고정한다.
 - 기존 ZeroClaw `identity` / workspace 개념과 충돌하지 않도록 "Context Book에 보고하는 런타임 식별자"와 "에이전트 페르소나/프롬프트 identity"를 분리한다.
 - config 키 추가 시 `Default`, serde round-trip, 최소/기본 config 호환성, 문서화 범위를 계획에 포함한다.
+- `allowed_hosts` / `allow_private_hosts`는 tool 계층 밖에서 동작하는 장수명 client에도 동일한 outbound 검증을 적용하기 위한 최소 계약으로 사용한다.
+- proxy는 새 config 키를 만들지 않고 기존 runtime proxy 설정을 재사용한다. 필요하면 proxy service selector에 `context_book` 전용 key를 추가해 기존 `build_runtime_proxy_client*` 경로로 통합한다.
 
 ### 6.4 Tool Integration
 
@@ -168,6 +183,8 @@ Repository: `zeroclaw`
 - tool registration 시 `ContextBookHandle` + `ContextBookService`를 주입하고, 실행 시에는 가능한 한 blocking validation을 피한다
 - config 변경 또는 auth rotation 시 cached validation 상태를 무효화할 수 있어야 한다
 - tool 이름 수는 많으므로 Phase 1~2에서는 `status`, `subscriptions_get`, `contexts_query`, `votes_query` 중심으로 먼저 열고, 쓰기 계열은 연결/권한 계약이 안정화된 뒤 추가한다
+- 일반 user turn에서는 Context Book 데이터를 자동으로 프롬프트에 삽입하지 않고, `context_book_*` tool 또는 cron/heartbeat helper를 통해서만 참조한다.
+- daemon 외 실행 경로에서 tool은 공유 handle/service를 사용하되, background subscription worker를 암묵적으로 시작하지 않는다.
 
 ### 6.5 Data Persistence Strategy
 
@@ -192,6 +209,11 @@ Repository: `zeroclaw`
 - 대용량 원문 payload는 필요한 경우에만 `raw_json`으로 저장하고, size cap / pruning 정책을 둔다.
 
 ## 7. Runtime Flow (Direct REST+SSE)
+
+0. Outbound Policy Check
+- manual override 또는 discovery 결과 endpoint는 실제 connect 전에 host validation을 통과해야 한다
+- reqwest client는 기존 runtime proxy 경로를 사용한다
+- private/local endpoint 허용 여부는 `allow_private_hosts` 계약을 따른다
 
 1. Endpoint 결정
 - 우선순위: manual override > discovery > fallback(정책 허용 시)
@@ -235,7 +257,10 @@ Repository: `zeroclaw`
 - daemon worker skeleton + health integration + doctor surface
 - no-op SSE loop/diagnostics 먼저 통과
 - shared handle/wiring 규약 확정
+- bootstrap/ownership 계약 확정: daemon, `agent::run`, `AgentBuilder`, 기타 tool registry 생성 경로가 어떤 방식으로 동일 handle을 주입받는지 먼저 고정
+- non-daemon 경로는 service-only 모드이며 SSE worker auto-start 금지 규칙을 문서와 코드에 함께 반영
 - graceful shutdown, doctor 상세 노출, auth refresh 책임 중 무엇을 어디서 소유하는지 계약을 먼저 문서에 고정
+- outbound proxy/host validation 계약을 함께 고정
 - config default / serde round-trip 테스트 추가
 
 ### Phase 2 (Connectivity)
@@ -243,6 +268,7 @@ Repository: `zeroclaw`
 - polling fallback + `409 CURSOR_NOT_FOUND` 처리
 - auth/secrets 재사용 경로 연결
 - graceful shutdown / resume 계약 반영
+- runtime proxy + outbound host validation 경로 연결
 
 ### Phase 3 (Subscriptions + Read Path)
 - desired/effective subscription 관리
@@ -261,7 +287,8 @@ Repository: `zeroclaw`
 - 로컬+원격 context 기반 vote/cast 의사결정 헬퍼
 - heartbeat/cron에서 필요 시 참조하는 read helper 추가
 - memory 비침투 유지 검증
-- cron/heartbeat가 기존 memory recall과 별개로 Context Book reference block을 주입할지, 아니면 tool 조회로만 제한할지 명시
+- 기본 정책은 cron/heartbeat helper 또는 명시적 tool 조회로만 제한한다
+- 일반 user chat turn에 대한 자동 reference block/system prompt 주입은 이번 범위에서 제외한다
 
 ### Phase 6 (Conformance Tests + Hardening)
 - resume/dedup/disconnect/subscription persistence tests
@@ -306,10 +333,12 @@ Repository: `zeroclaw`
 - token/secret 로그 노출
 - memory 오염(요구사항 3 위반)
 - tool/worker shared state 경계 불명확으로 stale state 또는 multi-client 누수 발생 가능
+- tool registry가 여러 경로에서 생성되는 구조와 충돌해 중복 worker / 분리된 handle/store가 생길 수 있음
 - SQLite write contention으로 partial sync / cursor commit skew 가능
 - daemon abort 기반 종료로 graceful disconnect 불능
 - health/doctor 진단 경계가 모호해 잘못된 정상 판정 또는 stale 판정 가능
 - auth 재사용 범위가 불명확해 token refresh 책임 중복 또는 누락 가능
+- daemon 밖 장수명/온디맨드 client가 기존 proxy/egress 정책을 우회할 수 있음
 
 완화:
 - dedup + idempotent upsert
@@ -318,9 +347,11 @@ Repository: `zeroclaw`
 - context_book cache와 memory 경로 물리 분리
 - auth/secrets 재사용으로 credential 저장 중복 제거
 - handle pattern + explicit transaction boundary + WAL 사용
+- process-scoped singleton handle + daemon-only subscription ownership 고정
 - cooperative shutdown contract 명시 후 구현
 - health와 doctor의 역할 분리를 먼저 고정
 - auth 저장/조회/refresh 책임을 한 계층에만 두고 중복 구현 금지
+- 기존 runtime proxy + outbound host validation을 `context_book::client`에 강제
 
 ## 11. Scope Control
 
@@ -357,5 +388,6 @@ Repository: `zeroclaw`
 1. 이 문서(`CONTEXT_BOOK_INTEGRATION_PLAN.md`) 확인
 2. `Phase 1`부터 순차 구현
 3. 구현 전에 `auth/secrets 재사용`, `shared handle`, `identity precedence`, `graceful shutdown 계약`, `doctor/health 경계` 다섯 항목이 코드 구조에 반영되는지 먼저 확인
-4. 각 Phase 종료 시 체크리스트와 테스트 결과 업데이트
-5. 변경된 파일/동작/리스크를 문서에 즉시 반영
+4. 추가로 `daemon-only worker ownership`, `general user turn은 tool-only integration`, `outbound proxy/host validation`, `ctxbk spec 접근성` 네 항목을 먼저 확인
+5. 각 Phase 종료 시 체크리스트와 테스트 결과 업데이트
+6. 변경된 파일/동작/리스크를 문서에 즉시 반영

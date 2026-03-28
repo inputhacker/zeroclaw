@@ -36,6 +36,7 @@ Repository: `zeroclaw`
 - polling fallback은 SSE 불능 시에만 사용, 복구 즉시 중단
 - heartbeat/keepalive는 transport-only로 취급(비즈니스 이벤트로 저장/전달 금지)
 - `409 CURSOR_NOT_FOUND` 명시 처리(리플레이/커서 리셋 정책)
+- `POST /agents/connect`의 `403 BOOTSTRAP_APPROVAL_REQUIRED`는 기존 identity의 connect-side reapproval으로 처리하고, 같은 request의 wait/complete 흐름으로 이어간다
 - `desiredProducerAgentIds`와 `effectiveProducerAgentIds` 분리 유지
 - transient disconnect 시 desired subscription 의도 보존
 - `agent.connection.changed`, `vote.deleted` 명시 처리
@@ -56,6 +57,7 @@ Repository: `zeroclaw`
 9. 현재 health registry는 일반 component 상태(`status`, `last_ok`, `last_error`, `restart_count`)만 제공하므로, Context Book의 상세 freshness/last_sync/connection_state는 health schema 확장 또는 `doctor`의 store/runtime snapshot 직접 조회 중 하나를 명시적으로 선택해 노출한다.
 10. persisted config schema는 기존 관례대로 `src/config/schema.rs`가 source of truth이며, `src/context_book/config.rs`는 별도 직렬화 루트가 아니라 runtime resolution/validation helper로 한정한다.
 11. auth 재사용은 "토큰 저장소 재사용"과 "refresh 책임 재사용"을 구분해서 설계한다. 일반 bearer token 조회는 기존 `AuthService`를 우선 활용하되, refresh가 필요한 경우 Context Book 전용 auth profile kind를 `AuthService`에 추가할지, `context_book::client`가 refresh protocol을 소유할지 명시한다.
+   또한 refresh protocol 자체는 spec 기준으로 Authorization Server의 OAuth refresh grant(`POST /oauth2/token`)를 기본 계약으로 두고, 레거시 `POST /auth/refresh`는 명시적 호환 모드로만 취급할지 여부를 Phase 2 전에 고정한다.
 12. `ContextBookHandle`과 로컬 store/service 상태는 process-scoped singleton으로 생성하고, daemon/agent/tool 경로에 주입한다. tool이 자체적으로 별도 worker/store/client를 lazy-init하는 패턴은 금지한다.
 13. 장수명 subscription worker의 소유권은 daemon에 둔다. daemon이 없는 one-shot CLI/isolated agent 경로는 기본적으로 service-only 모드로 동작하며, on-demand read/write는 허용하되 SSE subscription loop를 자동 기동하지 않는다.
 14. 일반 사용자 요청에 대한 Context Book 활용은 Phase 1~5 기본 정책으로 "명시적 tool 호출"에 한정한다. 일반 chat turn의 system prompt / reference block 자동 주입은 별도 평가 전까지 도입하지 않는다.
@@ -220,6 +222,7 @@ Repository: `zeroclaw`
 
 2. Bootstrap / Connect
 - `POST /agents/connect` 우선
+- `403 BOOTSTRAP_APPROVAL_REQUIRED` + request-scoped wait metadata가 오면, 기존 identity에 대한 connect-side reapproval로 간주하고 `register/init`로 되돌아가지 않은 채 동일 request의 wait/complete 흐름을 이어간다
 - `404 AGENT_NOT_REGISTERED` 시 `POST /bootstrap/register/init`
 - 필요 시 request-scoped wait(`status` 또는 `watch`) 후 `complete`
 - 토큰 획득 후 `PATCH /agents/{agentId}/status` -> `Active`
@@ -228,7 +231,20 @@ Repository: `zeroclaw`
 - refresh 책임은 구현 전에 명시적으로 둘 중 하나를 선택한다:
   - `AuthService`에 Context Book용 profile kind/refresh 로직 추가
   - `context_book::client`가 refresh protocol을 소유하되, 저장은 기존 auth/secrets 계층에 위임
+- refresh endpoint/protocol 계약은 Phase 2 전에 문서로 고정한다:
+  - 기본값: Authorization Server의 OAuth refresh grant (`POST /oauth2/token`)
+  - 선택적 호환 모드: legacy `POST /auth/refresh`를 deployment capability가 명시된 경우에만 허용
 - 어떤 방식을 택하든 cache DB에는 token/refresh_token/bootstrap secret을 저장하지 않는다
+
+2.5 Post-Bootstrap Contract Validation
+- discovery 또는 manual endpoint로 연결한 뒤 full behavior를 켜기 전에 runtime API contract를 검증한다
+- 최소 확인 항목:
+  - `lifecycleState` / `connectionState` 분리 노출
+  - `desiredProducerAgentIds` / `effectiveProducerAgentIds` 동시 노출
+  - `agent.status.changed` 와 `agent.connection.changed` 구분
+  - `vote.deleted` 지원
+  - unknown resume cursor에 대한 `409 CURSOR_NOT_FOUND`
+- discovery metadata와 runtime behavior가 불일치하면 runtime behavior를 기준으로 판단하고, full feature enable 대신 degraded/read-only 또는 disconnect를 선택할 수 있어야 한다
 
 3. Runtime SSE
 - `GET /events/stream?agentId=...`
@@ -265,10 +281,13 @@ Repository: `zeroclaw`
 
 ### Phase 2 (Connectivity)
 - bootstrap/connect/refresh + SSE consume + dedup + cursor persistence
+- `connect`의 `403 BOOTSTRAP_APPROVAL_REQUIRED` reapproval flow 반영
 - polling fallback + `409 CURSOR_NOT_FOUND` 처리
 - auth/secrets 재사용 경로 연결
+- refresh endpoint/protocol 계약(`oauth2/token` 기본, legacy `/auth/refresh` 호환 여부) 구현 반영
 - graceful shutdown / resume 계약 반영
 - runtime proxy + outbound host validation 경로 연결
+- post-bootstrap contract validation 및 degraded 모드 결정 경로 연결
 
 ### Phase 3 (Subscriptions + Read Path)
 - desired/effective subscription 관리

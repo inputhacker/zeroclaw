@@ -7,7 +7,7 @@ use std::net::IpAddr;
 use std::path::PathBuf;
 
 #[allow(clippy::struct_excessive_bools)]
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ResolvedContextBookConfig {
     pub enabled: bool,
     pub manual_url: Option<String>,

@@ -135,6 +135,7 @@ impl ContextBookHandleState {
     }
 
     pub fn refresh_config(&self, config: Config, resolved: ResolvedContextBookConfig) {
+        let config_changed = *self.resolved.read() != resolved;
         {
             let mut current = self.source_config.write();
             *current = config;
@@ -157,6 +158,12 @@ impl ContextBookHandleState {
                 runtime.status_message = Some("context_book disabled in config".to_string());
             }
         });
+
+        if config_changed {
+            self.invalidate_contract(
+                "context_book config/auth selector changed; contract revalidation required",
+            );
+        }
     }
 
     pub fn store(&self) -> Arc<ContextBookStore> {
@@ -204,6 +211,31 @@ impl ContextBookHandleState {
             });
             if validation_state == ContextBookContractValidationState::Invalid {
                 runtime.last_error = Some(notes.join("; "));
+            }
+        });
+    }
+
+    pub fn invalidate_contract(&self, reason: impl Into<String>) {
+        let reason = reason.into();
+        {
+            let mut current = self.contract.write();
+            *current = ContextBookContractSnapshot {
+                validation_state: ContextBookContractValidationState::Unknown,
+                checked_at: None,
+                lifecycle_connection_split: None,
+                subscriptions_desired_effective_split: None,
+                cursor_not_found_returns_409: None,
+                vote_deleted_supported: None,
+                refresh_mode: ContextBookRefreshMode::Unknown,
+                degraded_modes: Vec::new(),
+                notes: vec![reason.clone()],
+            };
+        }
+
+        self.update_runtime(|runtime| {
+            if runtime.enabled {
+                runtime.status_message =
+                    Some("context_book contract revalidation required".to_string());
             }
         });
     }

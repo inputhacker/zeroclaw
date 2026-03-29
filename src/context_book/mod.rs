@@ -118,6 +118,17 @@ mod tests {
 
         let first = bootstrap(&config).handle;
         assert_eq!(first.resolved_config().manual_url, None);
+        first.apply_contract_snapshot(handle::ContextBookContractSnapshot {
+            validation_state: handle::ContextBookContractValidationState::Validated,
+            checked_at: Some("2026-03-29T00:00:00Z".into()),
+            lifecycle_connection_split: Some(true),
+            subscriptions_desired_effective_split: Some(true),
+            cursor_not_found_returns_409: Some(true),
+            vote_deleted_supported: Some(true),
+            refresh_mode: handle::ContextBookRefreshMode::LegacyAuthRefresh,
+            degraded_modes: Vec::new(),
+            notes: Vec::new(),
+        });
 
         config.context_book.manual_url = Some("https://context.example".into());
         config.context_book.allowed_hosts = vec!["context.example".into()];
@@ -128,6 +139,17 @@ mod tests {
         assert_eq!(
             second.resolved_config().manual_url.as_deref(),
             Some("https://context.example")
+        );
+        assert_eq!(
+            second.contract_snapshot().validation_state,
+            handle::ContextBookContractValidationState::Unknown
+        );
+        assert!(
+            second
+                .contract_snapshot()
+                .notes
+                .iter()
+                .any(|note| note.contains("revalidation required"))
         );
     }
 }

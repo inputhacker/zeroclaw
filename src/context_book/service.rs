@@ -4,8 +4,8 @@ use super::client::{
 };
 use super::config::ResolvedContextBookConfig;
 use super::handle::{
-    ContextBookContractSnapshot, ContextBookDegradedMode, ContextBookHandle,
-    ContextBookRuntimeSnapshot,
+    ContextBookContractSnapshot, ContextBookContractValidationState, ContextBookDegradedMode,
+    ContextBookHandle, ContextBookRuntimeSnapshot,
 };
 use super::policy::{
     ContextBookPolicyReadMode, ContextBookPolicyReference, ContextBookPolicySource,
@@ -224,7 +224,6 @@ impl ContextBookService {
         &self,
         desired_producer_agent_ids: &[String],
     ) -> Result<ContextBookSubscriptionsSnapshot> {
-        self.ensure_remote_writes_available("subscription writes")?;
         let (client, session) = self.write_client_and_session("subscriptions set").await?;
         let subscriptions = client
             .set_subscriptions(&session, desired_producer_agent_ids)
@@ -242,7 +241,6 @@ impl ContextBookService {
         &self,
         request: &ContextBookContextCreateRequest,
     ) -> Result<ContextBookContextSnapshot> {
-        self.ensure_remote_writes_available("context writes")?;
         let (client, session) = self.write_client_and_session("context create").await?;
         validate_context_create(&session.agent_id, request)?;
         let created = client
@@ -260,7 +258,6 @@ impl ContextBookService {
         context_id: &str,
         request: &ContextBookContextUpdateRequest,
     ) -> Result<ContextBookContextSnapshot> {
-        self.ensure_remote_writes_available("context writes")?;
         let (client, session) = self.write_client_and_session("context update").await?;
         validate_context_update(request)?;
         if let Some(cached) = self
@@ -287,7 +284,6 @@ impl ContextBookService {
     }
 
     pub async fn delete_context(&self, context_id: &str) -> Result<()> {
-        self.ensure_remote_writes_available("context writes")?;
         let (client, session) = self.write_client_and_session("context delete").await?;
         if let Some(cached) = self
             .handle
@@ -315,7 +311,6 @@ impl ContextBookService {
         &self,
         request: &ContextBookVoteCreateRequest,
     ) -> Result<ContextBookVoteSnapshot> {
-        self.ensure_remote_writes_available("vote writes")?;
         let (client, session) = self.write_client_and_session("vote create").await?;
         validate_vote_create(&session.agent_id, request)?;
         let created = client
@@ -333,7 +328,6 @@ impl ContextBookService {
         vote_id: &str,
         request: &ContextBookVoteUpdateRequest,
     ) -> Result<ContextBookVoteSnapshot> {
-        self.ensure_remote_writes_available("vote writes")?;
         let (client, session) = self.write_client_and_session("vote update").await?;
         let cached = self
             .handle
@@ -352,7 +346,6 @@ impl ContextBookService {
     }
 
     pub async fn delete_vote(&self, vote_id: &str) -> Result<()> {
-        self.ensure_remote_writes_available("vote writes")?;
         let (client, session) = self.write_client_and_session("vote delete").await?;
         if let Some(cached) = self
             .handle
@@ -381,7 +374,6 @@ impl ContextBookService {
         vote_id: &str,
         request: &ContextBookVoteCastRequest,
     ) -> Result<ContextBookVoteSnapshot> {
-        self.ensure_remote_writes_available("vote writes")?;
         let (client, session) = self.write_client_and_session("vote cast").await?;
         let cached = self
             .handle
@@ -437,7 +429,27 @@ impl ContextBookService {
             .await
             .map_err(anyhow::Error::new)
             .with_context(|| format!("failed to activate Context Book agent before {operation}"))?;
+        if self.contract_revalidation_required(&session.agent_id) {
+            let contract = client
+                .validate_runtime_contract(&session)
+                .await
+                .map_err(anyhow::Error::new)
+                .with_context(|| {
+                    format!("failed to revalidate Context Book contract before {operation}")
+                })?;
+            self.handle.apply_contract_snapshot(contract);
+        }
+        self.ensure_remote_writes_available(operation)?;
         Ok((client, session))
+    }
+
+    fn contract_revalidation_required(&self, session_agent_id: &str) -> bool {
+        let contract = self.handle.contract_snapshot();
+        if contract.validation_state == ContextBookContractValidationState::Unknown {
+            return true;
+        }
+
+        self.handle.snapshot().agent_id.as_deref() != Some(session_agent_id)
     }
 
     async fn sync_context_snapshot_with_fallback(
@@ -796,7 +808,7 @@ mod tests {
     use crate::auth::profiles::{AuthProfile, AuthProfileKind, AuthProfilesStore, profile_id};
     use crate::auth::state_dir_from_config;
     use crate::config::Config;
-    use crate::context_book::shared_handle;
+    use crate::context_book::{bootstrap, shared_handle};
     use crate::memory::traits::Memory;
     use axum::{
         Json, Router,
@@ -808,6 +820,7 @@ mod tests {
     use chrono::Utc;
     use serde_json::{Value, json};
     use std::collections::BTreeMap;
+    use std::sync::Arc;
     use tempfile::TempDir;
     use tokio::net::TcpListener;
 
@@ -855,24 +868,34 @@ mod tests {
     }
 
     async fn seed_token_profile(config: &Config, agent_id: &str) {
+        seed_named_token_profile(config, "default", "service-token", agent_id, true).await;
+    }
+
+    async fn seed_named_token_profile(
+        config: &Config,
+        profile_name: &str,
+        token: &str,
+        agent_id: &str,
+        set_active: bool,
+    ) {
         let state_dir = state_dir_from_config(config);
         let store = AuthProfilesStore::new(&state_dir, config.secrets.encrypt);
         store
             .upsert_profile(
                 AuthProfile {
-                    id: profile_id("context-book", "default"),
+                    id: profile_id("context-book", profile_name),
                     provider: "context-book".into(),
-                    profile_name: "default".into(),
+                    profile_name: profile_name.into(),
                     kind: AuthProfileKind::Token,
                     account_id: None,
                     workspace_id: None,
                     token_set: None,
-                    token: Some("service-token".into()),
+                    token: Some(token.into()),
                     metadata: BTreeMap::from([("agent_id".to_string(), agent_id.to_string())]),
                     created_at: Utc::now(),
                     updated_at: Utc::now(),
                 },
-                true,
+                set_active,
             )
             .await
             .expect("seed token profile");
@@ -1244,6 +1267,203 @@ mod tests {
 
         server.abort();
         let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn config_reload_and_auth_profile_rotation_revalidate_contract_before_writes() {
+        async fn stale_activate(AxumPath(agent_id): AxumPath<String>) -> impl IntoResponse {
+            assert_eq!(agent_id, "workspace-old");
+            StatusCode::NO_CONTENT
+        }
+
+        async fn stale_agents() -> impl IntoResponse {
+            Json(json!([
+                {
+                    "agentId": "workspace-old",
+                    "lifecycleState": "Active",
+                    "connectionState": "Disconnected"
+                }
+            ]))
+        }
+
+        async fn stale_subscriptions() -> impl IntoResponse {
+            Json(json!({
+                "consumerAgentId": "workspace-old",
+                "desiredProducerAgentIds": ["peer-a"]
+            }))
+        }
+
+        async fn events_probe() -> impl IntoResponse {
+            (
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "error": {
+                        "code": "CURSOR_NOT_FOUND",
+                        "message": "missing cursor"
+                    }
+                })),
+            )
+        }
+
+        async fn legacy_refresh() -> impl IntoResponse {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": {
+                        "code": "REFRESH_TOKEN_REQUIRED",
+                        "message": "missing refresh token"
+                    }
+                })),
+            )
+        }
+
+        let stale_app = Router::new()
+            .route("/agents/{agent_id}/status", patch(stale_activate))
+            .route("/agents", get(stale_agents))
+            .route("/subscriptions", get(stale_subscriptions))
+            .route("/events", get(events_probe))
+            .route("/auth/refresh", post(legacy_refresh));
+        let stale_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stale listener");
+        let stale_addr = stale_listener.local_addr().expect("stale local addr");
+        let stale_server = tokio::spawn(async move {
+            axum::serve(stale_listener, stale_app)
+                .await
+                .expect("serve stale axum");
+        });
+
+        async fn fresh_activate(AxumPath(agent_id): AxumPath<String>) -> impl IntoResponse {
+            assert_eq!(agent_id, "workspace-new");
+            StatusCode::NO_CONTENT
+        }
+
+        async fn fresh_agents() -> impl IntoResponse {
+            Json(json!([
+                {
+                    "agentId": "workspace-new",
+                    "lifecycleState": "Active",
+                    "connectionState": "Disconnected"
+                }
+            ]))
+        }
+
+        async fn fresh_subscriptions() -> impl IntoResponse {
+            Json(json!({
+                "consumerAgentId": "workspace-new",
+                "desiredProducerAgentIds": ["peer-a"],
+                "effectiveProducerAgentIds": ["peer-a"]
+            }))
+        }
+
+        async fn fresh_delete_vote_probe(AxumPath(vote_id): AxumPath<String>) -> impl IntoResponse {
+            assert_eq!(vote_id, "__zeroclaw_probe__");
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({
+                    "error": {
+                        "code": "VOTE_NOT_FOUND",
+                        "message": "missing vote"
+                    }
+                })),
+            )
+        }
+
+        async fn fresh_create_context(Json(body): Json<Value>) -> impl IntoResponse {
+            assert_eq!(body["contextId"], "workspace_new_ctx");
+            assert_eq!(body["title"], "Rotated");
+            Json(json!({
+                "contextId": "workspace_new_ctx",
+                "authorAgentId": "workspace-new",
+                "title": "Rotated",
+                "contents": "write after reload",
+                "tag": "ops",
+                "status": "Published",
+                "createdAt": "2026-03-29T00:00:00Z",
+                "updatedAt": "2026-03-29T00:00:00Z"
+            }))
+        }
+
+        let fresh_app = Router::new()
+            .route("/agents/{agent_id}/status", patch(fresh_activate))
+            .route("/agents", get(fresh_agents))
+            .route("/subscriptions", get(fresh_subscriptions))
+            .route("/events", get(events_probe))
+            .route("/votes/{vote_id}", delete(fresh_delete_vote_probe))
+            .route("/contexts", post(fresh_create_context))
+            .route("/auth/refresh", post(legacy_refresh));
+        let fresh_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fresh listener");
+        let fresh_addr = fresh_listener.local_addr().expect("fresh local addr");
+        let fresh_server = tokio::spawn(async move {
+            axum::serve(fresh_listener, fresh_app)
+                .await
+                .expect("serve fresh axum");
+        });
+
+        let tmp = TempDir::new().expect("temp dir");
+        let mut config = test_config(&tmp, format!("http://{stale_addr}"));
+        config.context_book.auth_profile = Some("primary".into());
+        seed_named_token_profile(&config, "primary", "primary-token", "workspace-old", true).await;
+        seed_named_token_profile(&config, "rotated", "rotated-token", "workspace-new", false).await;
+
+        let handle = shared_handle(&config);
+        let service = ContextBookService::new(handle.clone());
+        let first_error = service
+            .create_context(&ContextBookContextCreateRequest {
+                context_id: Some("workspace_old_ctx".into()),
+                title: "Should Fail".into(),
+                contents: "blocked by stale contract".into(),
+                tag: "ops".into(),
+                status: "Published".into(),
+            })
+            .await
+            .expect_err("stale contract should block writes");
+        assert!(first_error.to_string().contains("no-write/read-only"));
+        assert_eq!(
+            handle.contract_snapshot().validation_state,
+            ContextBookContractValidationState::Degraded
+        );
+        assert!(
+            handle
+                .contract_snapshot()
+                .degraded_modes
+                .contains(&ContextBookDegradedMode::NoWrite)
+        );
+
+        let mut reloaded = config.clone();
+        reloaded.context_book.manual_url = Some(format!("http://{fresh_addr}"));
+        reloaded.context_book.auth_profile = Some("rotated".into());
+        let refreshed = bootstrap(&reloaded).handle;
+        assert!(Arc::ptr_eq(&handle, &refreshed));
+        assert_eq!(
+            refreshed.contract_snapshot().validation_state,
+            ContextBookContractValidationState::Unknown
+        );
+
+        let reloaded_service = ContextBookService::new(refreshed.clone());
+        let created = reloaded_service
+            .create_context(&ContextBookContextCreateRequest {
+                context_id: Some("workspace_new_ctx".into()),
+                title: "Rotated".into(),
+                contents: "write after reload".into(),
+                tag: "ops".into(),
+                status: "Published".into(),
+            })
+            .await
+            .expect("write should succeed after reload");
+        assert_eq!(created.author_agent_id, "workspace-new");
+        assert_eq!(
+            refreshed.contract_snapshot().validation_state,
+            ContextBookContractValidationState::Validated
+        );
+        assert!(refreshed.contract_snapshot().degraded_modes.is_empty());
+
+        stale_server.abort();
+        let _ = stale_server.await;
+        fresh_server.abort();
+        let _ = fresh_server.await;
     }
 
     #[tokio::test]

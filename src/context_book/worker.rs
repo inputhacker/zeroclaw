@@ -15,7 +15,7 @@ const HEALTH_TICK_SECS: u64 = 30;
 const HEALTH_STALE_SECONDS: i64 = 120;
 
 pub async fn run(
-    config: Config,
+    _config: Config,
     handle: ContextBookHandle,
     shutdown: Option<CancellationToken>,
 ) -> Result<()> {
@@ -39,7 +39,6 @@ pub async fn run(
     persist_runtime_state(&handle)?;
     refresh_component_health(&handle);
 
-    let client = ContextBookClient::new(&config);
     let reconnect_backoff = handle.resolved_config().reconnect_backoff_ms.max(1);
     let max_backoff = handle
         .resolved_config()
@@ -55,6 +54,7 @@ pub async fn run(
                 () = token.cancelled() => {
                     handle.mark_shutdown_requested();
                     persist_runtime_state(&handle)?;
+                    let client = ContextBookClient::new(&handle.source_config());
                     if let Ok(session) = client.ensure_session().await {
                         if let Err(error) = client.mark_inactive(&session).await {
                             tracing::warn!("context_book graceful inactive transition failed: {error}");
@@ -71,7 +71,7 @@ pub async fn run(
             interval.tick().await;
         }
 
-        match connect_and_sync_once(&client, &handle, shutdown.as_ref()).await {
+        match connect_and_sync_once(&handle, shutdown.as_ref()).await {
             Ok(progressed) => {
                 backoff_ms = reconnect_backoff;
                 if !progressed {
@@ -165,10 +165,10 @@ fn age_seconds(value: &str) -> Option<i64> {
 }
 
 async fn connect_and_sync_once(
-    client: &ContextBookClient,
     handle: &ContextBookHandle,
     shutdown: Option<&CancellationToken>,
 ) -> Result<bool> {
+    let client = ContextBookClient::new(&handle.source_config());
     let session = client
         .ensure_session()
         .await
@@ -208,7 +208,7 @@ async fn connect_and_sync_once(
         Ok(response) => {
             handle.mark_stream_connected(&session.agent_id, "context_book SSE connected");
             persist_runtime_state(handle)?;
-            consume_sse_stream(response, client, &session, handle, shutdown).await?;
+            consume_sse_stream(response, &client, &session, handle, shutdown).await?;
             Ok(true)
         }
         Err(error) if error.kind == ContextBookClientErrorKind::CursorNotFound => {
@@ -219,7 +219,7 @@ async fn connect_and_sync_once(
                 .context("failed to persist cursor reset after CURSOR_NOT_FOUND")?;
             persist_runtime_state(handle)?;
             if handle.resolved_config().polling_fallback_enabled {
-                poll_once(client, &session, handle).await?;
+                poll_once(&client, &session, handle).await?;
                 return Ok(true);
             }
             Ok(false)
@@ -228,7 +228,7 @@ async fn connect_and_sync_once(
             if handle.resolved_config().polling_fallback_enabled {
                 handle.mark_retrying("context_book SSE unavailable; polling fallback active");
                 persist_runtime_state(handle)?;
-                poll_once(client, &session, handle).await?;
+                poll_once(&client, &session, handle).await?;
                 return Ok(true);
             }
             Err(anyhow::Error::new(error).context("failed to open Context Book SSE stream"))

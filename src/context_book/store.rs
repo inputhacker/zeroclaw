@@ -274,6 +274,19 @@ impl ContextBookStore {
         snapshot: &ContextBookRuntimeSnapshot,
         update: ContextBookEventSyncUpdate,
     ) -> Result<bool> {
+        self.apply_event_sync_inner(event, snapshot, update, |_| Ok(()))
+    }
+
+    fn apply_event_sync_inner<F>(
+        &self,
+        event: &ContextBookEventEnvelope,
+        snapshot: &ContextBookRuntimeSnapshot,
+        update: ContextBookEventSyncUpdate,
+        before_cursor_commit: F,
+    ) -> Result<bool>
+    where
+        F: FnOnce(&rusqlite::Transaction<'_>) -> Result<()>,
+    {
         self.initialize()?;
         self.with_connection(|conn| {
             let tx = conn.unchecked_transaction()?;
@@ -306,6 +319,7 @@ impl ContextBookStore {
                 if let Some(votes) = update.votes.as_ref() {
                     replace_votes_tx(&tx, votes)?;
                 }
+                before_cursor_commit(&tx)?;
                 tx.execute(
                     "INSERT INTO cb_cursor_state (
                          singleton, agent_id, last_event_id, cursor_generation,
@@ -1084,6 +1098,8 @@ fn normalize_agent_ids(values: &[String]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use std::thread;
     use tempfile::TempDir;
 
     #[test]
@@ -1314,5 +1330,138 @@ mod tests {
         assert_eq!(inventory.contexts.count, 1);
         assert_eq!(inventory.votes.count, 1);
         assert_eq!(inventory.agents.count, 1);
+    }
+
+    #[test]
+    fn apply_event_sync_rolls_back_snapshot_changes_when_transaction_fails() {
+        let tmp = TempDir::new().expect("temp dir");
+        let store = ContextBookStore::new(tmp.path().join("context_book").join("cache.db"));
+        let snapshot = ContextBookRuntimeSnapshot {
+            enabled: true,
+            owner_mode: "daemon_supervised".into(),
+            worker_state: "streaming".into(),
+            agent_id: Some("zc-agent".into()),
+            lifecycle_state: "active".into(),
+            connection_state: "connected".into(),
+            shutdown_requested: false,
+            status_message: Some("streaming".into()),
+            last_error: None,
+            last_status_at: "2026-03-29T00:00:00Z".into(),
+            last_event_id: Some("evt-prev".into()),
+            cursor_generation: 0,
+            last_connect_at: Some("2026-03-29T00:00:00Z".into()),
+            last_sync_at: Some("2026-03-29T00:00:01Z".into()),
+            cache_db_path: store.path().display().to_string(),
+            store_initialized: true,
+        };
+        store
+            .save_runtime_state(&snapshot)
+            .expect("seed runtime snapshot");
+        store
+            .save_contexts(&[ContextBookContextSnapshot {
+                context_id: "ctx-prev".into(),
+                author_agent_id: "peer".into(),
+                title: "Previous".into(),
+                contents: "old".into(),
+                tag: "ops".into(),
+                status: "Published".into(),
+                created_at: Some("2026-03-29T00:00:00Z".into()),
+                updated_at: Some("2026-03-29T00:00:00Z".into()),
+                raw_json: serde_json::json!({"contextId": "ctx-prev"}),
+                synced_at: "2026-03-29T00:00:00Z".into(),
+            }])
+            .expect("seed cached contexts");
+
+        let event = ContextBookEventEnvelope {
+            event_id: "evt-rollback".into(),
+            event_type: "context.updated".into(),
+            occurred_at: "2026-03-29T00:00:03Z".into(),
+            producer_agent_id: "peer".into(),
+            entity_id: "ctx-new".into(),
+            payload: serde_json::json!({}),
+            meta: serde_json::json!({}),
+        };
+        let update = ContextBookEventSyncUpdate {
+            contexts: Some(vec![ContextBookContextSnapshot {
+                context_id: "ctx-new".into(),
+                author_agent_id: "peer".into(),
+                title: "Replacement".into(),
+                contents: "new".into(),
+                tag: "ops".into(),
+                status: "Published".into(),
+                created_at: Some("2026-03-29T00:00:03Z".into()),
+                updated_at: Some("2026-03-29T00:00:03Z".into()),
+                raw_json: serde_json::json!({"contextId": "ctx-new"}),
+                synced_at: "2026-03-29T00:00:03Z".into(),
+            }]),
+            ..ContextBookEventSyncUpdate::default()
+        };
+
+        let error = store
+            .apply_event_sync_inner(&event, &snapshot, update, |_| {
+                anyhow::bail!("injected failure before cursor commit")
+            })
+            .expect_err("transaction should fail");
+        assert!(error.to_string().contains("injected failure"));
+        assert_eq!(store.seen_event_count().expect("seen event count"), 0);
+
+        let cached_contexts = store
+            .load_contexts()
+            .expect("load cached contexts")
+            .expect("cached contexts should remain");
+        assert_eq!(cached_contexts.items.len(), 1);
+        assert_eq!(cached_contexts.items[0].context_id, "ctx-prev");
+
+        let persisted = store
+            .load_runtime_state()
+            .expect("load runtime state")
+            .expect("persisted runtime state");
+        assert_eq!(persisted.last_event_id.as_deref(), Some("evt-prev"));
+    }
+
+    #[test]
+    fn store_handles_sqlite_write_contention_without_losing_updates() {
+        let tmp = TempDir::new().expect("temp dir");
+        let store = Arc::new(ContextBookStore::new(
+            tmp.path().join("context_book").join("cache.db"),
+        ));
+        store.initialize().expect("initialize store");
+
+        let locked_store = Arc::clone(&store);
+        let lock_holder = thread::spawn(move || {
+            locked_store
+                .with_connection(|conn| {
+                    conn.execute_batch("BEGIN IMMEDIATE")
+                        .context("begin immediate transaction")?;
+                    thread::sleep(Duration::from_millis(250));
+                    conn.execute_batch("COMMIT")
+                        .context("commit immediate transaction")?;
+                    Ok(())
+                })
+                .expect("hold write lock");
+        });
+
+        thread::sleep(Duration::from_millis(50));
+        store
+            .save_context_snapshot(&ContextBookContextSnapshot {
+                context_id: "ctx-contention".into(),
+                author_agent_id: "peer".into(),
+                title: "Contention".into(),
+                contents: "writer waited for busy timeout".into(),
+                tag: "ops".into(),
+                status: "Published".into(),
+                created_at: Some("2026-03-29T00:00:00Z".into()),
+                updated_at: Some("2026-03-29T00:00:00Z".into()),
+                raw_json: serde_json::json!({"contextId": "ctx-contention"}),
+                synced_at: "2026-03-29T00:00:00Z".into(),
+            })
+            .expect("save snapshot after contention");
+        lock_holder.join().expect("join lock holder");
+
+        let persisted = store
+            .load_context("ctx-contention")
+            .expect("load persisted context")
+            .expect("context should be persisted");
+        assert_eq!(persisted.title, "Contention");
     }
 }

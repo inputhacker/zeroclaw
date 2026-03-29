@@ -4,7 +4,10 @@ use super::handle::{
     ContextBookContractSnapshot, ContextBookContractValidationState, ContextBookDegradedMode,
     ContextBookRefreshMode,
 };
-use super::store::ContextBookSubscriptionsSnapshot;
+use super::store::{
+    ContextBookAgentSnapshot, ContextBookContextSnapshot, ContextBookSubscriptionsSnapshot,
+    ContextBookVoteSnapshot,
+};
 use crate::auth::profiles::{AuthProfileKind, AuthProfilesStore, TokenSet};
 use crate::auth::{AuthService, state_dir_from_config};
 use crate::config::Config;
@@ -103,14 +106,66 @@ struct TokenResponseAgent {
     agent_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct AgentStatusResponse {
     #[serde(default, alias = "agentId")]
     agent_id: String,
+    #[serde(default, alias = "deviceType")]
+    device_type: Option<String>,
+    #[serde(default, alias = "displayName")]
+    display_name: Option<String>,
     #[serde(default, alias = "lifecycleState")]
     lifecycle_state: Option<String>,
     #[serde(default, alias = "connectionState")]
     connection_state: Option<String>,
+    #[serde(default, alias = "lastSeenAt")]
+    last_seen_at: Option<String>,
+    #[serde(default, alias = "createdAt")]
+    created_at: Option<String>,
+    #[serde(default, alias = "updatedAt")]
+    updated_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ContextRecordResponse {
+    #[serde(default, alias = "contextId")]
+    context_id: String,
+    #[serde(default, alias = "authorAgentId")]
+    author_agent_id: String,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    contents: String,
+    #[serde(default)]
+    tag: String,
+    #[serde(default)]
+    status: String,
+    #[serde(default, alias = "createdAt")]
+    created_at: Option<String>,
+    #[serde(default, alias = "updatedAt")]
+    updated_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct VoteResponse {
+    #[serde(default, alias = "voteId")]
+    vote_id: String,
+    #[serde(default, alias = "ownerAgentId")]
+    owner_agent_id: String,
+    #[serde(default, alias = "voteScore")]
+    vote_score: f64,
+    #[serde(default, alias = "voteContext")]
+    vote_context: String,
+    #[serde(default, alias = "voterAgentIds")]
+    voter_agent_ids: Vec<String>,
+    #[serde(default, alias = "requiredScore")]
+    required_score: Option<i64>,
+    #[serde(default)]
+    executable: Option<bool>,
+    #[serde(default, alias = "createdAt")]
+    created_at: Option<String>,
+    #[serde(default, alias = "updatedAt")]
+    updated_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -405,6 +460,93 @@ impl ContextBookClient {
             .fetch_subscriptions_response(session)
             .await?
             .into_snapshot())
+    }
+
+    pub async fn get_agents(
+        &self,
+        session: &ContextBookSession,
+    ) -> Result<Vec<ContextBookAgentSnapshot>, ContextBookClientError> {
+        let url = session
+            .base_url
+            .join("agents")
+            .map_err(|error| self.contract_error(format!("invalid agents URL: {error}")))?;
+        let response = self
+            .http_client
+            .get(url)
+            .bearer_auth(&session.access_token)
+            .send()
+            .await
+            .map_err(|error| {
+                self.network_error(format!("failed to fetch Context Book agents: {error}"))
+            })?;
+        let response = self
+            .expect_success(response, "failed to fetch Context Book agents")
+            .await?;
+        let body = response.json::<Value>().await.map_err(|error| {
+            self.contract_error(format!(
+                "failed to parse Context Book agents response: {error}"
+            ))
+        })?;
+        parse_agent_snapshots(body)
+            .map_err(|error| self.contract_error(format!("invalid agents payload: {error}")))
+    }
+
+    pub async fn get_contexts(
+        &self,
+        session: &ContextBookSession,
+    ) -> Result<Vec<ContextBookContextSnapshot>, ContextBookClientError> {
+        let url = session
+            .base_url
+            .join("contexts")
+            .map_err(|error| self.contract_error(format!("invalid contexts URL: {error}")))?;
+        let response = self
+            .http_client
+            .get(url)
+            .bearer_auth(&session.access_token)
+            .send()
+            .await
+            .map_err(|error| {
+                self.network_error(format!("failed to fetch Context Book contexts: {error}"))
+            })?;
+        let response = self
+            .expect_success(response, "failed to fetch Context Book contexts")
+            .await?;
+        let body = response.json::<Value>().await.map_err(|error| {
+            self.contract_error(format!(
+                "failed to parse Context Book contexts response: {error}"
+            ))
+        })?;
+        parse_context_snapshots(body)
+            .map_err(|error| self.contract_error(format!("invalid contexts payload: {error}")))
+    }
+
+    pub async fn get_votes(
+        &self,
+        session: &ContextBookSession,
+    ) -> Result<Vec<ContextBookVoteSnapshot>, ContextBookClientError> {
+        let url = session
+            .base_url
+            .join("votes")
+            .map_err(|error| self.contract_error(format!("invalid votes URL: {error}")))?;
+        let response = self
+            .http_client
+            .get(url)
+            .bearer_auth(&session.access_token)
+            .send()
+            .await
+            .map_err(|error| {
+                self.network_error(format!("failed to fetch Context Book votes: {error}"))
+            })?;
+        let response = self
+            .expect_success(response, "failed to fetch Context Book votes")
+            .await?;
+        let body = response.json::<Value>().await.map_err(|error| {
+            self.contract_error(format!(
+                "failed to parse Context Book votes response: {error}"
+            ))
+        })?;
+        parse_vote_snapshots(body)
+            .map_err(|error| self.contract_error(format!("invalid votes payload: {error}")))
     }
 
     pub async fn set_subscriptions(
@@ -1381,6 +1523,92 @@ fn parse_agents_response(value: Value) -> anyhow::Result<Vec<ContextBookAgentSta
     anyhow::bail!("Context Book agents response did not contain a parseable agent list")
 }
 
+fn parse_agent_snapshots(value: Value) -> anyhow::Result<Vec<ContextBookAgentSnapshot>> {
+    let synced_at = Utc::now().to_rfc3339();
+    parse_list_response::<AgentStatusResponse>(value)?
+        .into_iter()
+        .map(|agent| {
+            let raw_json = serde_json::to_value(&agent)?;
+            Ok(ContextBookAgentSnapshot {
+                agent_id: agent.agent_id,
+                device_type: normalize_optional_string(agent.device_type.as_deref()),
+                display_name: normalize_optional_string(agent.display_name.as_deref()),
+                lifecycle_state: normalize_optional_string(agent.lifecycle_state.as_deref()),
+                connection_state: normalize_optional_string(agent.connection_state.as_deref()),
+                last_seen_at: normalize_optional_string(agent.last_seen_at.as_deref()),
+                created_at: normalize_optional_string(agent.created_at.as_deref()),
+                updated_at: normalize_optional_string(agent.updated_at.as_deref()),
+                raw_json,
+                synced_at: synced_at.clone(),
+            })
+        })
+        .collect()
+}
+
+fn parse_context_snapshots(value: Value) -> anyhow::Result<Vec<ContextBookContextSnapshot>> {
+    let synced_at = Utc::now().to_rfc3339();
+    parse_list_response::<ContextRecordResponse>(value)?
+        .into_iter()
+        .map(|context| {
+            let raw_json = serde_json::to_value(&context)?;
+            Ok(ContextBookContextSnapshot {
+                context_id: context.context_id,
+                author_agent_id: context.author_agent_id,
+                title: context.title,
+                contents: context.contents,
+                tag: context.tag,
+                status: context.status,
+                created_at: normalize_optional_string(context.created_at.as_deref()),
+                updated_at: normalize_optional_string(context.updated_at.as_deref()),
+                raw_json,
+                synced_at: synced_at.clone(),
+            })
+        })
+        .collect()
+}
+
+fn parse_vote_snapshots(value: Value) -> anyhow::Result<Vec<ContextBookVoteSnapshot>> {
+    let synced_at = Utc::now().to_rfc3339();
+    parse_list_response::<VoteResponse>(value)?
+        .into_iter()
+        .map(|vote| {
+            let raw_json = serde_json::to_value(&vote)?;
+            Ok(ContextBookVoteSnapshot {
+                vote_id: vote.vote_id,
+                owner_agent_id: vote.owner_agent_id,
+                vote_score: vote.vote_score,
+                vote_context: vote.vote_context,
+                voter_agent_ids: vote.voter_agent_ids,
+                required_score: vote.required_score,
+                executable: vote.executable,
+                created_at: normalize_optional_string(vote.created_at.as_deref()),
+                updated_at: normalize_optional_string(vote.updated_at.as_deref()),
+                raw_json,
+                synced_at: synced_at.clone(),
+            })
+        })
+        .collect()
+}
+
+fn parse_list_response<T>(value: Value) -> anyhow::Result<Vec<T>>
+where
+    T: serde::de::DeserializeOwned,
+{
+    if value.is_array() {
+        return Ok(serde_json::from_value(value)?);
+    }
+
+    if let Some(items) = value.get("items") {
+        return parse_list_response(items.clone());
+    }
+
+    if value.is_object() {
+        return Ok(vec![serde_json::from_value(value)?]);
+    }
+
+    anyhow::bail!("Context Book list response did not contain a parseable items array")
+}
+
 fn normalize_optional_string(value: Option<&str>) -> Option<String> {
     value
         .map(str::trim)
@@ -2021,6 +2249,24 @@ mod tests {
                 .map(|tokens| tokens.access_token.as_str()),
             Some(session.access_token.as_str())
         );
+
+        let agents = client.get_agents(&session).await.expect("live GET /agents");
+        let contexts = client
+            .get_contexts(&session)
+            .await
+            .expect("live GET /contexts");
+        let votes = client.get_votes(&session).await.expect("live GET /votes");
+        assert!(
+            agents
+                .iter()
+                .any(|agent| agent.agent_id == session.agent_id)
+        );
+        assert!(
+            contexts
+                .iter()
+                .all(|context| !context.context_id.trim().is_empty())
+        );
+        assert!(votes.iter().all(|vote| !vote.vote_id.trim().is_empty()));
     }
 
     #[tokio::test]

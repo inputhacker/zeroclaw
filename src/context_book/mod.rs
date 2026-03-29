@@ -21,7 +21,9 @@ pub use handle::{
 pub use service::{ContextBookService, ContextBookStatusReport};
 #[allow(unused_imports)]
 pub use store::{
-    ContextBookPersistedRuntimeState, ContextBookStore, ContextBookSubscriptionsSnapshot,
+    ContextBookAgentSnapshot, ContextBookCacheInventory, ContextBookCachedItems,
+    ContextBookContextSnapshot, ContextBookPersistedRuntimeState, ContextBookStore,
+    ContextBookSubscriptionsSnapshot, ContextBookVoteSnapshot,
 };
 
 use crate::config::Config;

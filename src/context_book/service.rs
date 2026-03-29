@@ -4,7 +4,11 @@ use super::handle::{
     ContextBookContractSnapshot, ContextBookDegradedMode, ContextBookHandle,
     ContextBookRuntimeSnapshot,
 };
-use super::store::{ContextBookPersistedRuntimeState, ContextBookSubscriptionsSnapshot};
+use super::store::{
+    ContextBookAgentSnapshot, ContextBookCacheInventory, ContextBookCachedItems,
+    ContextBookContextSnapshot, ContextBookPersistedRuntimeState, ContextBookSubscriptionsSnapshot,
+    ContextBookVoteSnapshot,
+};
 use anyhow::{Context, Result};
 use serde::Serialize;
 
@@ -20,6 +24,7 @@ pub struct ContextBookStatusReport {
     pub contract: ContextBookContractSnapshot,
     pub persisted_runtime: Option<ContextBookPersistedRuntimeState>,
     pub persisted_subscriptions: Option<ContextBookSubscriptionsSnapshot>,
+    pub cache_inventory: ContextBookCacheInventory,
 }
 
 impl ContextBookService {
@@ -55,6 +60,100 @@ impl ContextBookService {
             .save_subscriptions(&subscriptions)
             .context("failed to persist fetched Context Book subscriptions")?;
         Ok(subscriptions)
+    }
+
+    pub fn cached_contexts(
+        &self,
+    ) -> Result<Option<ContextBookCachedItems<ContextBookContextSnapshot>>> {
+        self.handle
+            .store()
+            .load_contexts()
+            .context("failed to load cached Context Book contexts")
+    }
+
+    pub async fn get_contexts(&self) -> Result<ContextBookCachedItems<ContextBookContextSnapshot>> {
+        let client = ContextBookClient::new(&self.handle.source_config());
+        let session = client
+            .ensure_session()
+            .await
+            .map_err(anyhow::Error::new)
+            .context("failed to establish Context Book session for contexts query")?;
+        let contexts = client
+            .get_contexts(&session)
+            .await
+            .map_err(anyhow::Error::new)
+            .context("failed to fetch Context Book contexts")?;
+        self.handle
+            .store()
+            .save_contexts(&contexts)
+            .context("failed to persist fetched Context Book contexts")?;
+        let updated_at = contexts.iter().map(|item| item.synced_at.clone()).max();
+        Ok(ContextBookCachedItems {
+            items: contexts,
+            updated_at,
+        })
+    }
+
+    pub fn cached_votes(&self) -> Result<Option<ContextBookCachedItems<ContextBookVoteSnapshot>>> {
+        self.handle
+            .store()
+            .load_votes()
+            .context("failed to load cached Context Book votes")
+    }
+
+    pub async fn get_votes(&self) -> Result<ContextBookCachedItems<ContextBookVoteSnapshot>> {
+        let client = ContextBookClient::new(&self.handle.source_config());
+        let session = client
+            .ensure_session()
+            .await
+            .map_err(anyhow::Error::new)
+            .context("failed to establish Context Book session for votes query")?;
+        let votes = client
+            .get_votes(&session)
+            .await
+            .map_err(anyhow::Error::new)
+            .context("failed to fetch Context Book votes")?;
+        self.handle
+            .store()
+            .save_votes(&votes)
+            .context("failed to persist fetched Context Book votes")?;
+        let updated_at = votes.iter().map(|item| item.synced_at.clone()).max();
+        Ok(ContextBookCachedItems {
+            items: votes,
+            updated_at,
+        })
+    }
+
+    pub fn cached_agents(
+        &self,
+    ) -> Result<Option<ContextBookCachedItems<ContextBookAgentSnapshot>>> {
+        self.handle
+            .store()
+            .load_agents()
+            .context("failed to load cached Context Book agents")
+    }
+
+    pub async fn get_agents(&self) -> Result<ContextBookCachedItems<ContextBookAgentSnapshot>> {
+        let client = ContextBookClient::new(&self.handle.source_config());
+        let session = client
+            .ensure_session()
+            .await
+            .map_err(anyhow::Error::new)
+            .context("failed to establish Context Book session for agents query")?;
+        let agents = client
+            .get_agents(&session)
+            .await
+            .map_err(anyhow::Error::new)
+            .context("failed to fetch Context Book agents")?;
+        self.handle
+            .store()
+            .save_agents(&agents)
+            .context("failed to persist fetched Context Book agents")?;
+        let updated_at = agents.iter().map(|item| item.synced_at.clone()).max();
+        Ok(ContextBookCachedItems {
+            items: agents,
+            updated_at,
+        })
     }
 
     pub async fn set_subscriptions(

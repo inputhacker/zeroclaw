@@ -350,16 +350,36 @@ Phase 2 current status (2026-03-29):
 
 ### Phase 3 (Subscriptions + Read Path)
 - [x] desired/effective subscription 관리
-- [ ] events 기반 캐시 동기화
-- [ ] query tools (`contexts/votes/subscriptions/status`)
-- [ ] read-through 정책과 cache freshness 표면화
+- [x] events 기반 캐시 동기화
+- [x] query tools (`contexts/votes/subscriptions/status`)
+- [x] read-through 정책과 cache freshness 표면화
 - [ ] doctor/health에 stale or degraded 상태 반영
 
 Phase 3 current status (2026-03-29):
 - 완료된 3개 구현 묶음: desired/effective subscription SQLite persistence 추가 (`cb_subscription_state`, `cb_desired_subscriptions`, `cb_effective_subscriptions`)
 - 완료된 3개 구현 묶음: `ContextBookService`에 remote `GET/PUT /subscriptions` read-through 연결, service-only 경로에서도 explicit subscription read/write 지원
 - 완료된 3개 구현 묶음: `context_book_subscriptions_get`, `context_book_subscriptions_set` tool 추가 및 doctor/status에 cached subscription/degraded contract 노출 연결
-- 다음 턴 시작 지점: `Phase 3`의 `events 기반 캐시 동기화`에서 `subscription.updated` 및 이후 context/vote read path snapshot sync를 연결한다.
+- 완료된 3개 구현 묶음: worker event routing에서 `subscription.updated`, `agent.*`, `context.*`, `vote.*`에 대한 read-through cache sync 연결, `cb_agent_snapshots`/`cb_context_snapshots`/`cb_vote_snapshots` 추가, `event dedup + snapshot replace + cursor commit` transaction 경계 반영
+- 완료된 3개 구현 묶음: `context_book_contexts_query`, `context_book_votes_query` tool 추가 및 `status/subscriptions` 응답에 cache inventory/freshness 표면화 연결
+- 완료된 3개 구현 묶음: `ContextBookClient`의 `GET /agents`, `GET /contexts`, `GET /votes` read API 연결 및 live bootstrap test에서 authenticated read path 확인
+- 다음 턴 시작 지점: `Phase 3`의 마지막 작업인 `doctor/health에 stale or degraded 상태 반영`부터 진행한다.
+- 그 다음 우선순위는 `Phase 4`의 `context CRUD`와 `vote CRUD + cast` write path 진입이다.
+
+Validation completed for Phase 3 read-path work on 2026-03-29:
+- `cargo fmt --all`
+- `cargo check --lib --tests`
+- `cargo test apply_event_sync_replaces_cached_snapshots_in_same_transaction --lib`
+- `cargo test worker_resets_cursor_and_uses_polling_fallback --lib`
+- `cargo test contexts_query_tool_filters_cached_items --lib`
+- `cargo test votes_query_tool_filters_cached_items --lib`
+- `cargo test status_tool_reports_runtime_snapshot --lib`
+- `cargo test all_tools_includes_browser_when_enabled --lib`
+- `CONTEXT_BOOK_BOOTSTRAP_SHARED_SECRET=... cargo test live_client_bootstraps_against_context_book_server --lib -- --ignored --nocapture`
+- `cargo fmt --all -- --check`
+- `cargo clippy --all-targets -- -D warnings` → 이번 변경에서 추가한 clippy 이슈는 정리했고, 현재는 기존 lint만 남음 (`src/security/firejail.rs:163`, `inefficient_to_string`)
+- `cargo test` → 현재 작업과 무관한 기존 실패 2건으로 실패:
+  - `providers::bedrock::tests::bearer_token_from_env`
+  - `providers::bedrock::tests::chat_fails_without_credentials`
 
 ### Phase 4 (Write Path)
 - context CRUD 툴/서비스
@@ -385,21 +405,21 @@ Phase 3 current status (2026-03-29):
 
 우선순위 순:
 
-1. `Phase 3` 계속: events 기반 캐시 동기화
-- `subscription.updated`를 포함한 control-plane 이벤트로 desired/effective subscription snapshot 갱신
-- 이후 context/vote snapshot sync 경로를 동일 transaction/dedup 경계에 맞춰 확장
+1. `Phase 3` 마무리: doctor/health stale or degraded 반영
+- `context_book` cache inventory(`agents/contexts/votes`)의 freshness를 doctor/health에 연결
+- stale 판정 기준과 degraded mode surface를 같은 상태 모델로 일관화
 
-2. query tools / read-through 확장
-- `contexts_query`, `votes_query`, `subscriptions_get/status`를 같은 상태 모델에 맞춰 정리
-- cache hit/miss, freshness, degraded contract를 tool 응답과 doctor surface에 일관되게 노출
+2. `Phase 4` 진입: context CRUD write path
+- `POST/PATCH/DELETE /contexts` service/tool 구현
+- remote success 후 local cache sync 보정 규칙과 Active/author 제약 처리
 
-3. `vote.deleted` / data-plane contract verification 보강
-- 현재 runtime contract snapshot은 `vote.deleted`를 parser/상태 모델에서 수용하지만 live probe는 아직 `unknown`으로 남겨 둠
-- 다음 세션에서는 spec/live를 대조해 explicit verification 또는 capability source를 추가
+3. `Phase 4` 계속: vote CRUD + cast
+- `POST/PATCH/DELETE /votes`, `POST /votes/{voteId}/cast` 구현
+- owner cast 금지, duplicate cast 방지, 원격 성공 후 로컬 sync 보정
 
-4. daemon end-to-end live verification 보강
-- 현재는 `ContextBookClient` live test로 bootstrap/auth/activation/SSE open + contract probe를 검증했음
-- 다음 세션에서는 daemon worker 전체 경로를 live server 기준으로 한 번 더 검증해 persisted runtime snapshot, degraded mode surface, auth profile resume까지 확인
+4. `vote.deleted` / data-plane contract verification 보강
+- 현재 read path는 `vote.deleted`를 처리하지만 runtime contract snapshot의 explicit live verification은 아직 남아 있음
+- 다음 세션에서는 spec/live를 대조해 capability source 또는 probe를 보강
 
 ## 9. Testing & Verification Checklist
 

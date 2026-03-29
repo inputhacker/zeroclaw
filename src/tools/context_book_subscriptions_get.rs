@@ -1,6 +1,7 @@
 use super::traits::{Tool, ToolResult};
 use crate::context_book::{ContextBookHandle, ContextBookService};
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use serde_json::json;
 
 pub struct ContextBookSubscriptionsGetTool {
@@ -45,12 +46,12 @@ impl Tool for ContextBookSubscriptionsGetTool {
             .and_then(|value| value.as_str())
             .unwrap_or("auto");
 
-        let snapshot = match source {
-            "cache" => self.service.cached_subscriptions()?,
-            "remote" => Some(self.service.get_subscriptions().await?),
+        let (resolved_source, snapshot) = match source {
+            "cache" => ("cache", self.service.cached_subscriptions()?),
+            "remote" => ("remote", Some(self.service.get_subscriptions().await?)),
             "auto" => match self.service.cached_subscriptions()? {
-                some @ Some(_) => some,
-                None => Some(self.service.get_subscriptions().await?),
+                some @ Some(_) => ("cache", some),
+                None => ("remote", Some(self.service.get_subscriptions().await?)),
             },
             _ => {
                 return Ok(ToolResult {
@@ -64,10 +65,26 @@ impl Tool for ContextBookSubscriptionsGetTool {
         Ok(ToolResult {
             success: true,
             output: serde_json::to_string_pretty(&json!({
-                "source": source,
+                "source": resolved_source,
+                "requested_source": source,
+                "freshness": snapshot.as_ref().map(|snapshot| freshness(&snapshot.updated_at)),
                 "subscriptions": snapshot,
             }))?,
             error: None,
         })
     }
+}
+
+fn freshness(updated_at: &str) -> serde_json::Value {
+    let age_seconds = DateTime::parse_from_rfc3339(updated_at)
+        .ok()
+        .map(|timestamp| {
+            Utc::now()
+                .signed_duration_since(timestamp.with_timezone(&Utc))
+                .num_seconds()
+        });
+    json!({
+        "updated_at": updated_at,
+        "age_seconds": age_seconds,
+    })
 }

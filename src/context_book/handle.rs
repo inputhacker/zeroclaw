@@ -354,6 +354,24 @@ impl ContextBookHandleState {
             tracing::debug!("context_book status could not load subscriptions: {error}");
             None
         });
+        let cache_inventory = self.store.cache_inventory().unwrap_or_else(|error| {
+            tracing::debug!("context_book status could not load cache inventory: {error}");
+            super::store::ContextBookCacheInventory {
+                seen_event_count: 0,
+                agents: super::store::ContextBookCacheCollectionSummary {
+                    count: 0,
+                    updated_at: None,
+                },
+                contexts: super::store::ContextBookCacheCollectionSummary {
+                    count: 0,
+                    updated_at: None,
+                },
+                votes: super::store::ContextBookCacheCollectionSummary {
+                    count: 0,
+                    updated_at: None,
+                },
+            }
+        });
 
         ContextBookStatusReport {
             resolved: self.resolved_config(),
@@ -361,6 +379,7 @@ impl ContextBookHandleState {
             contract: self.contract_snapshot(),
             persisted_runtime,
             persisted_subscriptions,
+            cache_inventory,
         }
     }
 

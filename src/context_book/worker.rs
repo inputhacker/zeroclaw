@@ -2,6 +2,7 @@ use super::ContextBookHandle;
 use super::client::{ContextBookClient, ContextBookClientErrorKind};
 use super::events::{ContextBookSseParser, ParsedContextBookSseFrame};
 use super::handle::{ContextBookContractValidationState, ContextBookDegradedMode};
+use super::store::ContextBookEventSyncUpdate;
 use crate::config::Config;
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
@@ -138,7 +139,7 @@ async fn connect_and_sync_once(
         Ok(response) => {
             handle.mark_stream_connected(&session.agent_id, "context_book SSE connected");
             persist_runtime_state(handle)?;
-            consume_sse_stream(response, handle, shutdown).await?;
+            consume_sse_stream(response, client, &session, handle, shutdown).await?;
             Ok(true)
         }
         Err(error) if error.kind == ContextBookClientErrorKind::CursorNotFound => {
@@ -168,6 +169,8 @@ async fn connect_and_sync_once(
 
 async fn consume_sse_stream(
     response: reqwest::Response,
+    client: &ContextBookClient,
+    session: &super::client::ContextBookSession,
     handle: &ContextBookHandle,
     shutdown: Option<&CancellationToken>,
 ) -> Result<()> {
@@ -192,11 +195,19 @@ async fn consume_sse_stream(
                         match frame {
                             ParsedContextBookSseFrame::Heartbeat => {}
                             ParsedContextBookSseFrame::Event(event) => {
+                                let update = build_event_sync_update(client, session, &event)
+                                    .await
+                                    .with_context(|| {
+                                        format!(
+                                            "failed to prepare Context Book cache sync for event {}",
+                                            event.event_id
+                                        )
+                                    })?;
                                 handle.mark_event_applied(&event.event_id);
                                 let snapshot = handle.snapshot();
                                 if handle
                                     .store()
-                                    .record_event(&event, &snapshot)
+                                    .apply_event_sync(&event, &snapshot, update)
                                     .context("failed to record Context Book event")?
                                 {
                                     persist_runtime_state(handle)?;
@@ -225,11 +236,19 @@ async fn poll_once(
         .map_err(anyhow::Error::new)
         .context("failed to poll Context Book events")?;
     for event in events {
+        let update = build_event_sync_update(client, session, &event)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to prepare Context Book cache sync for polled event {}",
+                    event.event_id
+                )
+            })?;
         handle.mark_event_applied(&event.event_id);
         let snapshot = handle.snapshot();
         if handle
             .store()
-            .record_event(&event, &snapshot)
+            .apply_event_sync(&event, &snapshot, update)
             .context("failed to persist polled Context Book event")?
         {
             persist_runtime_state(handle)?;
@@ -255,6 +274,63 @@ async fn cancel_or_never(shutdown: Option<&CancellationToken>) {
     } else {
         std::future::pending::<()>().await;
     }
+}
+
+async fn build_event_sync_update(
+    client: &ContextBookClient,
+    session: &super::client::ContextBookSession,
+    event: &super::events::ContextBookEventEnvelope,
+) -> Result<ContextBookEventSyncUpdate> {
+    let mut update = ContextBookEventSyncUpdate::default();
+    match event.event_type.as_str() {
+        "subscription.updated" => {
+            update.subscriptions = Some(
+                client
+                    .get_subscriptions(session)
+                    .await
+                    .map_err(anyhow::Error::new)
+                    .context("failed to refresh subscriptions after subscription.updated")?,
+            );
+        }
+        "agent.registered" | "agent.status.changed" | "agent.connection.changed" => {
+            update.agents = Some(
+                client
+                    .get_agents(session)
+                    .await
+                    .map_err(anyhow::Error::new)
+                    .context("failed to refresh agents after agent event")?,
+            );
+        }
+        "agent.unregistered" => {
+            update.agents = Some(
+                client
+                    .get_agents(session)
+                    .await
+                    .map_err(anyhow::Error::new)
+                    .context("failed to refresh agents after agent.unregistered")?,
+            );
+        }
+        "context.created" | "context.updated" | "context.deleted" => {
+            update.contexts = Some(
+                client
+                    .get_contexts(session)
+                    .await
+                    .map_err(anyhow::Error::new)
+                    .context("failed to refresh contexts after context event")?,
+            );
+        }
+        "vote.created" | "vote.updated" | "vote.deleted" => {
+            update.votes = Some(
+                client
+                    .get_votes(session)
+                    .await
+                    .map_err(anyhow::Error::new)
+                    .context("failed to refresh votes after vote event")?,
+            );
+        }
+        _ => {}
+    }
+    Ok(update)
 }
 
 #[cfg(test)]
@@ -391,6 +467,23 @@ mod tests {
             }))
         }
 
+        async fn contexts() -> impl IntoResponse {
+            axum::Json(serde_json::json!({
+                "items": [
+                    {
+                        "contextId": "ctx-100",
+                        "authorAgentId": "peer-a",
+                        "title": "Remote context",
+                        "contents": "payload",
+                        "tag": "ops",
+                        "status": "Published",
+                        "createdAt": "2026-03-29T00:00:00Z",
+                        "updatedAt": "2026-03-29T00:00:00Z"
+                    }
+                ]
+            }))
+        }
+
         async fn legacy_refresh() -> impl IntoResponse {
             (
                 StatusCode::BAD_REQUEST,
@@ -410,6 +503,7 @@ mod tests {
             .route("/agents/workspace/status", patch(patch_status))
             .route("/agents", get(agents))
             .route("/subscriptions", get(subscriptions))
+            .route("/contexts", get(contexts))
             .route("/events/stream", get(events_stream))
             .route("/events", get(events))
             .route("/auth/refresh", post(legacy_refresh))
@@ -477,11 +571,19 @@ mod tests {
             handle.store().seen_event_count().expect("seen event count"),
             1
         );
+        let cached_contexts = handle
+            .store()
+            .load_contexts()
+            .expect("load cached contexts")
+            .expect("cached contexts");
+        assert_eq!(cached_contexts.items.len(), 1);
+        assert_eq!(cached_contexts.items[0].context_id, "ctx-100");
         assert!(status.persisted_runtime.as_ref().is_some_and(|runtime| {
             runtime.worker_state == "stopped"
                 && runtime.last_event_id.as_deref() == Some("evt-100")
                 && runtime.cursor_generation == 1
         }));
+        assert_eq!(status.cache_inventory.contexts.count, 1);
 
         server.abort();
         let _ = server.await;

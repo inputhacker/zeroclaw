@@ -30,9 +30,11 @@ pub mod cloud_patterns;
 pub mod codex_cli;
 pub mod composio;
 pub mod content_search;
+pub mod context_book_contexts_query;
 pub mod context_book_status;
 pub mod context_book_subscriptions_get;
 pub mod context_book_subscriptions_set;
+pub mod context_book_votes_query;
 pub mod cron_add;
 pub mod cron_list;
 pub mod cron_remove;
@@ -130,9 +132,11 @@ pub use cloud_patterns::CloudPatternsTool;
 pub use codex_cli::CodexCliTool;
 pub use composio::ComposioTool;
 pub use content_search::ContentSearchTool;
+pub use context_book_contexts_query::ContextBookContextsQueryTool;
 pub use context_book_status::ContextBookStatusTool;
 pub use context_book_subscriptions_get::ContextBookSubscriptionsGetTool;
 pub use context_book_subscriptions_set::ContextBookSubscriptionsSetTool;
+pub use context_book_votes_query::ContextBookVotesQueryTool;
 pub use cron_add::CronAddTool;
 pub use cron_list::CronListTool;
 pub use cron_remove::CronRemoveTool;
@@ -451,13 +455,17 @@ pub fn all_tools_with_runtime(
         Arc::new(WeatherTool::new()),
         Arc::new(CanvasTool::new(canvas_store.unwrap_or_default())),
         Arc::new(ContextBookStatusTool::new(context_book_handle.clone())),
+        Arc::new(ContextBookContextsQueryTool::new(
+            context_book_handle.clone(),
+        )),
         Arc::new(ContextBookSubscriptionsGetTool::new(
             context_book_handle.clone(),
         )),
         Arc::new(ContextBookSubscriptionsSetTool::new(
-            context_book_handle,
+            context_book_handle.clone(),
             security.clone(),
         )),
+        Arc::new(ContextBookVotesQueryTool::new(context_book_handle)),
     ];
 
     // Register discord_search if discord_history channel is configured
@@ -1133,8 +1141,10 @@ mod tests {
         assert!(names.contains(&"pushover"));
         assert!(names.contains(&"proxy_config"));
         assert!(names.contains(&"context_book_status"));
+        assert!(names.contains(&"context_book_contexts_query"));
         assert!(names.contains(&"context_book_subscriptions_get"));
         assert!(names.contains(&"context_book_subscriptions_set"));
+        assert!(names.contains(&"context_book_votes_query"));
     }
 
     #[test]
@@ -1179,8 +1189,10 @@ mod tests {
         assert!(names.contains(&"pushover"));
         assert!(names.contains(&"proxy_config"));
         assert!(names.contains(&"context_book_status"));
+        assert!(names.contains(&"context_book_contexts_query"));
         assert!(names.contains(&"context_book_subscriptions_get"));
         assert!(names.contains(&"context_book_subscriptions_set"));
+        assert!(names.contains(&"context_book_votes_query"));
     }
 
     #[test]

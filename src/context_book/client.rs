@@ -1,5 +1,10 @@
 use super::config::ResolvedContextBookConfig;
 use super::events::{ContextBookEventEnvelope, parse_polled_events};
+use super::handle::{
+    ContextBookContractSnapshot, ContextBookContractValidationState, ContextBookDegradedMode,
+    ContextBookRefreshMode,
+};
+use super::store::ContextBookSubscriptionsSnapshot;
 use crate::auth::profiles::{AuthProfileKind, AuthProfilesStore, TokenSet};
 use crate::auth::{AuthService, state_dir_from_config};
 use crate::config::Config;
@@ -32,6 +37,13 @@ pub struct ContextBookSession {
     pub access_token: String,
     pub refresh_token: Option<String>,
     pub expires_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContextBookAgentStatusSnapshot {
+    pub agent_id: String,
+    pub lifecycle_state: Option<String>,
+    pub connection_state: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,12 +103,56 @@ struct TokenResponseAgent {
     agent_id: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct AgentStatusResponse {
+    #[serde(default, alias = "agentId")]
+    agent_id: String,
+    #[serde(default, alias = "lifecycleState")]
+    lifecycle_state: Option<String>,
+    #[serde(default, alias = "connectionState")]
+    connection_state: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct SubscriptionsResponse {
+    #[serde(default, alias = "consumerAgentId")]
+    consumer_agent_id: Option<String>,
+    #[serde(default, alias = "desiredProducerAgentIds")]
+    desired_producer_agent_ids: Option<Vec<String>>,
+    #[serde(default, alias = "effectiveProducerAgentIds")]
+    effective_producer_agent_ids: Option<Vec<String>>,
+    #[serde(default, alias = "producerAgentIds")]
+    producer_agent_ids: Option<Vec<String>>,
+}
+
 impl TokenResponse {
     fn resolved_agent_id(&self, fallback: &str) -> String {
         self.agent_id
             .clone()
             .or_else(|| self.agent.as_ref().and_then(|agent| agent.agent_id.clone()))
             .unwrap_or_else(|| fallback.to_string())
+    }
+}
+
+impl SubscriptionsResponse {
+    fn split_view_available(&self) -> bool {
+        self.desired_producer_agent_ids.is_some() && self.effective_producer_agent_ids.is_some()
+    }
+
+    fn into_snapshot(self) -> ContextBookSubscriptionsSnapshot {
+        ContextBookSubscriptionsSnapshot {
+            consumer_agent_id: self.consumer_agent_id,
+            desired_producer_agent_ids: normalize_agent_ids(
+                &self.desired_producer_agent_ids.unwrap_or_default(),
+            ),
+            effective_producer_agent_ids: normalize_agent_ids(
+                &self
+                    .effective_producer_agent_ids
+                    .or(self.producer_agent_ids)
+                    .unwrap_or_default(),
+            ),
+            updated_at: Utc::now().to_rfc3339(),
+        }
     }
 }
 
@@ -341,6 +397,342 @@ impl ContextBookClient {
             .map_err(|error| self.contract_error(format!("invalid polling event payload: {error}")))
     }
 
+    pub async fn get_subscriptions(
+        &self,
+        session: &ContextBookSession,
+    ) -> Result<ContextBookSubscriptionsSnapshot, ContextBookClientError> {
+        Ok(self
+            .fetch_subscriptions_response(session)
+            .await?
+            .into_snapshot())
+    }
+
+    pub async fn set_subscriptions(
+        &self,
+        session: &ContextBookSession,
+        desired_producer_agent_ids: &[String],
+    ) -> Result<ContextBookSubscriptionsSnapshot, ContextBookClientError> {
+        let url = session
+            .base_url
+            .join("subscriptions")
+            .map_err(|error| self.contract_error(format!("invalid subscriptions URL: {error}")))?;
+        let desired = normalize_agent_ids(desired_producer_agent_ids);
+        let response = self
+            .http_client
+            .put(url)
+            .bearer_auth(&session.access_token)
+            .json(&json!({
+                "desiredProducerAgentIds": desired,
+                "producerAgentIds": desired,
+            }))
+            .send()
+            .await
+            .map_err(|error| {
+                self.network_error(format!(
+                    "failed to update Context Book subscriptions: {error}"
+                ))
+            })?;
+        let response = self
+            .expect_success(response, "failed to update Context Book subscriptions")
+            .await?;
+        let body = response
+            .json::<SubscriptionsResponse>()
+            .await
+            .map_err(|error| {
+                self.contract_error(format!("failed to parse subscriptions response: {error}"))
+            })?;
+        Ok(body.into_snapshot())
+    }
+
+    pub async fn validate_runtime_contract(
+        &self,
+        session: &ContextBookSession,
+    ) -> Result<ContextBookContractSnapshot, ContextBookClientError> {
+        let current_agent = self.current_agent_status(session).await?;
+        let subscriptions = self.fetch_subscriptions_response(session).await?;
+        let cursor_not_found_returns_409 = self.probe_cursor_not_found_contract(session).await?;
+        let refresh_mode = self
+            .probe_refresh_mode(&session.base_url, &session.agent_id)
+            .await?;
+
+        let lifecycle_connection_split = Some(current_agent.as_ref().is_some_and(|agent| {
+            agent
+                .lifecycle_state
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+                && agent
+                    .connection_state
+                    .as_deref()
+                    .is_some_and(|value| !value.trim().is_empty())
+        }));
+        let subscriptions_split = Some(subscriptions.split_view_available());
+        let mut degraded_modes = Vec::new();
+        let mut notes = Vec::new();
+
+        if lifecycle_connection_split == Some(false) {
+            degraded_modes.push(ContextBookDegradedMode::Disconnect);
+            notes.push(
+                "GET /agents did not expose both lifecycleState and connectionState".to_string(),
+            );
+        }
+        if subscriptions_split == Some(false) {
+            degraded_modes.push(ContextBookDegradedMode::NoWrite);
+            notes.push(
+                "GET /subscriptions did not expose both desiredProducerAgentIds and effectiveProducerAgentIds"
+                    .to_string(),
+            );
+        }
+        if !cursor_not_found_returns_409 {
+            degraded_modes.push(ContextBookDegradedMode::Disconnect);
+            notes.push(
+                "GET /events probe did not return 409 CURSOR_NOT_FOUND for an unknown cursor"
+                    .to_string(),
+            );
+        }
+        if refresh_mode == ContextBookRefreshMode::Disabled {
+            degraded_modes.push(ContextBookDegradedMode::NoRefresh);
+            notes.push("no supported refresh endpoint was detected".to_string());
+        }
+
+        dedup_degraded_modes(&mut degraded_modes);
+        let validation_state = if degraded_modes.contains(&ContextBookDegradedMode::Disconnect) {
+            ContextBookContractValidationState::Invalid
+        } else if degraded_modes.is_empty() {
+            ContextBookContractValidationState::Validated
+        } else {
+            ContextBookContractValidationState::Degraded
+        };
+
+        Ok(ContextBookContractSnapshot {
+            validation_state,
+            checked_at: Some(Utc::now().to_rfc3339()),
+            lifecycle_connection_split,
+            subscriptions_desired_effective_split: subscriptions_split,
+            cursor_not_found_returns_409: Some(cursor_not_found_returns_409),
+            vote_deleted_supported: None,
+            refresh_mode,
+            degraded_modes,
+            notes,
+        })
+    }
+
+    async fn current_agent_status(
+        &self,
+        session: &ContextBookSession,
+    ) -> Result<Option<ContextBookAgentStatusSnapshot>, ContextBookClientError> {
+        let url = session
+            .base_url
+            .join("agents")
+            .map_err(|error| self.contract_error(format!("invalid agents URL: {error}")))?;
+        let response = self
+            .http_client
+            .get(url)
+            .bearer_auth(&session.access_token)
+            .send()
+            .await
+            .map_err(|error| {
+                self.network_error(format!("failed to fetch Context Book agents: {error}"))
+            })?;
+        let response = self
+            .expect_success(response, "failed to fetch Context Book agents")
+            .await?;
+        let body = response.json::<Value>().await.map_err(|error| {
+            self.contract_error(format!(
+                "failed to parse Context Book agents response: {error}"
+            ))
+        })?;
+        let agents = parse_agents_response(body)
+            .map_err(|error| self.contract_error(format!("invalid agents payload: {error}")))?;
+        Ok(agents
+            .into_iter()
+            .find(|agent| agent.agent_id == session.agent_id))
+    }
+
+    async fn fetch_subscriptions_response(
+        &self,
+        session: &ContextBookSession,
+    ) -> Result<SubscriptionsResponse, ContextBookClientError> {
+        let url = session
+            .base_url
+            .join("subscriptions")
+            .map_err(|error| self.contract_error(format!("invalid subscriptions URL: {error}")))?;
+        let response = self
+            .http_client
+            .get(url)
+            .bearer_auth(&session.access_token)
+            .send()
+            .await
+            .map_err(|error| {
+                self.network_error(format!(
+                    "failed to fetch Context Book subscriptions: {error}"
+                ))
+            })?;
+        let response = self
+            .expect_success(response, "failed to fetch Context Book subscriptions")
+            .await?;
+        response
+            .json::<SubscriptionsResponse>()
+            .await
+            .map_err(|error| {
+                self.contract_error(format!("failed to parse subscriptions response: {error}"))
+            })
+    }
+
+    async fn probe_cursor_not_found_contract(
+        &self,
+        session: &ContextBookSession,
+    ) -> Result<bool, ContextBookClientError> {
+        let mut url = session
+            .base_url
+            .join("events")
+            .map_err(|error| self.contract_error(format!("invalid events URL: {error}")))?;
+        url.query_pairs_mut()
+            .append_pair("sinceEventId", "__zeroclaw_contract_probe_cursor__");
+        let response = self
+            .http_client
+            .get(url)
+            .bearer_auth(&session.access_token)
+            .send()
+            .await
+            .map_err(|error| {
+                self.network_error(format!(
+                    "failed to probe Context Book cursor-not-found contract: {error}"
+                ))
+            })?;
+        if response.status() == StatusCode::CONFLICT {
+            let error = self.parse_http_error(response).await;
+            return Ok(error.kind == ContextBookClientErrorKind::CursorNotFound);
+        }
+        Ok(false)
+    }
+
+    async fn probe_refresh_mode(
+        &self,
+        base_url: &Url,
+        agent_id: &str,
+    ) -> Result<ContextBookRefreshMode, ContextBookClientError> {
+        if self
+            .refresh_endpoint_exists(base_url, RefreshProbeKind::OAuth2Token)
+            .await?
+        {
+            return Ok(ContextBookRefreshMode::OAuth2Token);
+        }
+        if self
+            .refresh_endpoint_exists(
+                base_url,
+                RefreshProbeKind::LegacyAuthRefresh {
+                    agent_id: agent_id.to_string(),
+                },
+            )
+            .await?
+        {
+            return Ok(ContextBookRefreshMode::LegacyAuthRefresh);
+        }
+        Ok(ContextBookRefreshMode::Disabled)
+    }
+
+    async fn refresh_endpoint_exists(
+        &self,
+        base_url: &Url,
+        probe: RefreshProbeKind,
+    ) -> Result<bool, ContextBookClientError> {
+        let request = match probe {
+            RefreshProbeKind::OAuth2Token => self
+                .http_client
+                .post(base_url.join("oauth2/token").map_err(|error| {
+                    self.contract_error(format!("invalid oauth2/token URL: {error}"))
+                })?)
+                .form(&[
+                    ("grant_type", "refresh_token"),
+                    ("refresh_token", "__zeroclaw_probe__"),
+                ]),
+            RefreshProbeKind::LegacyAuthRefresh { ref agent_id } => self
+                .http_client
+                .post(base_url.join("auth/refresh").map_err(|error| {
+                    self.contract_error(format!("invalid auth/refresh URL: {error}"))
+                })?)
+                .json(&json!({
+                    "agentId": agent_id,
+                    "refreshToken": "__zeroclaw_probe__",
+                })),
+        };
+        let response = request.send().await.map_err(|error| {
+            self.network_error(format!(
+                "failed to probe Context Book refresh endpoint: {error}"
+            ))
+        })?;
+        Ok(response.status() != StatusCode::NOT_FOUND)
+    }
+
+    async fn refresh_via_oauth2_token(
+        &self,
+        base_url: &Url,
+        refresh_token: &str,
+    ) -> Result<TokenResponse, ContextBookClientError> {
+        let token_url = base_url
+            .join("oauth2/token")
+            .map_err(|error| self.contract_error(format!("invalid oauth2/token URL: {error}")))?;
+        let response = self
+            .http_client
+            .post(token_url)
+            .form(&[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", refresh_token),
+            ])
+            .send()
+            .await
+            .map_err(|error| {
+                self.network_error(format!("failed to refresh Context Book token: {error}"))
+            })?;
+        if response.status() == StatusCode::NOT_FOUND {
+            return Err(self.contract_error(
+                "oauth2/token refresh endpoint is not available on this Context Book server",
+            ));
+        }
+        let response = self
+            .expect_success(response, "failed to refresh Context Book token")
+            .await?;
+        response.json::<TokenResponse>().await.map_err(|error| {
+            self.contract_error(format!("failed to parse refresh token response: {error}"))
+        })
+    }
+
+    async fn refresh_via_legacy_auth_refresh(
+        &self,
+        base_url: &Url,
+        agent_id: &str,
+        refresh_token: &str,
+    ) -> Result<TokenResponse, ContextBookClientError> {
+        let token_url = base_url
+            .join("auth/refresh")
+            .map_err(|error| self.contract_error(format!("invalid auth/refresh URL: {error}")))?;
+        let response = self
+            .http_client
+            .post(token_url)
+            .json(&json!({
+                "agentId": agent_id,
+                "refreshToken": refresh_token,
+            }))
+            .send()
+            .await
+            .map_err(|error| {
+                self.network_error(format!(
+                    "failed to refresh Context Book token via legacy auth/refresh: {error}"
+                ))
+            })?;
+        let response = self
+            .expect_success(
+                response,
+                "failed to refresh Context Book token via auth/refresh",
+            )
+            .await?;
+        response.json::<TokenResponse>().await.map_err(|error| {
+            self.contract_error(format!(
+                "failed to parse legacy refresh token response: {error}"
+            ))
+        })
+    }
+
     async fn load_stored_session(
         &self,
         base_url: &Url,
@@ -379,13 +771,18 @@ impl ContextBookClient {
                 let Some(tokens) = profile.token_set else {
                     return Ok(None);
                 };
+                let agent_id = profile
+                    .metadata
+                    .get("agent_id")
+                    .cloned()
+                    .unwrap_or_else(|| self.identity.agent_id.clone());
                 let expires_soon = tokens.expires_at.is_some_and(|expires_at| {
                     expires_at
                         <= Utc::now() + ChronoDuration::seconds(ACCESS_TOKEN_REFRESH_SKEW_SECS)
                 });
                 if expires_soon {
                     return self
-                        .refresh_session(base_url, &profile.id, tokens)
+                        .refresh_session(base_url, &profile.id, &agent_id, tokens)
                         .await
                         .map(Some);
                 }
@@ -394,11 +791,7 @@ impl ContextBookClient {
                 }
                 Ok(Some(ContextBookSession {
                     base_url: base_url.clone(),
-                    agent_id: profile
-                        .metadata
-                        .get("agent_id")
-                        .cloned()
-                        .unwrap_or_else(|| self.identity.agent_id.clone()),
+                    agent_id,
                     access_token: tokens.access_token,
                     refresh_token: tokens.refresh_token,
                     expires_at: tokens.expires_at,
@@ -411,35 +804,25 @@ impl ContextBookClient {
         &self,
         base_url: &Url,
         profile_id: &str,
+        current_agent_id: &str,
         existing: TokenSet,
     ) -> Result<ContextBookSession, ContextBookClientError> {
         let refresh_token = existing
             .refresh_token
             .clone()
             .ok_or_else(|| self.auth_error("Context Book auth profile is missing refresh_token"))?;
-        let token_url = base_url
-            .join("oauth2/token")
-            .map_err(|error| self.contract_error(format!("invalid oauth2/token URL: {error}")))?;
-
-        let response = self
-            .http_client
-            .post(token_url)
-            .form(&[
-                ("grant_type", "refresh_token"),
-                ("refresh_token", refresh_token.as_str()),
-            ])
-            .send()
+        let token = match self
+            .refresh_via_oauth2_token(base_url, &refresh_token)
             .await
-            .map_err(|error| {
-                self.network_error(format!("failed to refresh Context Book token: {error}"))
-            })?;
-        let response = self
-            .expect_success(response, "failed to refresh Context Book token")
-            .await?;
-        let token = response.json::<TokenResponse>().await.map_err(|error| {
-            self.contract_error(format!("failed to parse refresh token response: {error}"))
-        })?;
-        let agent_id = token.resolved_agent_id(&self.identity.agent_id);
+        {
+            Ok(token) => token,
+            Err(error) if error.kind == ContextBookClientErrorKind::ContractViolation => {
+                self.refresh_via_legacy_auth_refresh(base_url, current_agent_id, &refresh_token)
+                    .await?
+            }
+            Err(error) => return Err(error),
+        };
+        let agent_id = token.resolved_agent_id(current_agent_id);
 
         let refreshed = TokenSet {
             access_token: token.access_token.clone(),
@@ -461,7 +844,7 @@ impl ContextBookClient {
                 profile.token_set = Some(refreshed.clone());
                 profile
                     .metadata
-                    .insert("agent_id".to_string(), self.identity.agent_id.clone());
+                    .insert("agent_id".to_string(), agent_id.clone());
                 Ok(())
             })
             .await
@@ -964,6 +1347,69 @@ fn validate_url_against_runtime_policy(
     Ok(())
 }
 
+enum RefreshProbeKind {
+    OAuth2Token,
+    LegacyAuthRefresh { agent_id: String },
+}
+
+fn parse_agents_response(value: Value) -> anyhow::Result<Vec<ContextBookAgentStatusSnapshot>> {
+    if value.is_array() {
+        let agents = serde_json::from_value::<Vec<AgentStatusResponse>>(value)?;
+        return Ok(agents
+            .into_iter()
+            .map(|agent| ContextBookAgentStatusSnapshot {
+                agent_id: agent.agent_id,
+                lifecycle_state: normalize_optional_string(agent.lifecycle_state.as_deref()),
+                connection_state: normalize_optional_string(agent.connection_state.as_deref()),
+            })
+            .collect());
+    }
+
+    if let Some(items) = value.get("items") {
+        return parse_agents_response(items.clone());
+    }
+
+    if value.is_object() {
+        let agent = serde_json::from_value::<AgentStatusResponse>(value)?;
+        return Ok(vec![ContextBookAgentStatusSnapshot {
+            agent_id: agent.agent_id,
+            lifecycle_state: normalize_optional_string(agent.lifecycle_state.as_deref()),
+            connection_state: normalize_optional_string(agent.connection_state.as_deref()),
+        }]);
+    }
+
+    anyhow::bail!("Context Book agents response did not contain a parseable agent list")
+}
+
+fn normalize_optional_string(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn normalize_agent_ids(values: &[String]) -> Vec<String> {
+    let mut ids = values
+        .iter()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
+fn dedup_degraded_modes(modes: &mut Vec<ContextBookDegradedMode>) {
+    modes.sort_by_key(|mode| match mode {
+        ContextBookDegradedMode::ReadOnly => 0_u8,
+        ContextBookDegradedMode::NoRefresh => 1,
+        ContextBookDegradedMode::NoWrite => 2,
+        ContextBookDegradedMode::Disconnect => 3,
+    });
+    modes.dedup();
+}
+
 fn host_matches_allowlist(host: &str, allowlist: &[String]) -> bool {
     let normalized = host.trim().to_ascii_lowercase();
     allowlist.iter().any(|pattern| {
@@ -1361,6 +1807,99 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn client_validates_contract_and_detects_legacy_refresh_mode() {
+        async fn agents() -> impl IntoResponse {
+            axum::Json(json!([
+                {
+                    "agentId": "workspace",
+                    "lifecycleState": "Active",
+                    "connectionState": "Disconnected"
+                }
+            ]))
+        }
+
+        async fn subscriptions() -> impl IntoResponse {
+            axum::Json(json!({
+                "consumerAgentId": "workspace",
+                "desiredProducerAgentIds": ["peer-a", "peer-b"],
+                "effectiveProducerAgentIds": ["peer-a"]
+            }))
+        }
+
+        async fn events() -> impl IntoResponse {
+            (
+                StatusCode::CONFLICT,
+                axum::Json(json!({
+                    "error": {
+                        "code": "CURSOR_NOT_FOUND",
+                        "message": "missing cursor"
+                    }
+                })),
+            )
+        }
+
+        async fn legacy_refresh() -> impl IntoResponse {
+            (
+                StatusCode::BAD_REQUEST,
+                axum::Json(json!({
+                    "error": {
+                        "code": "REFRESH_TOKEN_REQUIRED",
+                        "message": "missing refresh token"
+                    }
+                })),
+            )
+        }
+
+        let app = Router::new()
+            .route("/agents", get(agents))
+            .route("/subscriptions", get(subscriptions))
+            .route("/events", get(events))
+            .route("/auth/refresh", post(legacy_refresh));
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve axum");
+        });
+
+        let tmp = TempDir::new().expect("temp dir");
+        let mut config = test_config(&tmp);
+        config.context_book.manual_url = Some(format!("http://{addr}"));
+        config.context_book.allowed_hosts = vec!["127.0.0.1".into()];
+        config.context_book.allow_private_hosts = true;
+
+        let client = ContextBookClient::new(&config);
+        let session = ContextBookSession {
+            base_url: Url::parse(&format!("http://{addr}/")).expect("base URL should parse"),
+            agent_id: "workspace".into(),
+            access_token: "access-token".into(),
+            refresh_token: Some("refresh-token".into()),
+            expires_at: None,
+        };
+        let contract = client
+            .validate_runtime_contract(&session)
+            .await
+            .expect("contract validation");
+
+        assert_eq!(
+            contract.validation_state,
+            ContextBookContractValidationState::Validated
+        );
+        assert_eq!(contract.lifecycle_connection_split, Some(true));
+        assert_eq!(contract.subscriptions_desired_effective_split, Some(true));
+        assert_eq!(contract.cursor_not_found_returns_409, Some(true));
+        assert_eq!(
+            contract.refresh_mode,
+            ContextBookRefreshMode::LegacyAuthRefresh
+        );
+        assert!(contract.degraded_modes.is_empty());
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
     #[ignore = "requires a live Context Book server with dashboard approval access"]
     async fn live_client_bootstraps_against_context_book_server() {
         let shared_secret = std::env::var("CONTEXT_BOOK_BOOTSTRAP_SHARED_SECRET")
@@ -1459,6 +1998,14 @@ mod tests {
             .open_event_stream(&session, None)
             .await
             .expect("live event stream open");
+        let contract = client
+            .validate_runtime_contract(&session)
+            .await
+            .expect("live contract validation");
+        assert_eq!(contract.lifecycle_connection_split, Some(true));
+        assert_eq!(contract.subscriptions_desired_effective_split, Some(true));
+        assert_eq!(contract.cursor_not_found_returns_409, Some(true));
+        assert_ne!(contract.refresh_mode, ContextBookRefreshMode::Unknown);
 
         let stored = client
             .auth_service
@@ -1548,6 +2095,145 @@ mod tests {
                 .as_ref()
                 .map(|tokens| tokens.access_token.as_str()),
             Some("fresh-access")
+        );
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn client_refreshes_stored_oauth_profile_via_legacy_auth_refresh_when_oauth2_missing() {
+        async fn legacy_refresh() -> impl IntoResponse {
+            axum::Json(json!({
+                "access_token": "legacy-access",
+                "refresh_token": "legacy-refresh",
+                "expires_in": 1800
+            }))
+        }
+
+        let app = Router::new().route("/auth/refresh", post(legacy_refresh));
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve axum");
+        });
+
+        let tmp = TempDir::new().expect("temp dir");
+        let mut config = test_config(&tmp);
+        config.context_book.manual_url = Some(format!("http://{addr}"));
+        config.context_book.allowed_hosts = vec!["127.0.0.1".into()];
+        config.context_book.allow_private_hosts = true;
+
+        let state_dir = state_dir_from_config(&config);
+        let store = AuthProfilesStore::new(&state_dir, config.secrets.encrypt);
+        store
+            .upsert_profile(
+                crate::auth::profiles::AuthProfile {
+                    id: crate::auth::profiles::profile_id(CONTEXT_BOOK_PROVIDER, "default"),
+                    provider: CONTEXT_BOOK_PROVIDER.to_string(),
+                    profile_name: "default".to_string(),
+                    kind: AuthProfileKind::OAuth,
+                    account_id: None,
+                    workspace_id: None,
+                    token_set: Some(TokenSet {
+                        access_token: "stale-access".into(),
+                        refresh_token: Some("stale-refresh".into()),
+                        id_token: None,
+                        expires_at: Some(Utc::now() - ChronoDuration::minutes(5)),
+                        token_type: None,
+                        scope: None,
+                    }),
+                    token: None,
+                    metadata: BTreeMap::from([("agent_id".to_string(), "workspace".to_string())]),
+                    created_at: Utc::now(),
+                    updated_at: Utc::now(),
+                },
+                true,
+            )
+            .await
+            .expect("seed auth profile");
+
+        let client = ContextBookClient::new(&config);
+        let session = client
+            .ensure_session()
+            .await
+            .expect("legacy refresh session");
+
+        assert_eq!(session.access_token, "legacy-access");
+        assert_eq!(session.refresh_token.as_deref(), Some("legacy-refresh"));
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn client_gets_and_sets_subscriptions() {
+        async fn get_subscriptions() -> impl IntoResponse {
+            axum::Json(json!({
+                "consumerAgentId": "workspace",
+                "desiredProducerAgentIds": ["peer-a"],
+                "effectiveProducerAgentIds": ["peer-a"]
+            }))
+        }
+
+        async fn put_subscriptions(axum::Json(body): axum::Json<Value>) -> impl IntoResponse {
+            assert_eq!(body["desiredProducerAgentIds"], json!(["peer-a", "peer-b"]));
+            assert_eq!(body["producerAgentIds"], json!(["peer-a", "peer-b"]));
+            axum::Json(json!({
+                "consumerAgentId": "workspace",
+                "desiredProducerAgentIds": ["peer-a", "peer-b"],
+                "effectiveProducerAgentIds": ["peer-a"]
+            }))
+        }
+
+        let app = Router::new().route(
+            "/subscriptions",
+            get(get_subscriptions).put(put_subscriptions),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve axum");
+        });
+
+        let tmp = TempDir::new().expect("temp dir");
+        let mut config = test_config(&tmp);
+        config.context_book.manual_url = Some(format!("http://{addr}"));
+        config.context_book.allowed_hosts = vec!["127.0.0.1".into()];
+        config.context_book.allow_private_hosts = true;
+
+        let client = ContextBookClient::new(&config);
+        let session = ContextBookSession {
+            base_url: Url::parse(&format!("http://{addr}/")).expect("base URL should parse"),
+            agent_id: "workspace".into(),
+            access_token: "access-token".into(),
+            refresh_token: Some("refresh-token".into()),
+            expires_at: None,
+        };
+        let initial = client
+            .get_subscriptions(&session)
+            .await
+            .expect("get subscriptions");
+        let updated = client
+            .set_subscriptions(&session, &["peer-b".into(), "peer-a".into()])
+            .await
+            .expect("set subscriptions");
+
+        assert_eq!(
+            initial.desired_producer_agent_ids,
+            vec!["peer-a".to_string()]
+        );
+        assert_eq!(
+            updated.desired_producer_agent_ids,
+            vec!["peer-a".to_string(), "peer-b".to_string()]
+        );
+        assert_eq!(
+            updated.effective_producer_agent_ids,
+            vec!["peer-a".to_string()]
         );
 
         server.abort();

@@ -310,7 +310,13 @@ Additional validation for Phase 2 on 2026-03-29:
 - `avahi-browse -rt _contextbook._tcp` → 실서버 광고 확인 (`context-book-local`, `127.0.1.1:8080`, TXT feature 광고 존재)
 - `curl http://127.0.1.1:8080/` → unauthenticated preflight 정상 (`service=context-book`, `status=ok`)
 - `cargo test context_book::client:: --lib`
-- `CONTEXT_BOOK_BOOTSTRAP_SHARED_SECRET=... cargo test live_client_bootstraps_against_context_book_server --lib -- --ignored --nocapture` → 실서버 bootstrap request 생성, dashboard approval, token 저장, `PATCH status=Active`, `GET /events/stream` open까지 통과
+- `cargo test daemon_state_reports_context_book_contract_details --lib`
+- `cargo test status_tool_reports_runtime_snapshot --lib`
+- `cargo test all_tools_includes_browser_when_enabled --lib`
+- `cargo test`
+- `cargo fmt --all -- --check`
+- `cargo clippy --all-targets -- -D warnings` → 현재 작업과 무관한 기존 lint만 남음 (`src/security/firejail.rs:163`, `inefficient_to_string`). 이번 변경 범위를 벗어나므로 미수정.
+- `CONTEXT_BOOK_BOOTSTRAP_SHARED_SECRET=... cargo test live_client_bootstraps_against_context_book_server --lib -- --ignored --nocapture` → 실서버 bootstrap request 생성, dashboard approval, token 저장, `PATCH status=Active`, `GET /events/stream` open, `GET /agents`, `GET /subscriptions`, `GET /events?sinceEventId=...` 기반 contract validation까지 통과
 - 수동 live HTTP 검증:
   - `POST /bootstrap/register/init` + dashboard approval + `POST /bootstrap/register/complete` 성공
   - bearer `GET /agents`, `PATCH /agents/{id}/status`, `GET /events/stream`, 재연결용 `POST /agents/connect` 성공
@@ -324,27 +330,36 @@ Additional validation for Phase 2 on 2026-03-29:
 - [x] refresh endpoint/protocol 계약(`oauth2/token` 기본, legacy `/auth/refresh` 호환 여부) 구현 반영
 - [x] graceful shutdown / resume 계약 반영
 - [x] runtime proxy + outbound host validation 경로 연결
-- [ ] post-bootstrap contract validation 및 degraded 모드 결정 경로 연결
+- [x] post-bootstrap contract validation 및 degraded 모드 결정 경로 연결
 
 Phase 2 current status (2026-03-29):
 - 완료된 3개 구현 묶음: `context_book::client` 추가, bootstrap/connect/register/reapproval wait-complete flow 구현, OAuth `POST /oauth2/token` refresh 및 auth profile 재사용 연결
 - 완료된 3개 구현 묶음: worker SSE consume + heartbeat suppression + event dedup + cursor persistence + best-effort shutdown `Inactive` 전이
 - 완료된 3개 구현 묶음: polling fallback + `409 CURSOR_NOT_FOUND` cursor reset + resume persistence + runtime proxy/host validation 연결
 - 완료된 3개 구현 묶음: live 서버 응답 형태에 맞춰 nested bootstrap wait metadata parsing, nested `agent.agentId` token parsing, 기본 `device_type=unknown` fallback 정렬
+- 완료된 3개 구현 묶음: post-bootstrap runtime contract validation 추가, `read_only|no_refresh|no_write|disconnect` degraded mode 상태 모델 도입, doctor/status surface 반영
+- 완료된 3개 구현 묶음: live refresh contract detection/fallback 정리, `POST /oauth2/token` 부재 시 legacy `POST /auth/refresh` fallback 구현, unsupported deployment는 `no_refresh` degraded mode로 표면화
 - 라이브 검증 결과로 확인된 계약 차이:
   - 서버는 `deviceType=daemon`을 거부하고 `android_mobile|tv|notepc|unknown`만 허용함
   - bootstrap wait metadata가 top-level이 아니라 `request.waitToken/statusUrl/completeUrl` 아래에 내려올 수 있음
   - token 응답의 agent identity가 top-level `agentId`가 아니라 `agent.agentId`로 내려올 수 있음
   - 현재 실서버(2026-03-29)는 `POST /oauth2/token`에 `404 Not Found`를 반환했으므로 refresh contract는 문서 가정과 live deployment 사이에 불일치가 있음
-- 다음 턴 시작 지점: `Phase 2`의 마지막 남은 작업인 `post-bootstrap contract validation 및 degraded mode 결정 경로`부터 진행한다.
-- 그 다음 우선순위는 `live refresh contract detection/fallback` 정리이며, 이 작업이 끝나면 `Phase 3`의 첫 작업인 `desired/effective subscription 관리`로 넘어간다.
+- discovery TXT 광고는 여전히 `features=subscriptions,events_resume,dashboard`까지만 노출하므로, split state / explicit vote deletion / cursor `409` / refresh capability는 런타임 probe 결과를 기준으로 판단해야 함
+- 다음 턴 시작 지점: `Phase 3`의 두 번째 작업인 `events 기반 캐시 동기화`부터 진행한다.
+- 그 다음 우선순위는 `Phase 3`의 `query tools (contexts/votes/subscriptions/status)` 확장과 `read-through 정책 + cache freshness` 표면화다.
 
 ### Phase 3 (Subscriptions + Read Path)
-- desired/effective subscription 관리
-- events 기반 캐시 동기화
-- query tools (`contexts/votes/subscriptions/status`)
-- read-through 정책과 cache freshness 표면화
-- doctor/health에 stale or degraded 상태 반영
+- [x] desired/effective subscription 관리
+- [ ] events 기반 캐시 동기화
+- [ ] query tools (`contexts/votes/subscriptions/status`)
+- [ ] read-through 정책과 cache freshness 표면화
+- [ ] doctor/health에 stale or degraded 상태 반영
+
+Phase 3 current status (2026-03-29):
+- 완료된 3개 구현 묶음: desired/effective subscription SQLite persistence 추가 (`cb_subscription_state`, `cb_desired_subscriptions`, `cb_effective_subscriptions`)
+- 완료된 3개 구현 묶음: `ContextBookService`에 remote `GET/PUT /subscriptions` read-through 연결, service-only 경로에서도 explicit subscription read/write 지원
+- 완료된 3개 구현 묶음: `context_book_subscriptions_get`, `context_book_subscriptions_set` tool 추가 및 doctor/status에 cached subscription/degraded contract 노출 연결
+- 다음 턴 시작 지점: `Phase 3`의 `events 기반 캐시 동기화`에서 `subscription.updated` 및 이후 context/vote read path snapshot sync를 연결한다.
 
 ### Phase 4 (Write Path)
 - context CRUD 툴/서비스
@@ -370,21 +385,21 @@ Phase 2 current status (2026-03-29):
 
 우선순위 순:
 
-1. `Phase 2` 마무리: post-bootstrap contract validation + degraded mode 결정 경로 구현
-- 연결 직후 서버 capability/runtime behavior를 검증하고, 불일치 시 `read_only`, `no_refresh`, `no_write`, `disconnect` 같은 명시적 degraded mode로 전이
-- 최소 검증 항목: lifecycle/connection 분리, desired/effective subscription 분리, `vote.deleted`, `409 CURSOR_NOT_FOUND`, refresh capability
+1. `Phase 3` 계속: events 기반 캐시 동기화
+- `subscription.updated`를 포함한 control-plane 이벤트로 desired/effective subscription snapshot 갱신
+- 이후 context/vote snapshot sync 경로를 동일 transaction/dedup 경계에 맞춰 확장
 
-2. live refresh contract 정리
-- 현재 계획은 OAuth refresh grant (`POST /oauth2/token`)를 기본값으로 두고 있지만, 실서버는 2026-03-29에 `404`를 반환했음
-- 다음 세션에서는 spec 원문과 live deployment를 대조해 `legacy /auth/refresh` fallback을 둘지, capability probe를 둘지, `refresh disabled` degraded mode를 둘지 결정해야 함
+2. query tools / read-through 확장
+- `contexts_query`, `votes_query`, `subscriptions_get/status`를 같은 상태 모델에 맞춰 정리
+- cache hit/miss, freshness, degraded contract를 tool 응답과 doctor surface에 일관되게 노출
 
-3. `Phase 3` 시작: desired/effective subscription 관리
-- worker/store/service에 desired/effective subscription persistence 추가
-- query tool과 doctor stale/degraded surface를 이 상태 모델에 맞춰 연결
+3. `vote.deleted` / data-plane contract verification 보강
+- 현재 runtime contract snapshot은 `vote.deleted`를 parser/상태 모델에서 수용하지만 live probe는 아직 `unknown`으로 남겨 둠
+- 다음 세션에서는 spec/live를 대조해 explicit verification 또는 capability source를 추가
 
 4. daemon end-to-end live verification 보강
-- 현재는 `ContextBookClient` live test로 bootstrap/auth/activation/SSE open을 검증했음
-- 다음 세션에서는 daemon worker 전체 경로를 live server 기준으로 한 번 더 검증해 persisted runtime snapshot과 auth profile resume까지 확인
+- 현재는 `ContextBookClient` live test로 bootstrap/auth/activation/SSE open + contract probe를 검증했음
+- 다음 세션에서는 daemon worker 전체 경로를 live server 기준으로 한 번 더 검증해 persisted runtime snapshot, degraded mode surface, auth profile resume까지 확인
 
 ## 9. Testing & Verification Checklist
 

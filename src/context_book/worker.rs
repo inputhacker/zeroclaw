@@ -1,6 +1,7 @@
 use super::ContextBookHandle;
 use super::client::{ContextBookClient, ContextBookClientErrorKind};
 use super::events::{ContextBookSseParser, ParsedContextBookSseFrame};
+use super::handle::{ContextBookContractValidationState, ContextBookDegradedMode};
 use crate::config::Config;
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
@@ -108,9 +109,27 @@ async fn connect_and_sync_once(
         .await
         .map_err(anyhow::Error::new)
         .context("failed to activate Context Book agent")?;
+    let contract = client
+        .validate_runtime_contract(&session)
+        .await
+        .map_err(anyhow::Error::new)
+        .context("failed to validate Context Book runtime contract")?;
+    let disconnect_required = contract
+        .degraded_modes
+        .contains(&ContextBookDegradedMode::Disconnect);
+    let validation_state = contract.validation_state;
+    handle.apply_contract_snapshot(contract);
+    persist_runtime_state(handle)?;
+    if disconnect_required {
+        anyhow::bail!("Context Book runtime contract validation requires disconnect");
+    }
     handle.mark_session_ready(
         &session.agent_id,
-        "context_book session ready; opening events stream",
+        if validation_state == ContextBookContractValidationState::Validated {
+            "context_book session ready; contract validated and opening events stream"
+        } else {
+            "context_book session ready; opening events stream in degraded mode"
+        },
     );
     persist_runtime_state(handle)?;
 
@@ -248,10 +267,11 @@ mod tests {
     use crate::context_book::shared_handle;
     use axum::{
         Router,
+        extract::Query,
         extract::State,
         http::{HeaderMap, StatusCode},
         response::IntoResponse,
-        routing::{get, patch},
+        routing::{get, patch, post},
     };
     use chrono::{Duration as ChronoDuration, Utc};
     use std::collections::BTreeMap;
@@ -311,7 +331,24 @@ mod tests {
                 .into_response()
         }
 
-        async fn events(State(state): State<WorkerAppState>) -> impl IntoResponse {
+        async fn events(
+            State(state): State<WorkerAppState>,
+            Query(query): Query<std::collections::HashMap<String, String>>,
+        ) -> impl IntoResponse {
+            if query.get("sinceEventId").map(String::as_str)
+                == Some("__zeroclaw_contract_probe_cursor__")
+            {
+                return (
+                    StatusCode::CONFLICT,
+                    axum::Json(serde_json::json!({
+                        "error": {
+                            "code": "CURSOR_NOT_FOUND",
+                            "message": "missing cursor"
+                        }
+                    })),
+                )
+                    .into_response();
+            }
             state.poll_calls.fetch_add(1, Ordering::SeqCst);
             axum::Json(serde_json::json!([
                 {
@@ -333,6 +370,37 @@ mod tests {
                     "meta": {}
                 }
             ]))
+            .into_response()
+        }
+
+        async fn agents() -> impl IntoResponse {
+            axum::Json(serde_json::json!([
+                {
+                    "agentId": "workspace",
+                    "lifecycleState": "Active",
+                    "connectionState": "Disconnected"
+                }
+            ]))
+        }
+
+        async fn subscriptions() -> impl IntoResponse {
+            axum::Json(serde_json::json!({
+                "consumerAgentId": "workspace",
+                "desiredProducerAgentIds": ["peer-a"],
+                "effectiveProducerAgentIds": ["peer-a"]
+            }))
+        }
+
+        async fn legacy_refresh() -> impl IntoResponse {
+            (
+                StatusCode::BAD_REQUEST,
+                axum::Json(serde_json::json!({
+                    "error": {
+                        "code": "REFRESH_TOKEN_REQUIRED",
+                        "message": "missing refresh token"
+                    }
+                })),
+            )
         }
 
         let app_state = WorkerAppState {
@@ -340,8 +408,11 @@ mod tests {
         };
         let app = Router::new()
             .route("/agents/workspace/status", patch(patch_status))
+            .route("/agents", get(agents))
+            .route("/subscriptions", get(subscriptions))
             .route("/events/stream", get(events_stream))
             .route("/events", get(events))
+            .route("/auth/refresh", post(legacy_refresh))
             .with_state(app_state.clone());
         let listener = TcpListener::bind("127.0.0.1:0")
             .await

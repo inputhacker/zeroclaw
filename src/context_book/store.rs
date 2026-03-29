@@ -24,6 +24,14 @@ pub struct ContextBookPersistedRuntimeState {
     pub updated_at: String,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ContextBookSubscriptionsSnapshot {
+    pub consumer_agent_id: Option<String>,
+    pub desired_producer_agent_ids: Vec<String>,
+    pub effective_producer_agent_ids: Vec<String>,
+    pub updated_at: String,
+}
+
 #[derive(Debug)]
 pub struct ContextBookStore {
     path: PathBuf,
@@ -70,6 +78,19 @@ impl ContextBookStore {
                      producer_agent_id TEXT NOT NULL,
                      raw_json TEXT NOT NULL,
                      recorded_at TEXT NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS cb_subscription_state (
+                     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                     consumer_agent_id TEXT,
+                     updated_at TEXT NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS cb_desired_subscriptions (
+                     producer_agent_id TEXT PRIMARY KEY,
+                     updated_at TEXT NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS cb_effective_subscriptions (
+                     producer_agent_id TEXT PRIMARY KEY,
+                     updated_at TEXT NOT NULL
                  );",
             )
             .context("failed to initialize context_book schema")?;
@@ -249,6 +270,89 @@ impl ContextBookStore {
         })
     }
 
+    pub fn save_subscriptions(&self, snapshot: &ContextBookSubscriptionsSnapshot) -> Result<()> {
+        self.initialize()?;
+        self.with_connection(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute(
+                "INSERT INTO cb_subscription_state (singleton, consumer_agent_id, updated_at)
+                 VALUES (1, ?1, ?2)
+                 ON CONFLICT(singleton) DO UPDATE SET
+                     consumer_agent_id = excluded.consumer_agent_id,
+                     updated_at = excluded.updated_at",
+                params![snapshot.consumer_agent_id, snapshot.updated_at,],
+            )
+            .context("failed to persist subscription state metadata")?;
+            tx.execute("DELETE FROM cb_desired_subscriptions", [])
+                .context("failed to clear desired subscriptions")?;
+            tx.execute("DELETE FROM cb_effective_subscriptions", [])
+                .context("failed to clear effective subscriptions")?;
+
+            for producer_agent_id in normalize_agent_ids(&snapshot.desired_producer_agent_ids) {
+                tx.execute(
+                    "INSERT INTO cb_desired_subscriptions (producer_agent_id, updated_at)
+                     VALUES (?1, ?2)",
+                    params![producer_agent_id, snapshot.updated_at],
+                )
+                .context("failed to persist desired subscription")?;
+            }
+
+            for producer_agent_id in normalize_agent_ids(&snapshot.effective_producer_agent_ids) {
+                tx.execute(
+                    "INSERT INTO cb_effective_subscriptions (producer_agent_id, updated_at)
+                     VALUES (?1, ?2)",
+                    params![producer_agent_id, snapshot.updated_at],
+                )
+                .context("failed to persist effective subscription")?;
+            }
+
+            tx.commit()
+                .context("failed to commit subscription snapshot transaction")?;
+            Ok(())
+        })
+    }
+
+    pub fn load_subscriptions(&self) -> Result<Option<ContextBookSubscriptionsSnapshot>> {
+        if !self.path.exists() {
+            return Ok(None);
+        }
+
+        self.with_connection(|conn| {
+            let metadata = conn
+                .query_row(
+                    "SELECT consumer_agent_id, updated_at
+                     FROM cb_subscription_state
+                     WHERE singleton = 1",
+                    [],
+                    |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?)),
+                )
+                .optional()?;
+            let Some((consumer_agent_id, updated_at)) = metadata else {
+                return Ok(None);
+            };
+
+            let desired_producer_agent_ids = read_subscription_ids(
+                conn,
+                "SELECT producer_agent_id
+                 FROM cb_desired_subscriptions
+                 ORDER BY producer_agent_id ASC",
+            )?;
+            let effective_producer_agent_ids = read_subscription_ids(
+                conn,
+                "SELECT producer_agent_id
+                 FROM cb_effective_subscriptions
+                 ORDER BY producer_agent_id ASC",
+            )?;
+
+            Ok(Some(ContextBookSubscriptionsSnapshot {
+                consumer_agent_id,
+                desired_producer_agent_ids,
+                effective_producer_agent_ids,
+                updated_at,
+            }))
+        })
+    }
+
     pub fn load_runtime_state(&self) -> Result<Option<ContextBookPersistedRuntimeState>> {
         if !self.path.exists() {
             return Ok(None);
@@ -317,6 +421,27 @@ impl ContextBookStore {
             .context("failed to configure context_book sqlite busy timeout")?;
         f(&mut conn)
     }
+}
+
+fn read_subscription_ids(conn: &Connection, query: &str) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(query)?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    let ids = rows
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .context("failed to read subscription IDs")?;
+    Ok(ids)
+}
+
+fn normalize_agent_ids(values: &[String]) -> Vec<String> {
+    let mut ids = values
+        .iter()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    ids.sort_unstable();
+    ids.dedup();
+    ids
 }
 
 #[cfg(test)]
@@ -405,5 +530,41 @@ mod tests {
             .expect("load runtime")
             .expect("persisted runtime");
         assert_eq!(persisted.last_event_id.as_deref(), Some("evt-002"));
+    }
+
+    #[test]
+    fn store_round_trips_subscription_snapshots() {
+        let tmp = TempDir::new().expect("temp dir");
+        let store = ContextBookStore::new(tmp.path().join("context_book").join("cache.db"));
+        let snapshot = ContextBookSubscriptionsSnapshot {
+            consumer_agent_id: Some("zc-agent".into()),
+            desired_producer_agent_ids: vec![
+                "peer-b".into(),
+                "peer-a".into(),
+                "peer-a".into(),
+                String::new(),
+            ],
+            effective_producer_agent_ids: vec!["peer-b".into(), "peer-c".into()],
+            updated_at: "2026-03-29T00:00:00Z".into(),
+        };
+
+        store
+            .save_subscriptions(&snapshot)
+            .expect("save subscription snapshot");
+
+        let persisted = store
+            .load_subscriptions()
+            .expect("load subscription snapshot")
+            .expect("persisted subscriptions");
+        assert_eq!(persisted.consumer_agent_id.as_deref(), Some("zc-agent"));
+        assert_eq!(
+            persisted.desired_producer_agent_ids,
+            vec!["peer-a".to_string(), "peer-b".to_string()]
+        );
+        assert_eq!(
+            persisted.effective_producer_agent_ids,
+            vec!["peer-b".to_string(), "peer-c".to_string()]
+        );
+        assert_eq!(persisted.updated_at, "2026-03-29T00:00:00Z");
     }
 }

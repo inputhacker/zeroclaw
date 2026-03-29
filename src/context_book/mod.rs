@@ -13,11 +13,16 @@ pub use config::ResolvedContextBookConfig;
 #[allow(unused_imports)]
 pub use events::{ContextBookEventEnvelope, ContextBookSseParser, ParsedContextBookSseFrame};
 #[allow(unused_imports)]
-pub use handle::{ContextBookHandle, ContextBookRuntimeSnapshot};
+pub use handle::{
+    ContextBookContractSnapshot, ContextBookContractValidationState, ContextBookDegradedMode,
+    ContextBookHandle, ContextBookRefreshMode, ContextBookRuntimeSnapshot,
+};
 #[allow(unused_imports)]
 pub use service::{ContextBookService, ContextBookStatusReport};
 #[allow(unused_imports)]
-pub use store::{ContextBookPersistedRuntimeState, ContextBookStore};
+pub use store::{
+    ContextBookPersistedRuntimeState, ContextBookStore, ContextBookSubscriptionsSnapshot,
+};
 
 use crate::config::Config;
 use parking_lot::Mutex;
@@ -54,7 +59,7 @@ pub fn bootstrap(config: &Config) -> ContextBookBootstrap {
     let mut registry = registry().lock();
     let resolved = config::ResolvedContextBookConfig::resolve(config);
     if let Some(handle) = registry.get(&key) {
-        handle.refresh_resolved_config(resolved);
+        handle.refresh_config(config.clone(), resolved);
         return ContextBookBootstrap {
             handle: handle.clone(),
             service: ContextBookService::new(handle.clone()),
@@ -62,7 +67,7 @@ pub fn bootstrap(config: &Config) -> ContextBookBootstrap {
     }
 
     let store = Arc::new(store::ContextBookStore::new(resolved.cache_db_path.clone()));
-    let handle = handle::ContextBookHandleState::shared(resolved, store);
+    let handle = handle::ContextBookHandleState::shared(config.clone(), resolved, store);
     registry.insert(key, handle.clone());
     ContextBookBootstrap {
         handle: handle.clone(),

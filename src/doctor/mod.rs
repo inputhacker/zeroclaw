@@ -905,8 +905,14 @@ fn check_daemon_state(config: &Config, items: &mut Vec<DiagItem>) {
         let resolved = context_book
             .get("resolved")
             .and_then(serde_json::Value::as_object);
+        let contract = context_book
+            .get("contract")
+            .and_then(serde_json::Value::as_object);
         let persisted = context_book
             .get("persisted_runtime")
+            .and_then(serde_json::Value::as_object);
+        let subscriptions = context_book
+            .get("persisted_subscriptions")
             .and_then(serde_json::Value::as_object);
         let enabled = runtime
             .get("enabled")
@@ -1032,6 +1038,65 @@ fn check_daemon_state(config: &Config, items: &mut Vec<DiagItem>) {
                     "context_book auth contract: bearer via {bearer_token_source}, refresh via {refresh_owner} ({refresh_protocol}, legacy={legacy_refresh})"
                 ),
             ));
+
+            let contract_state = contract
+                .and_then(|contract| contract.get("validation_state"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown");
+            let refresh_mode = contract
+                .and_then(|contract| contract.get("refresh_mode"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown");
+            let degraded_modes = contract
+                .and_then(|contract| contract.get("degraded_modes"))
+                .and_then(serde_json::Value::as_array)
+                .map(|modes| {
+                    modes
+                        .iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            if degraded_modes.is_empty() {
+                items.push(DiagItem::ok(
+                    cat,
+                    format!(
+                        "context_book runtime contract {contract_state} (refresh_mode={refresh_mode})"
+                    ),
+                ));
+            } else {
+                items.push(DiagItem::warn(
+                    cat,
+                    format!(
+                        "context_book runtime contract {contract_state} with degraded modes: {} (refresh_mode={refresh_mode})",
+                        degraded_modes.join(", ")
+                    ),
+                ));
+            }
+
+            if let Some(subscriptions) = subscriptions {
+                let desired = subscriptions
+                    .get("desired_producer_agent_ids")
+                    .or_else(|| subscriptions.get("desiredProducerAgentIds"))
+                    .and_then(serde_json::Value::as_array)
+                    .map_or(0, std::vec::Vec::len);
+                let effective = subscriptions
+                    .get("effective_producer_agent_ids")
+                    .or_else(|| subscriptions.get("effectiveProducerAgentIds"))
+                    .and_then(serde_json::Value::as_array)
+                    .map_or(0, std::vec::Vec::len);
+                items.push(DiagItem::ok(
+                    cat,
+                    format!(
+                        "context_book cached subscriptions: desired={desired}, effective={effective}"
+                    ),
+                ));
+            } else {
+                items.push(DiagItem::warn(
+                    cat,
+                    "context_book cached subscriptions unavailable",
+                ));
+            }
         }
     } else {
         items.push(DiagItem::warn(
@@ -1487,6 +1552,11 @@ mod tests {
                     "refresh_protocol": "oauth2_token",
                     "legacy_refresh_enabled": false
                 },
+                "contract": {
+                    "validation_state": "degraded",
+                    "refresh_mode": "legacy_auth_refresh",
+                    "degraded_modes": ["no_refresh", "no_write"]
+                },
                 "runtime": {
                     "enabled": true,
                     "worker_state": "idle",
@@ -1497,6 +1567,10 @@ mod tests {
                 },
                 "persisted_runtime": {
                     "updated_at": Utc::now().to_rfc3339()
+                },
+                "persisted_subscriptions": {
+                    "desired_producer_agent_ids": ["peer-a", "peer-b"],
+                    "effective_producer_agent_ids": ["peer-a"]
                 }
             }
         });
@@ -1509,6 +1583,16 @@ mod tests {
         assert!(items.iter().any(|item| {
             item.message
                 .contains("context_book auth contract: bearer via auth_service")
+                && item.severity == Severity::Ok
+        }));
+        assert!(items.iter().any(|item| {
+            item.message
+                .contains("context_book runtime contract degraded")
+                && item.severity == Severity::Warn
+        }));
+        assert!(items.iter().any(|item| {
+            item.message
+                .contains("cached subscriptions: desired=2, effective=1")
                 && item.severity == Severity::Ok
         }));
         assert!(items.iter().any(|item| {

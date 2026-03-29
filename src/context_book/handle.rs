@@ -1,12 +1,53 @@
 use super::config::ResolvedContextBookConfig;
 use super::service::ContextBookStatusReport;
 use super::store::ContextBookStore;
+use crate::config::Config;
 use chrono::Utc;
 use parking_lot::RwLock;
 use serde::Serialize;
 use std::sync::Arc;
 
 pub type ContextBookHandle = Arc<ContextBookHandleState>;
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextBookDegradedMode {
+    ReadOnly,
+    NoRefresh,
+    NoWrite,
+    Disconnect,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextBookContractValidationState {
+    Unknown,
+    Validated,
+    Degraded,
+    Invalid,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextBookRefreshMode {
+    Unknown,
+    OAuth2Token,
+    LegacyAuthRefresh,
+    Disabled,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ContextBookContractSnapshot {
+    pub validation_state: ContextBookContractValidationState,
+    pub checked_at: Option<String>,
+    pub lifecycle_connection_split: Option<bool>,
+    pub subscriptions_desired_effective_split: Option<bool>,
+    pub cursor_not_found_returns_409: Option<bool>,
+    pub vote_deleted_supported: Option<bool>,
+    pub refresh_mode: ContextBookRefreshMode,
+    pub degraded_modes: Vec<ContextBookDegradedMode>,
+    pub notes: Vec<String>,
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ContextBookRuntimeSnapshot {
@@ -29,13 +70,16 @@ pub struct ContextBookRuntimeSnapshot {
 }
 
 pub struct ContextBookHandleState {
+    source_config: RwLock<Config>,
     resolved: RwLock<ResolvedContextBookConfig>,
     store: Arc<ContextBookStore>,
     runtime: RwLock<ContextBookRuntimeSnapshot>,
+    contract: RwLock<ContextBookContractSnapshot>,
 }
 
 impl ContextBookHandleState {
     pub fn shared(
+        config: Config,
         resolved: ResolvedContextBookConfig,
         store: Arc<ContextBookStore>,
     ) -> ContextBookHandle {
@@ -64,17 +108,37 @@ impl ContextBookHandleState {
         };
 
         Arc::new(Self {
+            source_config: RwLock::new(config),
             resolved: RwLock::new(resolved),
             store,
             runtime: RwLock::new(runtime),
+            contract: RwLock::new(ContextBookContractSnapshot {
+                validation_state: ContextBookContractValidationState::Unknown,
+                checked_at: None,
+                lifecycle_connection_split: None,
+                subscriptions_desired_effective_split: None,
+                cursor_not_found_returns_409: None,
+                vote_deleted_supported: None,
+                refresh_mode: ContextBookRefreshMode::Unknown,
+                degraded_modes: Vec::new(),
+                notes: Vec::new(),
+            }),
         })
+    }
+
+    pub fn source_config(&self) -> Config {
+        self.source_config.read().clone()
     }
 
     pub fn resolved_config(&self) -> ResolvedContextBookConfig {
         self.resolved.read().clone()
     }
 
-    pub fn refresh_resolved_config(&self, resolved: ResolvedContextBookConfig) {
+    pub fn refresh_config(&self, config: Config, resolved: ResolvedContextBookConfig) {
+        {
+            let mut current = self.source_config.write();
+            *current = config;
+        }
         {
             let mut current = self.resolved.write();
             *current = resolved.clone();
@@ -101,6 +165,51 @@ impl ContextBookHandleState {
 
     pub fn snapshot(&self) -> ContextBookRuntimeSnapshot {
         self.runtime.read().clone()
+    }
+
+    pub fn contract_snapshot(&self) -> ContextBookContractSnapshot {
+        self.contract.read().clone()
+    }
+
+    pub fn apply_contract_snapshot(&self, contract: ContextBookContractSnapshot) {
+        let validation_state = contract.validation_state;
+        let degraded_modes = contract.degraded_modes.clone();
+        let notes = contract.notes.clone();
+        {
+            let mut current = self.contract.write();
+            *current = contract;
+        }
+
+        self.update_runtime(|runtime| {
+            runtime.status_message = Some(match validation_state {
+                ContextBookContractValidationState::Validated => {
+                    "context_book contract validated".to_string()
+                }
+                ContextBookContractValidationState::Degraded => {
+                    format!(
+                        "context_book contract degraded: {}",
+                        degraded_modes
+                            .iter()
+                            .map(|mode| degraded_mode_name(*mode))
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    )
+                }
+                ContextBookContractValidationState::Invalid => {
+                    "context_book contract invalid".to_string()
+                }
+                ContextBookContractValidationState::Unknown => {
+                    "context_book contract not yet validated".to_string()
+                }
+            });
+            if validation_state == ContextBookContractValidationState::Invalid {
+                runtime.last_error = Some(notes.join("; "));
+            }
+        });
+    }
+
+    pub fn has_degraded_mode(&self, mode: ContextBookDegradedMode) -> bool {
+        self.contract.read().degraded_modes.contains(&mode)
     }
 
     pub fn mark_disabled(&self) {
@@ -241,11 +350,17 @@ impl ContextBookHandleState {
             tracing::debug!("context_book status could not load persisted runtime: {error}");
             None
         });
+        let persisted_subscriptions = self.store.load_subscriptions().unwrap_or_else(|error| {
+            tracing::debug!("context_book status could not load subscriptions: {error}");
+            None
+        });
 
         ContextBookStatusReport {
             resolved: self.resolved_config(),
             runtime: self.snapshot(),
+            contract: self.contract_snapshot(),
             persisted_runtime,
+            persisted_subscriptions,
         }
     }
 
@@ -261,4 +376,13 @@ impl ContextBookHandleState {
 
 fn now_rfc3339() -> String {
     Utc::now().to_rfc3339()
+}
+
+fn degraded_mode_name(mode: ContextBookDegradedMode) -> &'static str {
+    match mode {
+        ContextBookDegradedMode::ReadOnly => "read_only",
+        ContextBookDegradedMode::NoRefresh => "no_refresh",
+        ContextBookDegradedMode::NoWrite => "no_write",
+        ContextBookDegradedMode::Disconnect => "disconnect",
+    }
 }

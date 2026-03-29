@@ -37,6 +37,8 @@ Repository: `zeroclaw`
 - heartbeat/keepalive는 transport-only로 취급(비즈니스 이벤트로 저장/전달 금지)
 - `409 CURSOR_NOT_FOUND` 명시 처리(리플레이/커서 리셋 정책)
 - `POST /agents/connect`의 `403 BOOTSTRAP_APPROVAL_REQUIRED`는 기존 identity의 connect-side reapproval으로 처리하고, 같은 request의 wait/complete 흐름으로 이어간다
+- bootstrap wait metadata는 top-level 뿐 아니라 nested `request.waitToken` / `request.statusUrl` / `request.completeUrl` shape도 허용해야 한다
+- token 응답의 agent identity는 top-level `agentId`뿐 아니라 nested `agent.agentId` shape도 허용해야 한다
 - `desiredProducerAgentIds`와 `effectiveProducerAgentIds` 분리 유지
 - transient disconnect 시 desired subscription 의도 보존
 - `agent.connection.changed`, `vote.deleted` 명시 처리
@@ -225,6 +227,8 @@ Repository: `zeroclaw`
 - `403 BOOTSTRAP_APPROVAL_REQUIRED` + request-scoped wait metadata가 오면, 기존 identity에 대한 connect-side reapproval로 간주하고 `register/init`로 되돌아가지 않은 채 동일 request의 wait/complete 흐름을 이어간다
 - `404 AGENT_NOT_REGISTERED` 시 `POST /bootstrap/register/init`
 - 필요 시 request-scoped wait(`status` 또는 `watch`) 후 `complete`
+- wait metadata와 token payload는 deployment별 shape 차이(top-level vs nested `request.*`, top-level `agentId` vs nested `agent.agentId`)를 허용하는 parser로 처리한다
+- 기본 `device_type`는 서버 허용값 집합(`android_mobile|tv|notepc|unknown`) 밖의 값을 기본값으로 가정하지 않는다
 - 토큰 획득 후 `PATCH /agents/{agentId}/status` -> `Active`
 - 토큰 저장은 기존 auth/secrets 계층을 재사용한다
 - bearer token 조회는 기존 `AuthService` 경로를 우선 사용한다
@@ -305,6 +309,12 @@ Additional validation for Phase 2 on 2026-03-29:
 - `cargo test context_book:: --lib`
 - `avahi-browse -rt _contextbook._tcp` → 실서버 광고 확인 (`context-book-local`, `127.0.1.1:8080`, TXT feature 광고 존재)
 - `curl http://127.0.1.1:8080/` → unauthenticated preflight 정상 (`service=context-book`, `status=ok`)
+- `cargo test context_book::client:: --lib`
+- `CONTEXT_BOOK_BOOTSTRAP_SHARED_SECRET=... cargo test live_client_bootstraps_against_context_book_server --lib -- --ignored --nocapture` → 실서버 bootstrap request 생성, dashboard approval, token 저장, `PATCH status=Active`, `GET /events/stream` open까지 통과
+- 수동 live HTTP 검증:
+  - `POST /bootstrap/register/init` + dashboard approval + `POST /bootstrap/register/complete` 성공
+  - bearer `GET /agents`, `PATCH /agents/{id}/status`, `GET /events/stream`, 재연결용 `POST /agents/connect` 성공
+  - `POST /oauth2/token`은 `404 Not Found`로 응답하여 refresh contract 불일치 확인
 
 ### Phase 2 (Connectivity)
 - [x] bootstrap/connect/refresh + SSE consume + dedup + cursor persistence
@@ -314,13 +324,20 @@ Additional validation for Phase 2 on 2026-03-29:
 - [x] refresh endpoint/protocol 계약(`oauth2/token` 기본, legacy `/auth/refresh` 호환 여부) 구현 반영
 - [x] graceful shutdown / resume 계약 반영
 - [x] runtime proxy + outbound host validation 경로 연결
-- post-bootstrap contract validation 및 degraded 모드 결정 경로 연결
+- [ ] post-bootstrap contract validation 및 degraded 모드 결정 경로 연결
 
 Phase 2 current status (2026-03-29):
 - 완료된 3개 구현 묶음: `context_book::client` 추가, bootstrap/connect/register/reapproval wait-complete flow 구현, OAuth `POST /oauth2/token` refresh 및 auth profile 재사용 연결
 - 완료된 3개 구현 묶음: worker SSE consume + heartbeat suppression + event dedup + cursor persistence + best-effort shutdown `Inactive` 전이
 - 완료된 3개 구현 묶음: polling fallback + `409 CURSOR_NOT_FOUND` cursor reset + resume persistence + runtime proxy/host validation 연결
-- 다음 턴 시작 지점: `Phase 2`의 마지막 남은 작업인 `post-bootstrap contract validation 및 degraded mode 결정 경로`부터 진행한다. 이 작업이 끝나면 `Phase 3`의 첫 작업인 `desired/effective subscription 관리`로 넘어간다.
+- 완료된 3개 구현 묶음: live 서버 응답 형태에 맞춰 nested bootstrap wait metadata parsing, nested `agent.agentId` token parsing, 기본 `device_type=unknown` fallback 정렬
+- 라이브 검증 결과로 확인된 계약 차이:
+  - 서버는 `deviceType=daemon`을 거부하고 `android_mobile|tv|notepc|unknown`만 허용함
+  - bootstrap wait metadata가 top-level이 아니라 `request.waitToken/statusUrl/completeUrl` 아래에 내려올 수 있음
+  - token 응답의 agent identity가 top-level `agentId`가 아니라 `agent.agentId`로 내려올 수 있음
+  - 현재 실서버(2026-03-29)는 `POST /oauth2/token`에 `404 Not Found`를 반환했으므로 refresh contract는 문서 가정과 live deployment 사이에 불일치가 있음
+- 다음 턴 시작 지점: `Phase 2`의 마지막 남은 작업인 `post-bootstrap contract validation 및 degraded mode 결정 경로`부터 진행한다.
+- 그 다음 우선순위는 `live refresh contract detection/fallback` 정리이며, 이 작업이 끝나면 `Phase 3`의 첫 작업인 `desired/effective subscription 관리`로 넘어간다.
 
 ### Phase 3 (Subscriptions + Read Path)
 - desired/effective subscription 관리
@@ -348,6 +365,26 @@ Phase 2 current status (2026-03-29):
 - observability/log redaction/성능 점검
 - SQLite contention / transaction 경계 / restart recovery 검증
 - config reload 또는 credential rotation 이후 재검증 동작 확인
+
+## 8.5 Next Session Priorities
+
+우선순위 순:
+
+1. `Phase 2` 마무리: post-bootstrap contract validation + degraded mode 결정 경로 구현
+- 연결 직후 서버 capability/runtime behavior를 검증하고, 불일치 시 `read_only`, `no_refresh`, `no_write`, `disconnect` 같은 명시적 degraded mode로 전이
+- 최소 검증 항목: lifecycle/connection 분리, desired/effective subscription 분리, `vote.deleted`, `409 CURSOR_NOT_FOUND`, refresh capability
+
+2. live refresh contract 정리
+- 현재 계획은 OAuth refresh grant (`POST /oauth2/token`)를 기본값으로 두고 있지만, 실서버는 2026-03-29에 `404`를 반환했음
+- 다음 세션에서는 spec 원문과 live deployment를 대조해 `legacy /auth/refresh` fallback을 둘지, capability probe를 둘지, `refresh disabled` degraded mode를 둘지 결정해야 함
+
+3. `Phase 3` 시작: desired/effective subscription 관리
+- worker/store/service에 desired/effective subscription persistence 추가
+- query tool과 doctor stale/degraded surface를 이 상태 모델에 맞춰 연결
+
+4. daemon end-to-end live verification 보강
+- 현재는 `ContextBookClient` live test로 bootstrap/auth/activation/SSE open을 검증했음
+- 다음 세션에서는 daemon worker 전체 경로를 live server 기준으로 한 번 더 검증해 persisted runtime snapshot과 auth profile resume까지 확인
 
 ## 9. Testing & Verification Checklist
 
@@ -443,3 +480,4 @@ Phase 2 current status (2026-03-29):
 4. 추가로 `daemon-only worker ownership`, `general user turn은 tool-only integration`, `outbound proxy/host validation`, `ctxbk spec 접근성` 네 항목을 먼저 확인
 5. 각 Phase 종료 시 체크리스트와 테스트 결과 업데이트
 6. 변경된 파일/동작/리스크를 문서에 즉시 반영
+7. 다음 세션 시작 직후에는 `8.5 Next Session Priorities`의 1번부터 처리하고, live refresh mismatch(`POST /oauth2/token` → `404`)가 정리되기 전까지는 `Phase 3`를 시작하지 않는다

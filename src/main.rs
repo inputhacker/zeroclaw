@@ -81,6 +81,7 @@ mod rag {
     pub use zeroclaw::rag::*;
 }
 mod config;
+mod context_book;
 mod cost;
 mod cron;
 mod daemon;

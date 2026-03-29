@@ -213,6 +213,7 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
         opencode_cli: crate::config::OpenCodeCliConfig::default(),
         sop: crate::config::SopConfig::default(),
         shell_tool: crate::config::ShellToolConfig::default(),
+        context_book: crate::config::ContextBookConfig::default(),
     };
 
     println!(
@@ -660,6 +661,7 @@ async fn run_quick_setup_with_home(
         opencode_cli: crate::config::OpenCodeCliConfig::default(),
         sop: crate::config::SopConfig::default(),
         shell_tool: crate::config::ShellToolConfig::default(),
+        context_book: crate::config::ContextBookConfig::default(),
     };
 
     config.save().await?;

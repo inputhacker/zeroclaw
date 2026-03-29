@@ -1,4 +1,5 @@
 use crate::config::Config;
+use crate::context_book::ContextBookHandle;
 use anyhow::Result;
 use chrono::Utc;
 use std::future::Future;
@@ -51,6 +52,7 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
         .reliability
         .channel_max_backoff_secs
         .max(initial_backoff);
+    let context_book_handle = crate::context_book::shared_handle(&config);
 
     crate::health::mark_component_ok("daemon");
 
@@ -60,7 +62,10 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
                 .await;
     }
 
-    let mut handles: Vec<JoinHandle<()>> = vec![spawn_state_writer(config.clone())];
+    let mut handles: Vec<JoinHandle<()>> = vec![spawn_state_writer(
+        config.clone(),
+        Some(context_book_handle.clone()),
+    )];
 
     {
         let gateway_cfg = config.clone();
@@ -124,9 +129,28 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
         tracing::info!("Cron disabled; scheduler supervisor not started");
     }
 
+    if config.context_book.enabled {
+        let context_book_cfg = config.clone();
+        let handle = context_book_handle.clone();
+        handles.push(spawn_component_supervisor(
+            "context_book",
+            initial_backoff,
+            max_backoff,
+            move || {
+                let cfg = context_book_cfg.clone();
+                let handle = handle.clone();
+                async move { Box::pin(crate::context_book::worker::run(cfg, handle)).await }
+            },
+        ));
+    } else {
+        context_book_handle.mark_disabled();
+        crate::health::mark_component_ok("context_book");
+        tracing::info!("Context Book disabled; worker supervisor not started");
+    }
+
     println!("🧠 ZeroClaw daemon started");
     println!("   Gateway:  http://{host}:{port}");
-    println!("   Components: gateway, channels, heartbeat, scheduler");
+    println!("   Components: gateway, channels, heartbeat, scheduler, context_book");
     if config.gateway.require_pairing {
         println!("   Pairing:    enabled (code appears in gateway output above)");
     }
@@ -154,7 +178,7 @@ pub fn state_file_path(config: &Config) -> PathBuf {
         .join("daemon_state.json")
 }
 
-fn spawn_state_writer(config: Config) -> JoinHandle<()> {
+fn spawn_state_writer(config: Config, context_book: Option<ContextBookHandle>) -> JoinHandle<()> {
     tokio::spawn(async move {
         let path = state_file_path(&config);
         if let Some(parent) = path.parent() {
@@ -170,6 +194,11 @@ fn spawn_state_writer(config: Config) -> JoinHandle<()> {
                     "written_at".into(),
                     serde_json::json!(Utc::now().to_rfc3339()),
                 );
+                if let Some(handle) = &context_book {
+                    let context_book_json = serde_json::to_value(handle.status_report())
+                        .unwrap_or_else(|_| serde_json::json!({"error": "failed to serialize"}));
+                    obj.insert("context_book".into(), context_book_json);
+                }
             }
             let data = serde_json::to_vec_pretty(&json).unwrap_or_else(|_| b"{}".to_vec());
             let _ = tokio::fs::write(&path, data).await;
@@ -833,8 +862,11 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp);
 
+        let handle = crate::context_book::shared_handle(&config);
         let path = state_file_path(&config);
         assert_eq!(path, tmp.path().join("daemon_state.json"));
+        let status = handle.status_report();
+        assert!(!status.runtime.enabled);
     }
 
     #[tokio::test]

@@ -1,6 +1,6 @@
 # CONTEXT_BOOK_INTEGRATION_PLAN
 
-Last updated: 2026-03-28
+Last updated: 2026-03-29
 Repository: `zeroclaw`
 
 ## 1. Goal
@@ -269,15 +269,29 @@ Repository: `zeroclaw`
 ## 8. Implementation Phases
 
 ### Phase 1 (Foundation)
-- `context_book` config + module skeleton + store + status tool
-- daemon worker skeleton + health integration + doctor surface
-- no-op SSE loop/diagnostics 먼저 통과
-- shared handle/wiring 규약 확정
-- bootstrap/ownership 계약 확정: daemon, `agent::run`, `AgentBuilder`, 기타 tool registry 생성 경로가 어떤 방식으로 동일 handle을 주입받는지 먼저 고정
-- non-daemon 경로는 service-only 모드이며 SSE worker auto-start 금지 규칙을 문서와 코드에 함께 반영
-- graceful shutdown, doctor 상세 노출, auth refresh 책임 중 무엇을 어디서 소유하는지 계약을 먼저 문서에 고정
-- outbound proxy/host validation 계약을 함께 고정
-- config default / serde round-trip 테스트 추가
+- [x] `context_book` config + module skeleton + store + status tool
+- [x] daemon worker skeleton + health integration + doctor surface
+- [x] no-op SSE loop/diagnostics 먼저 통과
+- [x] shared handle/wiring 규약 확정
+- [ ] bootstrap/ownership 계약 확정: daemon, `agent::run`, `AgentBuilder`, 기타 tool registry 생성 경로가 어떤 방식으로 동일 handle을 주입받는지 먼저 고정
+- [x] non-daemon 경로는 service-only 모드이며 SSE worker auto-start 금지 규칙을 문서와 코드에 함께 반영
+- [ ] graceful shutdown, doctor 상세 노출, auth refresh 책임 중 무엇을 어디서 소유하는지 계약을 먼저 문서에 고정
+- [x] outbound proxy/host validation 계약을 함께 고정
+- [x] config default / serde round-trip 테스트 추가
+
+Phase 1 current status (2026-03-29):
+- 완료된 3개 구현 묶음: config/runtime helper + module/store/status tool foundation
+- 완료된 3개 구현 묶음: daemon no-op worker + health/doctor/state file integration
+- 완료된 3개 구현 묶음: shared handle/service-only wiring contract
+- 다음 턴 시작 지점: `Phase 1`의 남은 첫 작업인 `bootstrap/ownership 계약 확정`부터 진행한다.
+
+Validation completed on 2026-03-29:
+- `cargo fmt --all`
+- `cargo check --lib --tests`
+- `cargo test context_book_config_round_trips --lib`
+- `cargo test status_tool_reports_runtime_snapshot --lib`
+- `cargo test worker_persists_idle_runtime_state --lib`
+- `cargo test state_file_path_uses_config_directory --lib`
 
 ### Phase 2 (Connectivity)
 - bootstrap/connect/refresh + SSE consume + dedup + cursor persistence

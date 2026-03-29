@@ -40,6 +40,7 @@ const SUPPORTED_PROXY_SERVICE_KEYS: &[&str] = &[
     "tool.http_request",
     "tool.pushover",
     "tool.web_search",
+    "context_book.client",
     "memory.embeddings",
     "tunnel.custom",
     "transcription.groq",
@@ -432,6 +433,130 @@ pub struct Config {
     /// Shell tool configuration (`[shell_tool]`).
     #[serde(default)]
     pub shell_tool: ShellToolConfig,
+
+    /// Context Book integration configuration (`[context_book]`).
+    #[serde(default)]
+    pub context_book: ContextBookConfig,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextBookSubscriptionMode {
+    #[default]
+    Manual,
+    Auto,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextBookCursorNotFoundPolicy {
+    #[default]
+    Reset,
+    Fail,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default, PartialEq, Eq)]
+pub struct ContextBookAgentIdentityOverrideConfig {
+    /// Override the Context Book agent ID reported by this runtime.
+    #[serde(default)]
+    pub agent_id: Option<String>,
+    /// Override the device type reported to Context Book.
+    #[serde(default)]
+    pub device_type: Option<String>,
+    /// Override the display name reported to Context Book.
+    #[serde(default)]
+    pub display_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct ContextBookConfig {
+    /// Enable Context Book integration.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Manual Context Book base URL override.
+    #[serde(default)]
+    pub manual_url: Option<String>,
+    /// Enable Context Book discovery when manual_url is not set.
+    #[serde(default = "default_true")]
+    pub discovery_enabled: bool,
+    /// Discovery service type used for Context Book endpoint discovery.
+    #[serde(default = "default_context_book_service_type")]
+    pub service_type: String,
+    /// Subscription intent mode.
+    #[serde(default)]
+    pub subscription_mode: ContextBookSubscriptionMode,
+    /// Seed subscriptions loaded before discovery/runtime sync.
+    #[serde(default)]
+    pub subscription_seed: Vec<String>,
+    /// Whether to forward Context Book derived context to the host immediately.
+    #[serde(default)]
+    pub forward_to_host: bool,
+    /// Enable polling fallback when SSE is unavailable.
+    #[serde(default = "default_true")]
+    pub polling_fallback_enabled: bool,
+    /// Initial reconnect backoff in milliseconds.
+    #[serde(default = "default_context_book_reconnect_backoff_ms")]
+    pub reconnect_backoff_ms: u64,
+    /// Maximum reconnect backoff in milliseconds.
+    #[serde(default = "default_context_book_max_reconnect_backoff_ms")]
+    pub max_reconnect_backoff_ms: u64,
+    /// Policy used when the remote runtime rejects the local cursor.
+    #[serde(default)]
+    pub cursor_not_found_policy: ContextBookCursorNotFoundPolicy,
+    /// Environment variable key used to read the bootstrap secret.
+    #[serde(default = "default_context_book_bootstrap_secret_env_key")]
+    pub bootstrap_secret_env_key: String,
+    /// Existing auth profile to reuse for Context Book access.
+    #[serde(default)]
+    pub auth_profile: Option<String>,
+    /// Allowed outbound hosts for Context Book endpoints. Empty keeps runtime disabled until endpoint resolution.
+    #[serde(default)]
+    pub allowed_hosts: Vec<String>,
+    /// Allow private, loopback, and local-link addresses for Context Book.
+    #[serde(default)]
+    pub allow_private_hosts: bool,
+    /// Optional overrides for the runtime identity reported to Context Book.
+    #[serde(default)]
+    pub agent_identity_override: ContextBookAgentIdentityOverrideConfig,
+}
+
+fn default_context_book_service_type() -> String {
+    "_contextbook._tcp.local.".to_string()
+}
+
+fn default_context_book_reconnect_backoff_ms() -> u64 {
+    1_000
+}
+
+fn default_context_book_max_reconnect_backoff_ms() -> u64 {
+    30_000
+}
+
+fn default_context_book_bootstrap_secret_env_key() -> String {
+    "CONTEXT_BOOK_BOOTSTRAP_SECRET".to_string()
+}
+
+impl Default for ContextBookConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            manual_url: None,
+            discovery_enabled: true,
+            service_type: default_context_book_service_type(),
+            subscription_mode: ContextBookSubscriptionMode::default(),
+            subscription_seed: Vec::new(),
+            forward_to_host: false,
+            polling_fallback_enabled: true,
+            reconnect_backoff_ms: default_context_book_reconnect_backoff_ms(),
+            max_reconnect_backoff_ms: default_context_book_max_reconnect_backoff_ms(),
+            cursor_not_found_policy: ContextBookCursorNotFoundPolicy::default(),
+            bootstrap_secret_env_key: default_context_book_bootstrap_secret_env_key(),
+            auth_profile: None,
+            allowed_hosts: Vec::new(),
+            allow_private_hosts: false,
+            agent_identity_override: ContextBookAgentIdentityOverrideConfig::default(),
+        }
+    }
 }
 
 /// Multi-client workspace isolation configuration.
@@ -8297,6 +8422,7 @@ impl Default for Config {
             opencode_cli: OpenCodeCliConfig::default(),
             sop: SopConfig::default(),
             shell_tool: ShellToolConfig::default(),
+            context_book: ContextBookConfig::default(),
         }
     }
 }
@@ -10993,6 +11119,69 @@ mod tests {
         assert_eq!(c.provider_timeout_secs, 120);
         assert!(c.workspace_dir.to_string_lossy().contains("workspace"));
         assert!(c.config_path.to_string_lossy().contains("config.toml"));
+        assert!(!c.context_book.enabled);
+        assert!(c.context_book.discovery_enabled);
+        assert_eq!(c.context_book.service_type, "_contextbook._tcp.local.");
+        assert_eq!(c.context_book.reconnect_backoff_ms, 1_000);
+        assert_eq!(c.context_book.max_reconnect_backoff_ms, 30_000);
+        assert_eq!(
+            c.context_book.bootstrap_secret_env_key,
+            "CONTEXT_BOOK_BOOTSTRAP_SECRET"
+        );
+        assert!(c.context_book.allowed_hosts.is_empty());
+    }
+
+    #[test]
+    async fn context_book_config_round_trips() {
+        let raw = r#"
+[context_book]
+enabled = true
+manual_url = "http://127.0.0.1:7777"
+discovery_enabled = false
+service_type = "_contextbook._tcp.local."
+subscription_mode = "manual"
+subscription_seed = ["agent-a", "agent-b"]
+forward_to_host = false
+polling_fallback_enabled = true
+reconnect_backoff_ms = 2500
+max_reconnect_backoff_ms = 15000
+cursor_not_found_policy = "reset"
+bootstrap_secret_env_key = "CB_SECRET"
+auth_profile = "context-book"
+allowed_hosts = ["127.0.0.1", "localhost"]
+allow_private_hosts = true
+
+[context_book.agent_identity_override]
+agent_id = "zc-agent"
+device_type = "daemon"
+display_name = "ZeroClaw"
+"#;
+
+        let config = parse_test_config(raw);
+        assert!(config.context_book.enabled);
+        assert_eq!(
+            config.context_book.manual_url.as_deref(),
+            Some("http://127.0.0.1:7777")
+        );
+        assert_eq!(
+            config.context_book.subscription_seed,
+            vec!["agent-a".to_string(), "agent-b".to_string()]
+        );
+        assert_eq!(
+            config
+                .context_book
+                .agent_identity_override
+                .agent_id
+                .as_deref(),
+            Some("zc-agent")
+        );
+
+        let serialized = toml::to_string(&config).expect("context_book config should serialize");
+        let reparsed: Config =
+            toml::from_str(&serialized).expect("serialized config should deserialize");
+        assert!(reparsed.context_book.enabled);
+        assert_eq!(reparsed.context_book.bootstrap_secret_env_key, "CB_SECRET");
+        assert!(reparsed.context_book.allow_private_hosts);
     }
 
     #[derive(Clone, Default)]
@@ -11457,6 +11646,7 @@ auto_save = true
             opencode_cli: OpenCodeCliConfig::default(),
             sop: SopConfig::default(),
             shell_tool: ShellToolConfig::default(),
+            context_book: ContextBookConfig::default(),
         };
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -11987,6 +12177,7 @@ default_temperature = 0.7
             opencode_cli: OpenCodeCliConfig::default(),
             sop: SopConfig::default(),
             shell_tool: ShellToolConfig::default(),
+            context_book: ContextBookConfig::default(),
         };
 
         config.save().await.unwrap();

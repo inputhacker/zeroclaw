@@ -898,6 +898,54 @@ fn check_daemon_state(config: &Config, items: &mut Vec<DiagItem>) {
             ));
         }
     }
+
+    if let Some(context_book) = snapshot.get("context_book") {
+        let runtime = context_book.get("runtime").unwrap_or(context_book);
+        let enabled = runtime
+            .get("enabled")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let worker_state = runtime
+            .get("worker_state")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+        let connection_state = runtime
+            .get("connection_state")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+
+        if !enabled {
+            items.push(DiagItem::ok(cat, "context_book disabled"));
+        } else if worker_state == "idle" {
+            items.push(DiagItem::ok(
+                cat,
+                format!(
+                    "context_book worker healthy (state={worker_state}, connection_state={connection_state})"
+                ),
+            ));
+        } else if let Some(error) = runtime
+            .get("last_error")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty())
+        {
+            items.push(DiagItem::error(
+                cat,
+                format!("context_book unhealthy ({worker_state}): {error}"),
+            ));
+        } else {
+            items.push(DiagItem::warn(
+                cat,
+                format!(
+                    "context_book pending (state={worker_state}, connection_state={connection_state})"
+                ),
+            ));
+        }
+    } else {
+        items.push(DiagItem::warn(
+            cat,
+            "context_book diagnostics not tracked yet",
+        ));
+    }
 }
 
 // ── Environment checks ───────────────────────────────────────────

@@ -81,6 +81,23 @@ struct TokenResponse {
     scope: Option<String>,
     #[serde(default, alias = "agentId")]
     agent_id: Option<String>,
+    #[serde(default)]
+    agent: Option<TokenResponseAgent>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct TokenResponseAgent {
+    #[serde(default, alias = "agentId")]
+    agent_id: Option<String>,
+}
+
+impl TokenResponse {
+    fn resolved_agent_id(&self, fallback: &str) -> String {
+        self.agent_id
+            .clone()
+            .or_else(|| self.agent.as_ref().and_then(|agent| agent.agent_id.clone()))
+            .unwrap_or_else(|| fallback.to_string())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -107,8 +124,64 @@ struct BootstrapWaitResponse {
 struct BootstrapWaitRequestSnapshot {
     #[serde(default, alias = "requestId")]
     request_id: Option<String>,
+    #[serde(default, alias = "waitToken")]
+    wait_token: Option<String>,
+    #[serde(default, alias = "statusUrl")]
+    status_url: Option<String>,
+    #[serde(default, alias = "watchUrl")]
+    watch_url: Option<String>,
+    #[serde(default, alias = "completeUrl")]
+    complete_url: Option<String>,
+    #[serde(default, alias = "nextAction")]
+    next_action: Option<String>,
     #[serde(default, alias = "approvalState")]
     approval_state: Option<String>,
+}
+
+impl BootstrapWaitResponse {
+    fn request_id(&self) -> Option<&str> {
+        self.request_id.as_deref().or_else(|| {
+            self.request
+                .as_ref()
+                .and_then(|request| request.request_id.as_deref())
+        })
+    }
+
+    fn wait_token(&self) -> Option<&str> {
+        self.wait_token.as_deref().or_else(|| {
+            self.request
+                .as_ref()
+                .and_then(|request| request.wait_token.as_deref())
+        })
+    }
+
+    fn status_url(&self) -> Option<&str> {
+        self.status_url.as_deref().or_else(|| {
+            self.request
+                .as_ref()
+                .and_then(|request| request.status_url.as_deref())
+        })
+    }
+
+    fn complete_url(&self) -> Option<&str> {
+        self.complete_url.as_deref().or_else(|| {
+            self.request
+                .as_ref()
+                .and_then(|request| request.complete_url.as_deref())
+        })
+    }
+
+    fn approval_state(&self) -> Option<&str> {
+        self.approval_state.as_deref().or_else(|| {
+            self.request
+                .as_ref()
+                .and_then(|request| request.approval_state.as_deref())
+        })
+    }
+
+    fn has_wait_metadata(&self) -> bool {
+        self.wait_token().is_some()
+    }
 }
 
 #[derive(Clone)]
@@ -366,6 +439,7 @@ impl ContextBookClient {
         let token = response.json::<TokenResponse>().await.map_err(|error| {
             self.contract_error(format!("failed to parse refresh token response: {error}"))
         })?;
+        let agent_id = token.resolved_agent_id(&self.identity.agent_id);
 
         let refreshed = TokenSet {
             access_token: token.access_token.clone(),
@@ -399,9 +473,7 @@ impl ContextBookClient {
 
         Ok(ContextBookSession {
             base_url: base_url.clone(),
-            agent_id: token
-                .agent_id
-                .unwrap_or_else(|| self.identity.agent_id.clone()),
+            agent_id,
             access_token: token.access_token,
             refresh_token: refreshed.refresh_token,
             expires_at: refreshed.expires_at,
@@ -554,32 +626,23 @@ impl ContextBookClient {
         wait: BootstrapWaitResponse,
     ) -> Result<TokenResponse, ContextBookClientError> {
         let request_id = wait
-            .request_id
-            .clone()
-            .or_else(|| {
-                wait.request
-                    .as_ref()
-                    .and_then(|request| request.request_id.clone())
-            })
+            .request_id()
+            .map(ToOwned::to_owned)
             .ok_or_else(|| self.contract_error("bootstrap wait metadata missing requestId"))?;
         let wait_token = wait
-            .wait_token
-            .clone()
+            .wait_token()
+            .map(ToOwned::to_owned)
             .ok_or_else(|| self.contract_error("bootstrap wait metadata missing waitToken"))?;
         let status_path = wait
-            .status_url
-            .clone()
+            .status_url()
+            .map(ToOwned::to_owned)
             .unwrap_or_else(|| format!("/bootstrap/requests/{request_id}"));
         let complete_path = wait
-            .complete_url
-            .clone()
+            .complete_url()
+            .map(ToOwned::to_owned)
             .unwrap_or_else(|| "/bootstrap/register/complete".to_string());
 
-        let mut approval_state = wait.approval_state.clone().or_else(|| {
-            wait.request
-                .as_ref()
-                .and_then(|request| request.approval_state.clone())
-        });
+        let mut approval_state = wait.approval_state().map(ToOwned::to_owned);
         while !matches_terminal_or_approved(approval_state.as_deref()) {
             let status_url = join_relative_url(base_url, &status_path).map_err(|error| {
                 self.contract_error(format!("invalid bootstrap status URL: {error}"))
@@ -653,6 +716,7 @@ impl ContextBookClient {
         token: TokenResponse,
     ) -> Result<ContextBookSession, ContextBookClientError> {
         let profile_name = self.resolved.auth_profile.as_deref().unwrap_or("default");
+        let agent_id = token.resolved_agent_id(&self.identity.agent_id);
         let tokens = TokenSet {
             access_token: token.access_token.clone(),
             refresh_token: token.refresh_token.clone(),
@@ -664,7 +728,7 @@ impl ContextBookClient {
             scope: token.scope.clone(),
         };
         let mut metadata = BTreeMap::new();
-        metadata.insert("agent_id".to_string(), self.identity.agent_id.clone());
+        metadata.insert("agent_id".to_string(), agent_id.clone());
         metadata.insert("base_url".to_string(), base_url.to_string());
         self.auth_store
             .upsert_profile(
@@ -692,9 +756,7 @@ impl ContextBookClient {
 
         Ok(ContextBookSession {
             base_url: base_url.clone(),
-            agent_id: token
-                .agent_id
-                .unwrap_or_else(|| self.identity.agent_id.clone()),
+            agent_id,
             access_token: token.access_token,
             refresh_token: token.refresh_token,
             expires_at: tokens.expires_at,
@@ -730,9 +792,8 @@ impl ContextBookClient {
             .map(|body| body.error.message.clone())
             .or_else(|| {
                 wait.as_ref().and_then(|wait| {
-                    wait.wait_token
-                        .as_ref()
-                        .map(|_| "bootstrap approval required".to_string())
+                    wait.has_wait_metadata()
+                        .then(|| "bootstrap approval required".to_string())
                 })
             })
             .unwrap_or_else(|| format!("unexpected Context Book response status {status}: {body}"));
@@ -749,8 +810,7 @@ impl ContextBookClient {
             (StatusCode::FORBIDDEN, _)
                 if wait
                     .as_ref()
-                    .and_then(|wait| wait.wait_token.as_ref())
-                    .is_some() =>
+                    .is_some_and(BootstrapWaitResponse::has_wait_metadata) =>
             {
                 ContextBookClientErrorKind::BootstrapApprovalRequired
             }
@@ -831,7 +891,7 @@ fn derive_identity(config: &Config) -> ContextBookAgentIdentity {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
-        .unwrap_or_else(|| "daemon".to_string());
+        .unwrap_or_else(|| "unknown".to_string());
     let display_name = overrides
         .display_name
         .as_deref()
@@ -958,6 +1018,7 @@ mod tests {
         Arc,
         atomic::{AtomicUsize, Ordering},
     };
+    use std::time::Duration as StdDuration;
     use tempfile::TempDir;
     use tokio::net::TcpListener;
 
@@ -1011,7 +1072,7 @@ mod tests {
         let identity = derive_identity(&config);
 
         assert_eq!(identity.agent_id, "workspace");
-        assert_eq!(identity.device_type, "daemon");
+        assert_eq!(identity.device_type, "unknown");
         assert_eq!(identity.display_name, "workspace");
     }
 
@@ -1057,10 +1118,13 @@ mod tests {
             (
                 StatusCode::ACCEPTED,
                 axum::Json(json!({
-                    "requestId": "req-1",
-                    "waitToken": "wait-1",
-                    "statusUrl": "/bootstrap/requests/req-1",
-                    "completeUrl": "/bootstrap/register/complete",
+                    "request": {
+                        "requestId": "req-1",
+                        "waitToken": "wait-1",
+                        "statusUrl": "/bootstrap/requests/req-1",
+                        "completeUrl": "/bootstrap/register/complete",
+                        "approvalState": "Pending"
+                    },
                     "nextAction": "wait"
                 })),
             )
@@ -1085,10 +1149,12 @@ mod tests {
                 Some("wait-1")
             );
             axum::Json(json!({
+                "agent": {
+                    "agentId": "workspace-remote"
+                },
                 "access_token": "access-1",
                 "refresh_token": "refresh-1",
-                "expires_in": 1800,
-                "agentId": "workspace"
+                "expires_in": 1800
             }))
         }
 
@@ -1124,6 +1190,7 @@ mod tests {
 
         assert_eq!(session.access_token, "access-1");
         assert_eq!(session.refresh_token.as_deref(), Some("refresh-1"));
+        assert_eq!(session.agent_id, "workspace-remote");
         assert_eq!(state.connect_calls.load(Ordering::SeqCst), 1);
 
         let stored = client
@@ -1133,6 +1200,10 @@ mod tests {
             .expect("load stored profile")
             .expect("stored profile");
         assert_eq!(stored.provider, CONTEXT_BOOK_PROVIDER);
+        assert_eq!(
+            stored.metadata.get("agent_id").map(String::as_str),
+            Some("workspace-remote")
+        );
         assert_eq!(
             stored
                 .token_set
@@ -1151,10 +1222,13 @@ mod tests {
             (
                 StatusCode::FORBIDDEN,
                 axum::Json(json!({
-                    "requestId": "req-reapprove",
-                    "waitToken": "wait-reapprove",
-                    "statusUrl": "/bootstrap/requests/req-reapprove",
-                    "completeUrl": "/bootstrap/register/complete",
+                    "request": {
+                        "requestId": "req-reapprove",
+                        "waitToken": "wait-reapprove",
+                        "statusUrl": "/bootstrap/requests/req-reapprove",
+                        "completeUrl": "/bootstrap/register/complete",
+                        "approvalState": "Pending"
+                    },
                     "nextAction": "wait"
                 })),
             )
@@ -1172,6 +1246,9 @@ mod tests {
 
         async fn register_complete() -> impl IntoResponse {
             axum::Json(json!({
+                "agent": {
+                    "agentId": "remote-reapprove"
+                },
                 "access_token": "access-reapprove",
                 "refresh_token": "refresh-reapprove",
                 "expires_in": 600
@@ -1205,9 +1282,198 @@ mod tests {
 
         assert_eq!(session.access_token, "access-reapprove");
         assert_eq!(session.refresh_token.as_deref(), Some("refresh-reapprove"));
+        assert_eq!(session.agent_id, "remote-reapprove");
 
         server.abort();
         let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn client_handles_legacy_top_level_connect_reapproval_wait_flow() {
+        async fn connect() -> impl IntoResponse {
+            (
+                StatusCode::FORBIDDEN,
+                axum::Json(json!({
+                    "requestId": "req-legacy",
+                    "waitToken": "wait-legacy",
+                    "statusUrl": "/bootstrap/requests/req-legacy",
+                    "completeUrl": "/bootstrap/register/complete",
+                    "nextAction": "wait"
+                })),
+            )
+        }
+
+        async fn request_status() -> impl IntoResponse {
+            axum::Json(json!({
+                "request": {
+                    "requestId": "req-legacy",
+                    "approvalState": "Approved"
+                },
+                "nextAction": "complete"
+            }))
+        }
+
+        async fn register_complete() -> impl IntoResponse {
+            axum::Json(json!({
+                "agent": {
+                    "agentId": "remote-legacy"
+                },
+                "access_token": "access-legacy",
+                "refresh_token": "refresh-legacy",
+                "expires_in": 600
+            }))
+        }
+
+        let app = Router::new()
+            .route("/agents/connect", post(connect))
+            .route("/bootstrap/requests/req-legacy", get(request_status))
+            .route("/bootstrap/register/complete", post(register_complete));
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve axum");
+        });
+
+        let tmp = TempDir::new().expect("temp dir");
+        let mut config = test_config(&tmp);
+        config.context_book.manual_url = Some(format!("http://{addr}"));
+        config.context_book.allowed_hosts = vec!["127.0.0.1".into()];
+        config.context_book.allow_private_hosts = true;
+        let _guard = EnvGuard::set(
+            &config.context_book.bootstrap_secret_env_key,
+            Some("bootstrap-secret"),
+        );
+
+        let client = ContextBookClient::new(&config);
+        let session = client
+            .ensure_session()
+            .await
+            .expect("legacy reapproval session");
+
+        assert_eq!(session.access_token, "access-legacy");
+        assert_eq!(session.refresh_token.as_deref(), Some("refresh-legacy"));
+        assert_eq!(session.agent_id, "remote-legacy");
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live Context Book server with dashboard approval access"]
+    async fn live_client_bootstraps_against_context_book_server() {
+        let shared_secret = std::env::var("CONTEXT_BOOK_BOOTSTRAP_SHARED_SECRET")
+            .expect("set CONTEXT_BOOK_BOOTSTRAP_SHARED_SECRET to run the live test");
+        let base_url = std::env::var("CONTEXT_BOOK_LIVE_BASE_URL")
+            .unwrap_or_else(|_| "http://127.0.1.1:8080".to_string());
+        let parsed_base_url = Url::parse(&base_url).expect("live base URL should parse");
+        let host = parsed_base_url
+            .host_str()
+            .expect("live base URL should include a host")
+            .to_string();
+        let agent_id = format!(
+            "zeroclaw-live-test-{}",
+            Utc::now()
+                .timestamp_nanos_opt()
+                .expect("current timestamp should fit in i64")
+        );
+
+        let tmp = TempDir::new().expect("temp dir");
+        let mut config = test_config(&tmp);
+        config.context_book.manual_url = Some(base_url.clone());
+        config.context_book.discovery_enabled = false;
+        config.context_book.allowed_hosts = vec![host];
+        config.context_book.allow_private_hosts = true;
+        config.context_book.agent_identity_override.agent_id = Some(agent_id.clone());
+        config.context_book.agent_identity_override.device_type = Some("notepc".to_string());
+        config.context_book.agent_identity_override.display_name =
+            Some("ZeroClaw Live Test".to_string());
+
+        let _guard = EnvGuard::set(
+            &config.context_book.bootstrap_secret_env_key,
+            Some(shared_secret.as_str()),
+        );
+        let client = ContextBookClient::new(&config);
+        let approval_http = reqwest::Client::new();
+        let approval_agent_id = agent_id.clone();
+        let approval_base = base_url.clone();
+        let approval_task = tokio::spawn(async move {
+            for _ in 0..40 {
+                let queue = approval_http
+                    .get(format!("{approval_base}/dashboard/api/bootstrap/requests"))
+                    .send()
+                    .await
+                    .expect("bootstrap queue request");
+                let body = queue
+                    .json::<Value>()
+                    .await
+                    .expect("bootstrap queue JSON should parse");
+                if let Some(request_id) = body["items"].as_array().and_then(|items| {
+                    items.iter().find_map(|item| {
+                        (item["requestedAgentName"].as_str() == Some(approval_agent_id.as_str()))
+                            .then(|| item["requestId"].as_str())
+                            .flatten()
+                    })
+                }) {
+                    let response = approval_http
+                        .post(format!(
+                            "{approval_base}/dashboard/api/bootstrap/requests/{request_id}/approve"
+                        ))
+                        .json(&json!({
+                            "actor": "zeroclaw-live-test",
+                            "reason": "live client bootstrap verification",
+                            "channel": "dashboard",
+                        }))
+                        .send()
+                        .await
+                        .expect("bootstrap approval request");
+                    assert!(
+                        response.status().is_success(),
+                        "bootstrap approval failed with status {}",
+                        response.status()
+                    );
+                    return;
+                }
+                tokio::time::sleep(StdDuration::from_millis(500)).await;
+            }
+            panic!("timed out waiting for bootstrap request for {approval_agent_id}");
+        });
+
+        let session = tokio::time::timeout(StdDuration::from_secs(30), client.ensure_session())
+            .await
+            .expect("ensure_session should complete before timeout")
+            .expect("live bootstrap session");
+        approval_task
+            .await
+            .expect("bootstrap approval task should finish cleanly");
+
+        assert!(!session.access_token.is_empty());
+        assert!(session.refresh_token.is_some());
+
+        client
+            .activate_agent(&session)
+            .await
+            .expect("live agent activation");
+        client
+            .open_event_stream(&session, None)
+            .await
+            .expect("live event stream open");
+
+        let stored = client
+            .auth_service
+            .get_profile(CONTEXT_BOOK_PROVIDER, None)
+            .await
+            .expect("load stored live profile")
+            .expect("stored live profile");
+        assert_eq!(stored.provider, CONTEXT_BOOK_PROVIDER);
+        assert_eq!(
+            stored
+                .token_set
+                .as_ref()
+                .map(|tokens| tokens.access_token.as_str()),
+            Some(session.access_token.as_str())
+        );
     }
 
     #[tokio::test]

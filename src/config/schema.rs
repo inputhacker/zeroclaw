@@ -11154,7 +11154,7 @@ allow_private_hosts = true
 
 [context_book.agent_identity_override]
 agent_id = "zc-agent"
-device_type = "daemon"
+device_type = "unknown"
 display_name = "ZeroClaw"
 "#;
 

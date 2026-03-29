@@ -2,6 +2,7 @@ pub mod client;
 pub mod config;
 pub mod events;
 pub mod handle;
+pub mod policy;
 pub mod service;
 pub mod store;
 pub mod worker;
@@ -20,6 +21,11 @@ pub use events::{ContextBookEventEnvelope, ContextBookSseParser, ParsedContextBo
 pub use handle::{
     ContextBookContractSnapshot, ContextBookContractValidationState, ContextBookDegradedMode,
     ContextBookHandle, ContextBookRefreshMode, ContextBookRuntimeSnapshot,
+};
+#[allow(unused_imports)]
+pub use policy::{
+    ContextBookPolicyBlockedVote, ContextBookPolicyContextReview, ContextBookPolicyReadMode,
+    ContextBookPolicyReference, ContextBookPolicySource, ContextBookPolicyVoteReview,
 };
 #[allow(unused_imports)]
 pub use service::{ContextBookService, ContextBookStatusReport};

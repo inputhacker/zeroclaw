@@ -437,6 +437,13 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
         } else {
             None
         };
+        let context_book_focus = tasks_to_run
+            .iter()
+            .map(|task| task.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let context_book_context =
+            load_context_book_prompt_block(&config, &context_book_focus).await;
 
         // Create memory once per tick for recall + consolidation.
         let heartbeat_memory: Option<Box<dyn crate::memory::Memory>> =
@@ -469,12 +476,12 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                 None
             };
 
-            let prompt = match (&session_context, &memory_context) {
-                (Some(sc), Some(mc)) => format!("{mc}\n{sc}\n\n{task_prompt}"),
-                (Some(sc), None) => format!("{sc}\n\n{task_prompt}"),
-                (None, Some(mc)) => format!("{mc}\n\n{task_prompt}"),
-                (None, None) => task_prompt,
-            };
+            let prompt = compose_heartbeat_task_prompt(
+                &task_prompt,
+                session_context.as_deref(),
+                memory_context.as_deref(),
+                context_book_context.as_deref(),
+            );
             let temp = config.default_temperature;
             match Box::pin(crate::agent::run(
                 config.clone(),
@@ -781,6 +788,48 @@ fn load_heartbeat_session_context(config: &Config) -> Option<String> {
     Some(ctx)
 }
 
+async fn load_context_book_prompt_block(config: &Config, focus: &str) -> Option<String> {
+    if !config.context_book.enabled {
+        return None;
+    }
+
+    match crate::context_book::bootstrap(config)
+        .service
+        .build_policy_reference(
+            crate::context_book::ContextBookPolicyReadMode::Auto,
+            Some(focus),
+        )
+        .await
+    {
+        Ok(Some(reference)) if reference.has_actionable_items() => Some(reference.prompt_block),
+        Ok(_) => None,
+        Err(error) => {
+            tracing::warn!("context_book heartbeat helper skipped: {error}");
+            None
+        }
+    }
+}
+
+fn compose_heartbeat_task_prompt(
+    task_prompt: &str,
+    session_context: Option<&str>,
+    memory_context: Option<&str>,
+    context_book_context: Option<&str>,
+) -> String {
+    let mut sections = Vec::new();
+    if let Some(memory_context) = memory_context {
+        sections.push(memory_context.trim_end().to_string());
+    }
+    if let Some(context_book_context) = context_book_context {
+        sections.push(context_book_context.trim_end().to_string());
+    }
+    if let Some(session_context) = session_context {
+        sections.push(session_context.trim_end().to_string());
+    }
+    sections.push(task_prompt.to_string());
+    sections.join("\n\n")
+}
+
 /// Read the last `HEARTBEAT_SESSION_CONTEXT_MESSAGES` `ChatMessage` lines from
 /// a JSONL session file using a bounded rolling window so we never hold the
 /// entire file in memory.
@@ -884,7 +933,14 @@ fn has_supervised_channels(config: &Config) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::profiles::{AuthProfile, AuthProfileKind, AuthProfilesStore, profile_id};
+    use crate::auth::state_dir_from_config;
+    use axum::{Json, Router, routing::get};
+    use chrono::Utc;
+    use serde_json::json;
+    use std::collections::BTreeMap;
     use tempfile::TempDir;
+    use tokio::net::TcpListener;
 
     fn test_config(tmp: &TempDir) -> Config {
         let config = Config {
@@ -894,6 +950,30 @@ mod tests {
         };
         std::fs::create_dir_all(&config.workspace_dir).unwrap();
         config
+    }
+
+    async fn seed_token_profile(config: &Config, agent_id: &str) {
+        let state_dir = state_dir_from_config(config);
+        let store = AuthProfilesStore::new(&state_dir, config.secrets.encrypt);
+        store
+            .upsert_profile(
+                AuthProfile {
+                    id: profile_id("context-book", "default"),
+                    provider: "context-book".into(),
+                    profile_name: "default".into(),
+                    kind: AuthProfileKind::Token,
+                    account_id: None,
+                    workspace_id: None,
+                    token_set: None,
+                    token: Some("service-token".into()),
+                    metadata: BTreeMap::from([("agent_id".to_string(), agent_id.to_string())]),
+                    created_at: Utc::now(),
+                    updated_at: Utc::now(),
+                },
+                true,
+            )
+            .await
+            .expect("seed token profile");
     }
 
     #[test]
@@ -1135,6 +1215,84 @@ mod tests {
         let config = Config::default();
         let target = auto_detect_heartbeat_channel(&config);
         assert!(target.is_none());
+    }
+
+    #[test]
+    fn compose_heartbeat_prompt_includes_context_book_section() {
+        let prompt = compose_heartbeat_task_prompt(
+            "[Heartbeat Task | medium] Review launch",
+            Some("[Recent conversation history]\nUser: ping"),
+            Some("[Memory context]\n- task: launch"),
+            Some("[Context Book policy helper]\ncast opportunities:\n- vote-1"),
+        );
+
+        assert!(prompt.contains("[Memory context]"));
+        assert!(prompt.contains("[Context Book policy helper]"));
+        assert!(prompt.contains("[Recent conversation history]"));
+        assert!(prompt.contains("[Heartbeat Task | medium] Review launch"));
+    }
+
+    #[tokio::test]
+    async fn load_context_book_prompt_block_reads_remote_policy_reference() {
+        async fn contexts() -> Json<serde_json::Value> {
+            Json(json!([
+                {
+                    "contextId": "peer_ctx_launch",
+                    "authorAgentId": "peer-a",
+                    "title": "Launch Plan",
+                    "contents": "Ship launch plan today",
+                    "tag": "eng",
+                    "status": "Published",
+                    "createdAt": "2026-03-29T00:00:00Z",
+                    "updatedAt": "2026-03-29T00:00:01Z"
+                }
+            ]))
+        }
+
+        async fn votes() -> Json<serde_json::Value> {
+            Json(json!([
+                {
+                    "voteId": "peer_vote_launch",
+                    "ownerAgentId": "peer-a",
+                    "voteScore": 1,
+                    "voteContext": "Approve launch plan from peer_ctx_launch",
+                    "voterAgentIds": [],
+                    "requiredScore": 2,
+                    "executable": false,
+                    "createdAt": "2026-03-29T00:00:00Z",
+                    "updatedAt": "2026-03-29T00:00:02Z"
+                }
+            ]))
+        }
+
+        let app = Router::new()
+            .route("/contexts", get(contexts))
+            .route("/votes", get(votes));
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve axum");
+        });
+
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        config.context_book.enabled = true;
+        config.context_book.discovery_enabled = false;
+        config.context_book.manual_url = Some(format!("http://{addr}"));
+        config.context_book.allowed_hosts = vec!["127.0.0.1".into()];
+        config.context_book.allow_private_hosts = true;
+        seed_token_profile(&config, "workspace").await;
+
+        let block = load_context_book_prompt_block(&config, "launch")
+            .await
+            .expect("context book prompt block");
+        assert!(block.contains("[Context Book policy helper]"));
+        assert!(block.contains("cast opportunities"));
+
+        server.abort();
+        let _ = server.await;
     }
 
     /// Verify that SIGHUP does not cause shutdown — the daemon should ignore it

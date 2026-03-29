@@ -160,7 +160,7 @@ mod tests {
 
         for flag in &expected_flags {
             assert!(
-                args.contains(&flag.to_string()),
+                args.iter().any(|arg| arg == flag),
                 "must include security flag: {flag}"
             );
         }

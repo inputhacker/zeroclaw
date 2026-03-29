@@ -279,8 +279,19 @@ async fn run_agent_job(
         },
         Err(_) => String::new(),
     };
+    let context_book_context = load_context_book_prompt_block(config, &prompt).await;
 
-    let prefixed_prompt = format!("{memory_context}[cron:{} {name}] {prompt}", job.id);
+    let prefixed_prompt = compose_agent_job_prompt(
+        &job.id,
+        &name,
+        &prompt,
+        if memory_context.trim().is_empty() {
+            None
+        } else {
+            Some(memory_context.as_str())
+        },
+        context_book_context.as_deref(),
+    );
     let model_override = job.model.clone();
 
     let run_result = match job.session_target {
@@ -311,6 +322,46 @@ async fn run_agent_job(
         ),
         Err(e) => (false, format!("agent job failed: {e}")),
     }
+}
+
+async fn load_context_book_prompt_block(config: &Config, focus: &str) -> Option<String> {
+    if !config.context_book.enabled {
+        return None;
+    }
+
+    match crate::context_book::bootstrap(config)
+        .service
+        .build_policy_reference(
+            crate::context_book::ContextBookPolicyReadMode::Auto,
+            Some(focus),
+        )
+        .await
+    {
+        Ok(Some(reference)) if reference.has_actionable_items() => Some(reference.prompt_block),
+        Ok(_) => None,
+        Err(error) => {
+            tracing::warn!("context_book cron helper skipped: {error}");
+            None
+        }
+    }
+}
+
+fn compose_agent_job_prompt(
+    job_id: &str,
+    name: &str,
+    prompt: &str,
+    memory_context: Option<&str>,
+    context_book_context: Option<&str>,
+) -> String {
+    let mut sections = Vec::new();
+    if let Some(memory_context) = memory_context {
+        sections.push(memory_context.trim_end().to_string());
+    }
+    if let Some(context_book_context) = context_book_context {
+        sections.push(context_book_context.trim_end().to_string());
+    }
+    sections.push(format!("[cron:{job_id} {name}] {prompt}"));
+    sections.join("\n\n")
 }
 
 async fn persist_job_result(
@@ -764,11 +815,17 @@ fn build_cron_shell_command(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::profiles::{AuthProfile, AuthProfileKind, AuthProfilesStore, profile_id};
+    use crate::auth::state_dir_from_config;
     use crate::config::Config;
     use crate::cron::{self, DeliveryConfig};
     use crate::security::SecurityPolicy;
+    use axum::{Json, Router, routing::get};
     use chrono::{Duration as ChronoDuration, Utc};
+    use serde_json::json;
+    use std::collections::BTreeMap;
     use tempfile::TempDir;
+    use tokio::net::TcpListener;
 
     async fn test_config(tmp: &TempDir) -> Config {
         let config = Config {
@@ -780,6 +837,30 @@ mod tests {
             .await
             .unwrap();
         config
+    }
+
+    async fn seed_token_profile(config: &Config, agent_id: &str) {
+        let state_dir = state_dir_from_config(config);
+        let store = AuthProfilesStore::new(&state_dir, config.secrets.encrypt);
+        store
+            .upsert_profile(
+                AuthProfile {
+                    id: profile_id("context-book", "default"),
+                    provider: "context-book".into(),
+                    profile_name: "default".into(),
+                    kind: AuthProfileKind::Token,
+                    account_id: None,
+                    workspace_id: None,
+                    token_set: None,
+                    token: Some("service-token".into()),
+                    metadata: BTreeMap::from([("agent_id".to_string(), agent_id.to_string())]),
+                    created_at: Utc::now(),
+                    updated_at: Utc::now(),
+                },
+                true,
+            )
+            .await
+            .expect("seed token profile");
     }
 
     fn test_job(command: &str) -> CronJob {
@@ -1425,6 +1506,84 @@ mod tests {
         // all_overdue_jobs ignores the limit
         let overdue = cron::all_overdue_jobs(&config, far_future).unwrap();
         assert_eq!(overdue.len(), 3, "all_overdue_jobs must return all");
+    }
+
+    #[test]
+    fn compose_agent_job_prompt_includes_context_book_section() {
+        let prompt = compose_agent_job_prompt(
+            "job-1",
+            "launch-review",
+            "Check launch readiness",
+            Some("[Memory context]\n- launch checklist"),
+            Some("[Context Book policy helper]\ncast opportunities:\n- vote-1"),
+        );
+
+        assert!(prompt.contains("[Memory context]"));
+        assert!(prompt.contains("[Context Book policy helper]"));
+        assert!(prompt.contains("[cron:job-1 launch-review] Check launch readiness"));
+    }
+
+    #[tokio::test]
+    async fn cron_context_book_helper_reads_remote_policy_reference() {
+        async fn contexts() -> Json<serde_json::Value> {
+            Json(json!([
+                {
+                    "contextId": "peer_ctx_launch",
+                    "authorAgentId": "peer-a",
+                    "title": "Launch Plan",
+                    "contents": "Ship launch plan today",
+                    "tag": "eng",
+                    "status": "Published",
+                    "createdAt": "2026-03-29T00:00:00Z",
+                    "updatedAt": "2026-03-29T00:00:01Z"
+                }
+            ]))
+        }
+
+        async fn votes() -> Json<serde_json::Value> {
+            Json(json!([
+                {
+                    "voteId": "peer_vote_launch",
+                    "ownerAgentId": "peer-a",
+                    "voteScore": 1,
+                    "voteContext": "Approve launch plan from peer_ctx_launch",
+                    "voterAgentIds": [],
+                    "requiredScore": 2,
+                    "executable": false,
+                    "createdAt": "2026-03-29T00:00:00Z",
+                    "updatedAt": "2026-03-29T00:00:02Z"
+                }
+            ]))
+        }
+
+        let app = Router::new()
+            .route("/contexts", get(contexts))
+            .route("/votes", get(votes));
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve axum");
+        });
+
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        config.context_book.enabled = true;
+        config.context_book.discovery_enabled = false;
+        config.context_book.manual_url = Some(format!("http://{addr}"));
+        config.context_book.allowed_hosts = vec!["127.0.0.1".into()];
+        config.context_book.allow_private_hosts = true;
+        seed_token_profile(&config, "workspace").await;
+
+        let block = load_context_book_prompt_block(&config, "launch")
+            .await
+            .expect("context book prompt block");
+        assert!(block.contains("[Context Book policy helper]"));
+        assert!(block.contains("cast opportunities"));
+
+        server.abort();
+        let _ = server.await;
     }
 
     #[test]

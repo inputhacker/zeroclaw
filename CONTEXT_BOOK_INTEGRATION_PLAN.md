@@ -390,8 +390,9 @@ Validation completed for Phase 3 and Phase 4 work on 2026-03-29:
   - `POST/PATCH/DELETE /contexts` → `201/200/204`
   - `POST/PATCH/DELETE /votes` + `POST /votes/{voteId}/cast` → `201/200/200/204`
 - `cargo fmt --all -- --check`
-- `cargo clippy --all-targets -- -D warnings` → 이번 변경에서 추가한 clippy 이슈는 정리했고, 현재는 기존 lint만 남음 (`src/security/firejail.rs:163`, `inefficient_to_string`)
+- `cargo clippy --all-targets -- -D warnings` → 통과
 - `cargo test` → 통과
+- Phase 5 구현/검증 중 repository-wide `clippy` blocker였던 `src/security/firejail.rs`의 `inefficient_to_string` lint를 정리해 전체 검증 경로를 정상화함
 
 ### Phase 4 (Write Path)
 - [x] context CRUD 툴/서비스
@@ -404,15 +405,37 @@ Phase 4 current status (2026-03-29):
 - 완료된 3개 구현 묶음: `ContextBookService`에 Active 전이, author/owner/duplicate cast 로컬 가드, remote success 후 local single-snapshot sync + full refresh fallback 보정 규칙 추가
 - 완료된 3개 구현 묶음: `context_book_context_create|update|delete`, `context_book_vote_create|update|delete|cast` tool 추가 및 tool registry/security `Act` wiring 연결
 - 완료된 3개 구현 묶음: live 서버 write 응답 wrapper(`{"context": ...}`, `{"vote": ...}`) 대응 parser 보강 및 mock/live 검증 반영
-- 다음 턴 시작 지점: `Phase 5`의 첫 작업인 `로컬+원격 context 기반 vote/cast 의사결정 헬퍼`부터 진행한다.
-- 그 다음 우선순위는 `Phase 5`의 `heartbeat/cron에서 필요 시 참조하는 read helper`와 `memory 비침투 유지 검증`이다.
+- 다음 턴 시작 지점: `Phase 6`의 첫 작업인 `resume/dedup/disconnect/subscription persistence tests`부터 진행한다.
+- 그 다음 우선순위는 `Phase 6`의 `cast 예외 케이스 검증`, `observability/log redaction/성능 점검`, `SQLite contention / restart recovery 검증`이다.
 
 ### Phase 5 (Policy + Scheduler/Heartbeat Hook)
-- 로컬+원격 context 기반 vote/cast 의사결정 헬퍼
-- heartbeat/cron에서 필요 시 참조하는 read helper 추가
-- memory 비침투 유지 검증
+- [x] 로컬+원격 context 기반 vote/cast 의사결정 헬퍼
+- [x] heartbeat/cron에서 필요 시 참조하는 read helper 추가
+- [x] memory 비침투 유지 검증
 - 기본 정책은 cron/heartbeat helper 또는 명시적 tool 조회로만 제한한다
 - 일반 user chat turn에 대한 자동 reference block/system prompt 주입은 이번 범위에서 제외한다
+
+Phase 5 current status (2026-03-29):
+- 완료된 3개 구현 묶음: `src/context_book/policy.rs` 추가, cached/remote context+vote snapshot을 바탕으로 review-needed context, follow-up vote, castable vote, blocked vote를 분류하는 policy helper와 prompt block formatter 구현
+- 완료된 3개 구현 묶음: `ContextBookService::build_policy_reference` 추가, `cache|remote|auto` read mode로 정책 입력을 구성하고 cache miss 시 remote read-through를 허용하되 Context Book 데이터를 `memory`로 주입하지 않는 회귀 테스트를 보강
+- 완료된 3개 구현 묶음: `src/cron/scheduler.rs`, `src/daemon/mod.rs`에 Context Book helper block read 경로를 연결해 cron/heartbeat prompt에만 참조 블록을 삽입하고 일반 user chat turn 자동 주입은 여전히 배제
+- 완료된 3개 구현 묶음: policy helper/service/cron/heartbeat에 대한 unit test와 remote read helper test를 추가하고, discovered Context Book 서버(`127.0.1.1:8080`) 기준 live bootstrap ignored test까지 재검증
+- 다음 턴 시작 지점: `Phase 6`의 첫 작업인 `resume/dedup/disconnect/subscription persistence tests`부터 진행한다.
+- 그 다음 우선순위는 `Phase 6`의 `cast 예외 케이스 검증`, `observability/log redaction/성능 점검`, `SQLite contention / transaction 경계 / restart recovery 검증`, `config reload 또는 credential rotation 이후 재검증 동작 확인`이다.
+
+Validation completed for Phase 5 work on 2026-03-29:
+- `cargo test context_book::policy:: --lib`
+- `cargo test context_book::service:: --lib`
+- `cargo test load_context_book_prompt_block_reads_remote_policy_reference --lib`
+- `cargo test cron_context_book_helper_reads_remote_policy_reference --lib`
+- `cargo test compose_agent_job_prompt_includes_context_book_section --lib`
+- `cargo test compose_heartbeat_prompt_includes_context_book_section --lib`
+- `avahi-browse -rt _contextbook._tcp` → 실서버 광고 재확인 (`context-book-local`, `127.0.1.1:8080`, `bootstrap=trusted-network+shared-secret`)
+- `curl http://127.0.1.1:8080/` → unauthenticated preflight 재확인 (`service=context-book`, `status=ok`)
+- `cargo fmt --all -- --check`
+- `cargo clippy --all-targets -- -D warnings`
+- `cargo test`
+- `CONTEXT_BOOK_LIVE_BASE_URL=http://127.0.1.1:8080 cargo test live_client_bootstraps_against_context_book_server --lib -- --ignored --nocapture`
 
 ### Phase 6 (Conformance Tests + Hardening)
 - resume/dedup/disconnect/subscription persistence tests
@@ -425,21 +448,20 @@ Phase 4 current status (2026-03-29):
 
 우선순위 순:
 
-1. `Phase 5` 시작: 로컬+원격 context 기반 vote/cast 의사결정 헬퍼
-- cached context/vote와 remote read-through를 조합해 정책 입력을 만드는 helper 추가
-- 일반 chat turn 자동 주입 없이 cron/heartbeat/tool 경로에서만 참조하도록 유지
+1. `Phase 6` 시작: resume/dedup/disconnect/subscription persistence tests
+- `Last-Event-ID` resume, duplicate replay suppression, transient disconnect 이후 desired/effective subscription persistence를 worker/store 기준으로 보강 검증
+- restart 이후 cursor/subscription/auth profile 복구가 깨지지 않는지 integration 경로를 먼저 확보
 
-2. `Phase 5` 계속: heartbeat/cron read helper + memory 비침투 검증
-- scheduler/heartbeat에서 Context Book 참조가 필요할 때 사용할 read helper 추가
-- context/vote 데이터가 기존 `memory`로 자동 주입되지 않는지 regression test 보강
+2. `Phase 6` 계속: cast 예외 케이스 + data-plane contract verification 보강
+- `vote.deleted`, owner-delivery exception, duplicate cast/cast-after-delete 같은 edge case를 spec/live 기준으로 보강
+- runtime contract snapshot과 live capability probe의 차이가 있으면 degraded/read-only 판단까지 함께 검증
 
-3. `Phase 6` 진입: `vote.deleted` / data-plane contract verification 보강
-- 현재 read path는 `vote.deleted`를 처리하지만 runtime contract snapshot의 explicit live verification은 아직 남아 있음
-- 다음 세션에서는 spec/live를 대조해 capability source 또는 probe를 보강
+3. `Phase 6` 계속: observability/log redaction/성능 점검
+- token/bootstrap secret/log payload redaction을 재점검하고, Context Book component freshness/last_sync surface가 doctor/health에서 일관적인지 확인
+- cron/heartbeat helper가 과도한 remote read를 만들지 않는지 cache-first/read-through 비용도 점검
 
-4. `Phase 6` 계속: restart/recovery/contention hardening
-- restart 이후 desired subscription / cursor / auth profile 복구 테스트 보강
-- SQLite contention / transaction 경계 / credential rotation 재검증 동작 확인
+4. `Phase 6` 계속: SQLite contention / transaction 경계 / restart recovery / credential rotation
+- worker-tool 동시 접근, partial commit 방지, restart recovery, config reload 또는 credential rotation 이후 재검증 동작을 순서대로 보강
 
 ## 9. Testing & Verification Checklist
 

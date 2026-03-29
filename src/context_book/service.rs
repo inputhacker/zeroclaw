@@ -7,6 +7,10 @@ use super::handle::{
     ContextBookContractSnapshot, ContextBookDegradedMode, ContextBookHandle,
     ContextBookRuntimeSnapshot,
 };
+use super::policy::{
+    ContextBookPolicyReadMode, ContextBookPolicyReference, ContextBookPolicySource,
+    build_policy_reference,
+};
 use super::store::{
     ContextBookAgentSnapshot, ContextBookCacheInventory, ContextBookCachedItems,
     ContextBookContextSnapshot, ContextBookPersistedRuntimeState, ContextBookSubscriptionsSnapshot,
@@ -126,6 +130,62 @@ impl ContextBookService {
             items: votes,
             updated_at,
         })
+    }
+
+    pub async fn build_policy_reference(
+        &self,
+        read_mode: ContextBookPolicyReadMode,
+        focus: Option<&str>,
+    ) -> Result<Option<ContextBookPolicyReference>> {
+        if !self.handle.resolved_config().enabled {
+            return Ok(None);
+        }
+
+        let client = ContextBookClient::new(&self.handle.source_config());
+        let agent_id = match read_mode {
+            ContextBookPolicyReadMode::Cache => self
+                .handle
+                .snapshot()
+                .agent_id
+                .unwrap_or_else(|| client.identity().agent_id.clone()),
+            ContextBookPolicyReadMode::Auto | ContextBookPolicyReadMode::Remote => client
+                .ensure_session()
+                .await
+                .map(|session| session.agent_id)
+                .unwrap_or_else(|_| {
+                    self.handle
+                        .snapshot()
+                        .agent_id
+                        .unwrap_or_else(|| client.identity().agent_id.clone())
+                }),
+        };
+
+        let cached_contexts = self.cached_contexts()?;
+        let cached_votes = self.cached_votes()?;
+        let (contexts, context_source) = self
+            .select_policy_contexts(read_mode, cached_contexts.as_ref())
+            .await?;
+        let (votes, vote_source) = self
+            .select_policy_votes(read_mode, cached_votes.as_ref())
+            .await?;
+
+        if contexts.items.is_empty() && votes.items.is_empty() {
+            return Ok(None);
+        }
+
+        let source = match (context_source, vote_source) {
+            (ContextBookPolicySource::Cache, ContextBookPolicySource::Cache) => {
+                ContextBookPolicySource::Cache
+            }
+            (ContextBookPolicySource::Remote, ContextBookPolicySource::Remote) => {
+                ContextBookPolicySource::Remote
+            }
+            _ => ContextBookPolicySource::Mixed,
+        };
+
+        Ok(Some(build_policy_reference(
+            &agent_id, focus, source, &contexts, &votes,
+        )))
     }
 
     pub fn cached_agents(
@@ -491,6 +551,85 @@ impl ContextBookService {
             .save_votes(&votes)
             .context("failed to persist refreshed Context Book votes")
     }
+
+    async fn select_policy_contexts(
+        &self,
+        read_mode: ContextBookPolicyReadMode,
+        cached: Option<&ContextBookCachedItems<ContextBookContextSnapshot>>,
+    ) -> Result<(
+        ContextBookCachedItems<ContextBookContextSnapshot>,
+        ContextBookPolicySource,
+    )> {
+        match read_mode {
+            ContextBookPolicyReadMode::Cache => Ok((
+                cached.cloned().unwrap_or_else(empty_cached_items),
+                ContextBookPolicySource::Cache,
+            )),
+            ContextBookPolicyReadMode::Remote => {
+                Ok((self.get_contexts().await?, ContextBookPolicySource::Remote))
+            }
+            ContextBookPolicyReadMode::Auto => {
+                if let Some(cached) = cached
+                    && !cached.items.is_empty()
+                {
+                    return Ok((cached.clone(), ContextBookPolicySource::Cache));
+                }
+                match self.get_contexts().await {
+                    Ok(remote) => Ok((remote, ContextBookPolicySource::Remote)),
+                    Err(error) => {
+                        if let Some(cached) = cached {
+                            Ok((cached.clone(), ContextBookPolicySource::Cache))
+                        } else {
+                            Err(error)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    async fn select_policy_votes(
+        &self,
+        read_mode: ContextBookPolicyReadMode,
+        cached: Option<&ContextBookCachedItems<ContextBookVoteSnapshot>>,
+    ) -> Result<(
+        ContextBookCachedItems<ContextBookVoteSnapshot>,
+        ContextBookPolicySource,
+    )> {
+        match read_mode {
+            ContextBookPolicyReadMode::Cache => Ok((
+                cached.cloned().unwrap_or_else(empty_cached_items),
+                ContextBookPolicySource::Cache,
+            )),
+            ContextBookPolicyReadMode::Remote => {
+                Ok((self.get_votes().await?, ContextBookPolicySource::Remote))
+            }
+            ContextBookPolicyReadMode::Auto => {
+                if let Some(cached) = cached
+                    && !cached.items.is_empty()
+                {
+                    return Ok((cached.clone(), ContextBookPolicySource::Cache));
+                }
+                match self.get_votes().await {
+                    Ok(remote) => Ok((remote, ContextBookPolicySource::Remote)),
+                    Err(error) => {
+                        if let Some(cached) = cached {
+                            Ok((cached.clone(), ContextBookPolicySource::Cache))
+                        } else {
+                            Err(error)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn empty_cached_items<T>() -> ContextBookCachedItems<T> {
+    ContextBookCachedItems {
+        items: Vec::new(),
+        updated_at: None,
+    }
 }
 
 fn validate_context_create(
@@ -658,12 +797,13 @@ mod tests {
     use crate::auth::state_dir_from_config;
     use crate::config::Config;
     use crate::context_book::shared_handle;
+    use crate::memory::traits::Memory;
     use axum::{
         Json, Router,
         extract::Path as AxumPath,
         http::StatusCode,
         response::IntoResponse,
-        routing::{delete, patch, post},
+        routing::{delete, get, patch, post},
     };
     use chrono::Utc;
     use serde_json::{Value, json};
@@ -866,5 +1006,128 @@ mod tests {
 
         server.abort();
         let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn policy_reference_uses_remote_read_through_when_cache_is_empty() {
+        async fn contexts() -> impl IntoResponse {
+            Json(json!([
+                {
+                    "contextId": "peer_ctx_launch",
+                    "authorAgentId": "peer-a",
+                    "title": "Launch Plan",
+                    "contents": "Ship launch plan today",
+                    "tag": "eng",
+                    "status": "Published",
+                    "createdAt": "2026-03-29T00:00:00Z",
+                    "updatedAt": "2026-03-29T00:00:01Z"
+                }
+            ]))
+        }
+
+        async fn votes() -> impl IntoResponse {
+            Json(json!([
+                {
+                    "voteId": "peer_vote_launch",
+                    "ownerAgentId": "peer-a",
+                    "voteScore": 1,
+                    "voteContext": "Approve launch plan from peer_ctx_launch",
+                    "voterAgentIds": ["peer-b"],
+                    "requiredScore": 2,
+                    "executable": false,
+                    "createdAt": "2026-03-29T00:00:00Z",
+                    "updatedAt": "2026-03-29T00:00:02Z"
+                }
+            ]))
+        }
+
+        let app = Router::new()
+            .route("/contexts", get(contexts))
+            .route("/votes", get(votes));
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve axum");
+        });
+
+        let tmp = TempDir::new().expect("temp dir");
+        let config = test_config(&tmp, format!("http://{addr}"));
+        seed_token_profile(&config, "workspace").await;
+
+        let service = ContextBookService::new(shared_handle(&config));
+        let reference = service
+            .build_policy_reference(ContextBookPolicyReadMode::Auto, Some("launch"))
+            .await
+            .expect("policy reference")
+            .expect("policy reference should exist");
+
+        assert_eq!(reference.source, ContextBookPolicySource::Remote);
+        assert_eq!(reference.castable_votes.len(), 1);
+        assert_eq!(
+            reference.castable_votes[0].related_context_ids,
+            vec!["peer_ctx_launch"]
+        );
+        assert!(reference.prompt_block.contains("cast opportunities"));
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn policy_reference_does_not_write_context_book_data_into_memory() {
+        let tmp = TempDir::new().expect("temp dir");
+        let config = test_config(&tmp, "http://127.0.0.1:1".to_string());
+        let handle = shared_handle(&config);
+        handle
+            .store()
+            .save_context_snapshot(&ContextBookContextSnapshot {
+                context_id: "peer_ctx_memory".into(),
+                author_agent_id: "peer-a".into(),
+                title: "Memory Isolation".into(),
+                contents: "Do not store this in memory automatically".into(),
+                tag: "ops".into(),
+                status: "Published".into(),
+                created_at: Some("2026-03-29T00:00:00Z".into()),
+                updated_at: Some("2026-03-29T00:00:01Z".into()),
+                raw_json: json!({"contextId": "peer_ctx_memory"}),
+                synced_at: "2026-03-29T00:00:02Z".into(),
+            })
+            .expect("save cached context");
+        handle
+            .store()
+            .save_vote_snapshot(&ContextBookVoteSnapshot {
+                vote_id: "peer_vote_memory".into(),
+                owner_agent_id: "peer-a".into(),
+                vote_score: 1.0,
+                vote_context: "Review memory isolation context".into(),
+                voter_agent_ids: vec![],
+                required_score: Some(2),
+                executable: Some(false),
+                created_at: Some("2026-03-29T00:00:00Z".into()),
+                updated_at: Some("2026-03-29T00:00:01Z".into()),
+                raw_json: json!({"voteId": "peer_vote_memory"}),
+                synced_at: "2026-03-29T00:00:02Z".into(),
+            })
+            .expect("save cached vote");
+
+        let service = ContextBookService::new(handle);
+        let reference = service
+            .build_policy_reference(ContextBookPolicyReadMode::Cache, Some("memory isolation"))
+            .await
+            .expect("policy reference")
+            .expect("policy reference should exist");
+        assert!(reference.has_actionable_items());
+
+        let memory = crate::memory::SqliteMemory::new(&config.workspace_dir).expect("memory");
+        assert_eq!(memory.count().await.expect("memory count"), 0);
+        assert!(
+            memory
+                .recall("Memory Isolation", 10, None, None, None)
+                .await
+                .expect("memory recall")
+                .is_empty()
+        );
     }
 }

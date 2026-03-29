@@ -847,6 +847,7 @@ impl ContextBookClient {
         let current_agent = self.current_agent_status(session).await?;
         let subscriptions = self.fetch_subscriptions_response(session).await?;
         let cursor_not_found_returns_409 = self.probe_cursor_not_found_contract(session).await?;
+        let vote_deleted_supported = self.probe_vote_delete_support(session).await?;
         let refresh_mode = self
             .probe_refresh_mode(&session.base_url, &session.agent_id)
             .await?;
@@ -885,6 +886,13 @@ impl ContextBookClient {
                     .to_string(),
             );
         }
+        if !vote_deleted_supported {
+            degraded_modes.push(ContextBookDegradedMode::NoWrite);
+            notes.push(
+                "DELETE /votes/{voteId} probe did not indicate explicit vote delete support"
+                    .to_string(),
+            );
+        }
         if refresh_mode == ContextBookRefreshMode::Disabled {
             degraded_modes.push(ContextBookDegradedMode::NoRefresh);
             notes.push("no supported refresh endpoint was detected".to_string());
@@ -905,7 +913,7 @@ impl ContextBookClient {
             lifecycle_connection_split,
             subscriptions_desired_effective_split: subscriptions_split,
             cursor_not_found_returns_409: Some(cursor_not_found_returns_409),
-            vote_deleted_supported: None,
+            vote_deleted_supported: Some(vote_deleted_supported),
             refresh_mode,
             degraded_modes,
             notes,
@@ -1000,6 +1008,55 @@ impl ContextBookClient {
             return Ok(error.kind == ContextBookClientErrorKind::CursorNotFound);
         }
         Ok(false)
+    }
+
+    async fn probe_vote_delete_support(
+        &self,
+        session: &ContextBookSession,
+    ) -> Result<bool, ContextBookClientError> {
+        let url = session
+            .base_url
+            .join("votes/__zeroclaw_contract_probe_vote__")
+            .map_err(|error| {
+                self.contract_error(format!("invalid vote delete probe URL: {error}"))
+            })?;
+        let response = self
+            .http_client
+            .delete(url)
+            .bearer_auth(&session.access_token)
+            .send()
+            .await
+            .map_err(|error| {
+                self.network_error(format!(
+                    "failed to probe Context Book vote delete contract: {error}"
+                ))
+            })?;
+        let status = response.status();
+        if status.is_success() {
+            return Ok(true);
+        }
+
+        let body = response.text().await.unwrap_or_default();
+        let parsed = serde_json::from_str::<ContextBookErrorEnvelope>(&body).ok();
+        if matches!(
+            status,
+            StatusCode::BAD_REQUEST
+                | StatusCode::UNAUTHORIZED
+                | StatusCode::FORBIDDEN
+                | StatusCode::CONFLICT
+        ) {
+            return Ok(parsed.is_some());
+        }
+        if status == StatusCode::NOT_FOUND {
+            return Ok(parsed.is_some());
+        }
+        if matches!(
+            status,
+            StatusCode::METHOD_NOT_ALLOWED | StatusCode::NOT_IMPLEMENTED
+        ) {
+            return Ok(false);
+        }
+        Ok(parsed.is_some())
     }
 
     async fn probe_refresh_mode(
@@ -1568,14 +1625,19 @@ impl ContextBookClient {
             .unwrap_or_default();
         let message = parsed
             .as_ref()
-            .map(|body| body.error.message.clone())
+            .map(|body| sanitize_sensitive_text(&body.error.message))
             .or_else(|| {
                 wait.as_ref().and_then(|wait| {
                     wait.has_wait_metadata()
                         .then(|| "bootstrap approval required".to_string())
                 })
             })
-            .unwrap_or_else(|| format!("unexpected Context Book response status {status}: {body}"));
+            .unwrap_or_else(|| {
+                format!(
+                    "unexpected Context Book response status {status}: {}",
+                    sanitize_sensitive_text(&body)
+                )
+            });
 
         let kind = match (status, code.as_str()) {
             (StatusCode::UNAUTHORIZED, _) => ContextBookClientErrorKind::Unauthorized,
@@ -1888,6 +1950,65 @@ fn normalize_optional_string(value: Option<&str>) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
+}
+
+fn sanitize_sensitive_text(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    if let Ok(mut json) = serde_json::from_str::<Value>(trimmed) {
+        redact_sensitive_json(&mut json);
+        return json.to_string();
+    }
+
+    match crate::security::LeakDetector::default().scan(trimmed) {
+        crate::security::LeakResult::Detected { redacted, .. } => redacted,
+        crate::security::LeakResult::Clean => trimmed.to_string(),
+    }
+}
+
+fn redact_sensitive_json(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            for (key, value) in map.iter_mut() {
+                if is_sensitive_payload_key(key) {
+                    *value = Value::String("[REDACTED]".to_string());
+                } else {
+                    redact_sensitive_json(value);
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                redact_sensitive_json(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn is_sensitive_payload_key(key: &str) -> bool {
+    let normalized = key
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .collect::<String>()
+        .to_ascii_lowercase();
+    matches!(
+        normalized.as_str(),
+        "accesstoken"
+            | "refreshtoken"
+            | "idtoken"
+            | "token"
+            | "tokenvalue"
+            | "secret"
+            | "clientsecret"
+            | "bootstrapsecret"
+            | "bootstrapsharedsecret"
+            | "authorization"
+            | "waittoken"
+    )
 }
 
 fn normalize_agent_ids(values: &[String]) -> Vec<String> {
@@ -2352,10 +2473,23 @@ mod tests {
             )
         }
 
+        async fn delete_vote_probe() -> impl IntoResponse {
+            (
+                StatusCode::NOT_FOUND,
+                axum::Json(json!({
+                    "error": {
+                        "code": "VOTE_NOT_FOUND",
+                        "message": "missing vote"
+                    }
+                })),
+            )
+        }
+
         let app = Router::new()
             .route("/agents", get(agents))
             .route("/subscriptions", get(subscriptions))
             .route("/events", get(events))
+            .route("/votes/{vote_id}", axum::routing::delete(delete_vote_probe))
             .route("/auth/refresh", post(legacy_refresh));
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -2391,11 +2525,148 @@ mod tests {
         assert_eq!(contract.lifecycle_connection_split, Some(true));
         assert_eq!(contract.subscriptions_desired_effective_split, Some(true));
         assert_eq!(contract.cursor_not_found_returns_409, Some(true));
+        assert_eq!(contract.vote_deleted_supported, Some(true));
         assert_eq!(
             contract.refresh_mode,
             ContextBookRefreshMode::LegacyAuthRefresh
         );
         assert!(contract.degraded_modes.is_empty());
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn client_marks_contract_no_write_when_vote_delete_probe_route_is_missing() {
+        async fn agents() -> impl IntoResponse {
+            axum::Json(json!([
+                {
+                    "agentId": "workspace",
+                    "lifecycleState": "Active",
+                    "connectionState": "Disconnected"
+                }
+            ]))
+        }
+
+        async fn subscriptions() -> impl IntoResponse {
+            axum::Json(json!({
+                "consumerAgentId": "workspace",
+                "desiredProducerAgentIds": ["peer-a"],
+                "effectiveProducerAgentIds": ["peer-a"]
+            }))
+        }
+
+        async fn events() -> impl IntoResponse {
+            (
+                StatusCode::CONFLICT,
+                axum::Json(json!({
+                    "error": {
+                        "code": "CURSOR_NOT_FOUND",
+                        "message": "missing cursor"
+                    }
+                })),
+            )
+        }
+
+        let app = Router::new()
+            .route("/agents", get(agents))
+            .route("/subscriptions", get(subscriptions))
+            .route("/events", get(events));
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve axum");
+        });
+
+        let tmp = TempDir::new().expect("temp dir");
+        let mut config = test_config(&tmp);
+        config.context_book.manual_url = Some(format!("http://{addr}"));
+        config.context_book.allowed_hosts = vec!["127.0.0.1".into()];
+        config.context_book.allow_private_hosts = true;
+
+        let client = ContextBookClient::new(&config);
+        let session = ContextBookSession {
+            base_url: Url::parse(&format!("http://{addr}/")).expect("base URL should parse"),
+            agent_id: "workspace".into(),
+            access_token: "access-token".into(),
+            refresh_token: Some("refresh-token".into()),
+            expires_at: None,
+        };
+        let contract = client
+            .validate_runtime_contract(&session)
+            .await
+            .expect("contract validation");
+
+        assert_eq!(
+            contract.validation_state,
+            ContextBookContractValidationState::Degraded
+        );
+        assert_eq!(contract.vote_deleted_supported, Some(false));
+        assert!(
+            contract
+                .degraded_modes
+                .contains(&ContextBookDegradedMode::NoWrite)
+        );
+        assert!(
+            contract
+                .notes
+                .iter()
+                .any(|note| note.contains("vote delete"))
+        );
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn client_redacts_sensitive_values_from_http_errors() {
+        async fn votes() -> impl IntoResponse {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(json!({
+                    "access_token": "error-access-token",
+                    "refreshToken": "error-refresh-token",
+                    "bootstrapSecret": "bootstrap-secret",
+                    "message": "raw upstream failure"
+                })),
+            )
+        }
+
+        let app = Router::new().route("/votes", get(votes));
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve axum");
+        });
+
+        let tmp = TempDir::new().expect("temp dir");
+        let mut config = test_config(&tmp);
+        config.context_book.manual_url = Some(format!("http://{addr}"));
+        config.context_book.allowed_hosts = vec!["127.0.0.1".into()];
+        config.context_book.allow_private_hosts = true;
+
+        let client = ContextBookClient::new(&config);
+        let session = ContextBookSession {
+            base_url: Url::parse(&format!("http://{addr}/")).expect("base URL should parse"),
+            agent_id: "workspace".into(),
+            access_token: "access-token".into(),
+            refresh_token: Some("refresh-token".into()),
+            expires_at: None,
+        };
+        let error = client
+            .get_votes(&session)
+            .await
+            .expect_err("get votes should fail");
+
+        assert_eq!(error.kind, ContextBookClientErrorKind::Network);
+        assert!(!error.message.contains("error-access-token"));
+        assert!(!error.message.contains("error-refresh-token"));
+        assert!(!error.message.contains("bootstrap-secret"));
+        assert!(error.message.contains("[REDACTED]"));
 
         server.abort();
         let _ = server.await;

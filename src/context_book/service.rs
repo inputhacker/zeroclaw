@@ -811,6 +811,35 @@ mod tests {
     use tempfile::TempDir;
     use tokio::net::TcpListener;
 
+    #[derive(Clone)]
+    struct EnvGuard {
+        key: String,
+        previous: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &str, value: Option<&str>) -> Self {
+            let previous = std::env::var(key).ok();
+            match value {
+                Some(value) => unsafe { std::env::set_var(key, value) },
+                None => unsafe { std::env::remove_var(key) },
+            }
+            Self {
+                key: key.to_string(),
+                previous,
+            }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match self.previous.as_deref() {
+                Some(value) => unsafe { std::env::set_var(&self.key, value) },
+                None => unsafe { std::env::remove_var(&self.key) },
+            }
+        }
+    }
+
     fn test_config(tmp: &TempDir, base_url: String) -> Config {
         let mut config = Config {
             workspace_dir: tmp.path().join("workspace"),
@@ -1009,6 +1038,98 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cast_vote_after_delete_surfaces_remote_not_found_and_keeps_cache_empty() {
+        async fn activate(AxumPath(agent_id): AxumPath<String>) -> impl IntoResponse {
+            assert_eq!(agent_id, "workspace");
+            StatusCode::NO_CONTENT
+        }
+
+        async fn delete_vote(AxumPath(vote_id): AxumPath<String>) -> impl IntoResponse {
+            assert_eq!(vote_id, "workspace_vote_delete");
+            StatusCode::NO_CONTENT
+        }
+
+        async fn cast_vote(AxumPath(vote_id): AxumPath<String>) -> impl IntoResponse {
+            assert_eq!(vote_id, "workspace_vote_delete");
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({
+                    "error": {
+                        "code": "VOTE_NOT_FOUND",
+                        "message": "vote missing"
+                    }
+                })),
+            )
+        }
+
+        let app = Router::new()
+            .route("/agents/{agent_id}/status", patch(activate))
+            .route("/votes/{vote_id}", delete(delete_vote))
+            .route("/votes/{vote_id}/cast", post(cast_vote));
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve axum");
+        });
+
+        let tmp = TempDir::new().expect("temp dir");
+        let config = test_config(&tmp, format!("http://{addr}"));
+        seed_token_profile(&config, "workspace").await;
+
+        let handle = shared_handle(&config);
+        handle
+            .store()
+            .save_vote_snapshot(&ContextBookVoteSnapshot {
+                vote_id: "workspace_vote_delete".into(),
+                owner_agent_id: "workspace".into(),
+                vote_score: 1.0,
+                vote_context: "ship it".into(),
+                voter_agent_ids: vec![],
+                required_score: Some(2),
+                executable: Some(false),
+                created_at: Some("2026-03-29T00:00:00Z".into()),
+                updated_at: Some("2026-03-29T00:00:00Z".into()),
+                raw_json: json!({"voteId": "workspace_vote_delete"}),
+                synced_at: "2026-03-29T00:00:01Z".into(),
+            })
+            .expect("seed cached vote");
+
+        let service = ContextBookService::new(handle.clone());
+        service
+            .delete_vote("workspace_vote_delete")
+            .await
+            .expect("delete vote");
+        assert!(
+            handle
+                .store()
+                .load_vote("workspace_vote_delete")
+                .expect("load vote after delete")
+                .is_none()
+        );
+
+        let error = service
+            .cast_vote(
+                "workspace_vote_delete",
+                &ContextBookVoteCastRequest::default(),
+            )
+            .await
+            .expect_err("cast after delete should fail");
+        assert!(error.to_string().contains("vote missing"));
+        assert!(
+            handle
+                .store()
+                .load_vote("workspace_vote_delete")
+                .expect("load vote after failed cast")
+                .is_none()
+        );
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
     async fn policy_reference_uses_remote_read_through_when_cache_is_empty() {
         async fn contexts() -> impl IntoResponse {
             Json(json!([
@@ -1070,6 +1191,56 @@ mod tests {
             vec!["peer_ctx_launch"]
         );
         assert!(reference.prompt_block.contains("cast opportunities"));
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn get_contexts_persists_remote_snapshots_without_auth_or_bootstrap_secrets() {
+        async fn contexts() -> impl IntoResponse {
+            Json(json!([
+                {
+                    "contextId": "peer_ctx_secretless",
+                    "authorAgentId": "peer-a",
+                    "title": "No secret leakage",
+                    "contents": "cache this without persisting credentials",
+                    "tag": "ops",
+                    "status": "Published",
+                    "createdAt": "2026-03-29T00:00:00Z",
+                    "updatedAt": "2026-03-29T00:00:01Z"
+                }
+            ]))
+        }
+
+        let app = Router::new().route("/contexts", get(contexts));
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve axum");
+        });
+
+        let tmp = TempDir::new().expect("temp dir");
+        let config = test_config(&tmp, format!("http://{addr}"));
+        seed_token_profile(&config, "workspace").await;
+        let _guard = EnvGuard::set(
+            &config.context_book.bootstrap_secret_env_key,
+            Some("bootstrap-secret"),
+        );
+
+        let handle = shared_handle(&config);
+        let service = ContextBookService::new(handle.clone());
+        let contexts = service.get_contexts().await.expect("remote contexts");
+        assert_eq!(contexts.items.len(), 1);
+
+        let cache_bytes = std::fs::read(handle.resolved_config().cache_db_path)
+            .expect("read context_book cache db");
+        let cache_dump = String::from_utf8_lossy(&cache_bytes);
+        assert!(!cache_dump.contains("service-token"));
+        assert!(!cache_dump.contains("bootstrap-secret"));
+        assert!(!cache_dump.contains("refresh-token"));
 
         server.abort();
         let _ = server.await;

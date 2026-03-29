@@ -438,30 +438,46 @@ Validation completed for Phase 5 work on 2026-03-29:
 - `CONTEXT_BOOK_LIVE_BASE_URL=http://127.0.1.1:8080 cargo test live_client_bootstraps_against_context_book_server --lib -- --ignored --nocapture`
 
 ### Phase 6 (Conformance Tests + Hardening)
-- resume/dedup/disconnect/subscription persistence tests
-- cast 예외 케이스 검증
-- observability/log redaction/성능 점검
-- SQLite contention / transaction 경계 / restart recovery 검증
-- config reload 또는 credential rotation 이후 재검증 동작 확인
+- [x] resume/dedup/disconnect/subscription persistence tests
+- [x] cast 예외 케이스 검증
+- [x] observability/log redaction/성능 점검
+- [ ] SQLite contention / transaction 경계 / restart recovery 검증
+- [ ] config reload 또는 credential rotation 이후 재검증 동작 확인
+
+Phase 6 current status (2026-03-29):
+- 완료된 3개 구현 묶음: `src/context_book/worker.rs`에 worker 재시작 기반 resume 검증을 추가해 persisted `last_event_id`로 `Last-Event-ID` header를 재사용하고, duplicate replay suppression 및 desired/effective subscription persistence가 restart 이후에도 유지되는지 확인
+- 완료된 3개 구현 묶음: `src/context_book/client.rs`에 `DELETE /votes/{voteId}` contract probe를 추가해 `vote_deleted_supported`를 runtime contract/doctor surface에 반영하고, `src/context_book/service.rs`에 cast-after-delete edge case 검증을 보강
+- 완료된 3개 구현 묶음: `src/context_book/client.rs`의 HTTP error parsing에 민감정보 redaction을 추가하고, `src/context_book/service.rs`에 cache DB가 auth/bootstrap secret을 저장하지 않는 회귀 테스트를 추가
+- 다음 턴 시작 지점: `Phase 6`의 네 번째 작업인 `SQLite contention / transaction 경계 / restart recovery 검증`부터 진행한다.
+- 그 다음 우선순위는 `Phase 6`의 `config reload 또는 credential rotation 이후 재검증 동작 확인`이다.
+
+Validation completed for additional Phase 6 work on 2026-03-29:
+- `cargo fmt --all`
+- `cargo check --lib --tests`
+- `cargo fmt --all -- --check`
+- `cargo clippy --all-targets -- -D warnings`
+- `avahi-browse -rt _contextbook._tcp` → live Context Book advertisement 재확인 (`context-book-local`, `127.0.1.1:8080`, `features=subscriptions,events_resume,dashboard`, `bootstrap=trusted-network+shared-secret`)
+- `curl -fsS http://127.0.1.1:8080/` → unauthenticated preflight 재확인 (`service=context-book`, `status=ok`)
+
+Validation blockers / recorded failures:
+- `cargo test context_book:: --lib` → repository-wide lib-test link 단계에서 실패. 현재 변경 범위를 넘어서는 `rust-lld: undefined hidden symbol ...` 오류가 다수 발생하며 `src/channels/*`, `src/tools/*`, `src/gateway/*` 등 광범위한 기존 오브젝트가 함께 링크되는 구간에서 재현됨
+- `CONTEXT_BOOK_LIVE_BASE_URL=http://127.0.1.1:8080 cargo test live_client_bootstraps_against_context_book_server --lib -- --ignored --nocapture` → bootstrap secret이 세션에 존재함에도 동일한 lib-test link blocker로 실제 live test 본문 실행 전 실패
+- 위 두 실패는 이번 Phase 6 구현 자체의 타입/정적 분석 실패가 아니라 repository-wide lib-test linker blocker로 판단되며, 다음 스텝에서 `SQLite contention / restart recovery` 검증을 진행하기 전에 우선 lib-test linker 문제를 우회하거나 별도로 정리할 필요가 있다
 
 ## 8.5 Next Session Priorities
 
 우선순위 순:
 
-1. `Phase 6` 시작: resume/dedup/disconnect/subscription persistence tests
-- `Last-Event-ID` resume, duplicate replay suppression, transient disconnect 이후 desired/effective subscription persistence를 worker/store 기준으로 보강 검증
-- restart 이후 cursor/subscription/auth profile 복구가 깨지지 않는지 integration 경로를 먼저 확보
+1. `Phase 6` 계속: `SQLite contention / transaction 경계 / restart recovery` 검증
+- worker-tool 동시 접근, partial commit 방지, cursor commit skew 부재, restart recovery를 순서대로 보강
+- lib-test linker blocker가 지속되면 별도 integration harness 또는 narrower test target으로 우회 가능한지 먼저 판단
 
-2. `Phase 6` 계속: cast 예외 케이스 + data-plane contract verification 보강
-- `vote.deleted`, owner-delivery exception, duplicate cast/cast-after-delete 같은 edge case를 spec/live 기준으로 보강
-- runtime contract snapshot과 live capability probe의 차이가 있으면 degraded/read-only 판단까지 함께 검증
+2. `Phase 6` 계속: `config reload 또는 credential rotation 이후 재검증 동작 확인`
+- auth profile 갱신, bootstrap secret rotation, runtime config reload 이후 stale validation/cache가 재평가되는지 확인
+- reload 이후에도 shared handle singleton과 daemon/service-only 경로 계약이 유지되는지 점검
 
-3. `Phase 6` 계속: observability/log redaction/성능 점검
-- token/bootstrap secret/log payload redaction을 재점검하고, Context Book component freshness/last_sync surface가 doctor/health에서 일관적인지 확인
-- cron/heartbeat helper가 과도한 remote read를 만들지 않는지 cache-first/read-through 비용도 점검
-
-4. `Phase 6` 계속: SQLite contention / transaction 경계 / restart recovery / credential rotation
-- worker-tool 동시 접근, partial commit 방지, restart recovery, config reload 또는 credential rotation 이후 재검증 동작을 순서대로 보강
+3. 남은 운영 검증
+- live bootstrap ignored test는 현재 secret/env와 discovery는 확인되었지만 repository-wide lib-test linker blocker 때문에 실행되지 못했으므로, linker blocker 해소 직후 최우선 재실행
 
 ## 9. Testing & Verification Checklist
 

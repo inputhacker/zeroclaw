@@ -421,7 +421,7 @@ mod tests {
     use chrono::{Duration as ChronoDuration, Utc};
     use std::collections::BTreeMap;
     use std::sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     };
     use tempfile::TempDir;
@@ -653,6 +653,317 @@ mod tests {
                 && runtime.cursor_generation == 1
         }));
         assert_eq!(status.cache_inventory.contexts.count, 1);
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn worker_resumes_from_last_event_id_and_preserves_subscriptions_across_restart() {
+        #[derive(Clone)]
+        struct ResumeAppState {
+            stream_calls: Arc<AtomicUsize>,
+            seen_last_event_ids: Arc<Mutex<Vec<String>>>,
+        }
+
+        async fn patch_status() -> impl IntoResponse {
+            axum::Json(serde_json::json!({"ok": true}))
+        }
+
+        async fn events_stream(
+            State(state): State<ResumeAppState>,
+            headers: HeaderMap,
+        ) -> impl IntoResponse {
+            let last_event_id = headers
+                .get("last-event-id")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            state
+                .seen_last_event_ids
+                .lock()
+                .expect("last-event-id mutex")
+                .push(last_event_id.clone());
+
+            let body = match state.stream_calls.fetch_add(1, Ordering::SeqCst) {
+                0 => {
+                    assert_eq!(last_event_id, "evt-prev");
+                    concat!(
+                        "id: evt-next\n",
+                        "event: context.created\n",
+                        "data: {\"eventId\":\"evt-next\",\"eventType\":\"context.created\",",
+                        "\"occurredAt\":\"2026-03-29T00:00:01Z\",\"producerAgentId\":\"peer-a\",",
+                        "\"entityId\":\"ctx-101\",\"payload\":{},\"meta\":{}}\n\n"
+                    )
+                }
+                1 => {
+                    assert_eq!(last_event_id, "evt-next");
+                    concat!(
+                        "id: evt-next\n",
+                        "event: context.created\n",
+                        "data: {\"eventId\":\"evt-next\",\"eventType\":\"context.created\",",
+                        "\"occurredAt\":\"2026-03-29T00:00:01Z\",\"producerAgentId\":\"peer-a\",",
+                        "\"entityId\":\"ctx-101\",\"payload\":{},\"meta\":{}}\n\n",
+                        "id: evt-next-2\n",
+                        "event: context.created\n",
+                        "data: {\"eventId\":\"evt-next-2\",\"eventType\":\"context.created\",",
+                        "\"occurredAt\":\"2026-03-29T00:00:02Z\",\"producerAgentId\":\"peer-b\",",
+                        "\"entityId\":\"ctx-202\",\"payload\":{},\"meta\":{}}\n\n"
+                    )
+                }
+                _ => "",
+            };
+
+            (
+                StatusCode::OK,
+                [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                body,
+            )
+                .into_response()
+        }
+
+        async fn agents() -> impl IntoResponse {
+            axum::Json(serde_json::json!([
+                {
+                    "agentId": "workspace",
+                    "lifecycleState": "Active",
+                    "connectionState": "Disconnected"
+                }
+            ]))
+        }
+
+        async fn subscriptions() -> impl IntoResponse {
+            axum::Json(serde_json::json!({
+                "consumerAgentId": "workspace",
+                "desiredProducerAgentIds": ["peer-a", "peer-b"],
+                "effectiveProducerAgentIds": ["peer-a"]
+            }))
+        }
+
+        async fn contexts() -> impl IntoResponse {
+            axum::Json(serde_json::json!({
+                "items": [
+                    {
+                        "contextId": "ctx-101",
+                        "authorAgentId": "peer-a",
+                        "title": "Resume one",
+                        "contents": "first replayed context",
+                        "tag": "ops",
+                        "status": "Published",
+                        "createdAt": "2026-03-29T00:00:01Z",
+                        "updatedAt": "2026-03-29T00:00:01Z"
+                    },
+                    {
+                        "contextId": "ctx-202",
+                        "authorAgentId": "peer-b",
+                        "title": "Resume two",
+                        "contents": "second replayed context",
+                        "tag": "ops",
+                        "status": "Published",
+                        "createdAt": "2026-03-29T00:00:02Z",
+                        "updatedAt": "2026-03-29T00:00:02Z"
+                    }
+                ]
+            }))
+        }
+
+        async fn delete_vote_probe() -> impl IntoResponse {
+            (
+                StatusCode::NOT_FOUND,
+                axum::Json(serde_json::json!({
+                    "error": {
+                        "code": "VOTE_NOT_FOUND",
+                        "message": "missing vote"
+                    }
+                })),
+            )
+        }
+
+        async fn legacy_refresh() -> impl IntoResponse {
+            (
+                StatusCode::BAD_REQUEST,
+                axum::Json(serde_json::json!({
+                    "error": {
+                        "code": "REFRESH_TOKEN_REQUIRED",
+                        "message": "missing refresh token"
+                    }
+                })),
+            )
+        }
+
+        async fn events_probe() -> impl IntoResponse {
+            (
+                StatusCode::CONFLICT,
+                axum::Json(serde_json::json!({
+                    "error": {
+                        "code": "CURSOR_NOT_FOUND",
+                        "message": "missing cursor"
+                    }
+                })),
+            )
+        }
+
+        let app_state = ResumeAppState {
+            stream_calls: Arc::new(AtomicUsize::new(0)),
+            seen_last_event_ids: Arc::new(Mutex::new(Vec::new())),
+        };
+        let app = Router::new()
+            .route("/agents/workspace/status", patch(patch_status))
+            .route("/agents", get(agents))
+            .route("/subscriptions", get(subscriptions))
+            .route("/contexts", get(contexts))
+            .route("/events/stream", get(events_stream))
+            .route("/events", get(events_probe))
+            .route("/votes/{vote_id}", axum::routing::delete(delete_vote_probe))
+            .route("/auth/refresh", post(legacy_refresh))
+            .with_state(app_state.clone());
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve axum");
+        });
+
+        let tmp = TempDir::new().expect("temp dir");
+        let config = test_config(&tmp, format!("http://{addr}"));
+        let state_dir = state_dir_from_config(&config);
+        let auth_store = AuthProfilesStore::new(&state_dir, config.secrets.encrypt);
+        auth_store
+            .upsert_profile(
+                AuthProfile {
+                    id: profile_id("context-book", "default"),
+                    provider: "context-book".into(),
+                    profile_name: "default".into(),
+                    kind: AuthProfileKind::OAuth,
+                    account_id: None,
+                    workspace_id: None,
+                    token_set: Some(TokenSet {
+                        access_token: "resume-token".into(),
+                        refresh_token: Some("resume-refresh".into()),
+                        id_token: None,
+                        expires_at: Some(Utc::now() + ChronoDuration::minutes(30)),
+                        token_type: None,
+                        scope: None,
+                    }),
+                    token: None,
+                    metadata: BTreeMap::from([("agent_id".to_string(), "workspace".to_string())]),
+                    created_at: Utc::now(),
+                    updated_at: Utc::now(),
+                },
+                true,
+            )
+            .await
+            .expect("seed worker auth profile");
+
+        let handle = shared_handle(&config);
+        handle
+            .store()
+            .save_subscriptions(
+                &crate::context_book::store::ContextBookSubscriptionsSnapshot {
+                    consumer_agent_id: Some("workspace".into()),
+                    desired_producer_agent_ids: vec!["peer-a".into(), "peer-b".into()],
+                    effective_producer_agent_ids: vec!["peer-a".into()],
+                    updated_at: "2026-03-29T00:00:00Z".into(),
+                },
+            )
+            .expect("seed persisted subscriptions");
+        let mut snapshot = handle.snapshot();
+        snapshot.agent_id = Some("workspace".into());
+        snapshot.last_event_id = Some("evt-prev".into());
+        snapshot.cursor_generation = 0;
+        handle
+            .store()
+            .save_runtime_state(&snapshot)
+            .expect("seed persisted runtime");
+
+        let shutdown = CancellationToken::new();
+        let worker = tokio::spawn(run(
+            config.clone(),
+            handle.clone(),
+            Some(shutdown.child_token()),
+        ));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        shutdown.cancel();
+        worker
+            .await
+            .expect("worker join")
+            .expect("worker should stop cleanly");
+
+        let persisted_after_first = handle
+            .store()
+            .load_runtime_state()
+            .expect("load runtime after first run")
+            .expect("persisted runtime after first run");
+        assert_eq!(
+            persisted_after_first.last_event_id.as_deref(),
+            Some("evt-next")
+        );
+        assert_eq!(
+            handle.store().seen_event_count().expect("seen event count"),
+            1
+        );
+
+        let mut restart_config = config.clone();
+        restart_config.config_path = tmp.path().join("config-restart.toml");
+        let restart_handle = crate::context_book::bootstrap(&restart_config).handle;
+        let restart_shutdown = CancellationToken::new();
+        let restarted_worker = tokio::spawn(run(
+            restart_config,
+            restart_handle.clone(),
+            Some(restart_shutdown.child_token()),
+        ));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        restart_shutdown.cancel();
+        restarted_worker
+            .await
+            .expect("restarted worker join")
+            .expect("restarted worker should stop cleanly");
+
+        let persisted_after_restart = restart_handle
+            .store()
+            .load_runtime_state()
+            .expect("load runtime after restart")
+            .expect("persisted runtime after restart");
+        assert_eq!(
+            persisted_after_restart.last_event_id.as_deref(),
+            Some("evt-next-2")
+        );
+        assert_eq!(
+            restart_handle
+                .store()
+                .seen_event_count()
+                .expect("seen event count after restart"),
+            2
+        );
+        let persisted_subscriptions = restart_handle
+            .store()
+            .load_subscriptions()
+            .expect("load subscriptions after restart")
+            .expect("persisted subscriptions after restart");
+        assert_eq!(
+            persisted_subscriptions.desired_producer_agent_ids,
+            vec!["peer-a".to_string(), "peer-b".to_string()]
+        );
+        assert_eq!(
+            persisted_subscriptions.effective_producer_agent_ids,
+            vec!["peer-a".to_string()]
+        );
+        let seen_last_event_ids = app_state
+            .seen_last_event_ids
+            .lock()
+            .expect("last-event-id mutex")
+            .clone();
+        assert_eq!(
+            seen_last_event_ids,
+            vec!["evt-prev".to_string(), "evt-next".to_string()]
+        );
+        let cached_contexts = restart_handle
+            .store()
+            .load_contexts()
+            .expect("load cached contexts")
+            .expect("cached contexts after restart");
+        assert_eq!(cached_contexts.items.len(), 2);
 
         server.abort();
         let _ = server.await;

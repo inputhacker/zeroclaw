@@ -1077,6 +1077,23 @@ fn check_daemon_state(config: &Config, items: &mut Vec<DiagItem>) {
                 ));
             }
 
+            if let Some(vote_deleted_supported) = contract
+                .and_then(|contract| contract.get("vote_deleted_supported"))
+                .and_then(serde_json::Value::as_bool)
+            {
+                if vote_deleted_supported {
+                    items.push(DiagItem::ok(
+                        cat,
+                        "context_book vote.deleted contract is available",
+                    ));
+                } else {
+                    items.push(DiagItem::warn(
+                        cat,
+                        "context_book vote.deleted contract is unavailable",
+                    ));
+                }
+            }
+
             if let Some(subscriptions) = subscriptions {
                 let desired = subscriptions
                     .get("desired_producer_agent_ids")
@@ -1614,7 +1631,8 @@ mod tests {
                 "contract": {
                     "validation_state": "degraded",
                     "refresh_mode": "legacy_auth_refresh",
-                    "degraded_modes": ["no_refresh", "no_write"]
+                    "degraded_modes": ["no_refresh", "no_write"],
+                    "vote_deleted_supported": false
                 },
                 "runtime": {
                     "enabled": true,
@@ -1662,6 +1680,11 @@ mod tests {
         assert!(items.iter().any(|item| {
             item.message
                 .contains("context_book runtime contract degraded")
+                && item.severity == Severity::Warn
+        }));
+        assert!(items.iter().any(|item| {
+            item.message
+                .contains("context_book vote.deleted contract is unavailable")
                 && item.severity == Severity::Warn
         }));
         assert!(items.iter().any(|item| {

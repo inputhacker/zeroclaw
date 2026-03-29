@@ -1,11 +1,17 @@
+pub mod client;
 pub mod config;
+pub mod events;
 pub mod handle;
 pub mod service;
 pub mod store;
 pub mod worker;
 
 #[allow(unused_imports)]
+pub use client::{ContextBookAgentIdentity, ContextBookClient, ContextBookClientErrorKind};
+#[allow(unused_imports)]
 pub use config::ResolvedContextBookConfig;
+#[allow(unused_imports)]
+pub use events::{ContextBookEventEnvelope, ContextBookSseParser, ParsedContextBookSseFrame};
 #[allow(unused_imports)]
 pub use handle::{ContextBookHandle, ContextBookRuntimeSnapshot};
 #[allow(unused_imports)]

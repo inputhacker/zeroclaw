@@ -301,15 +301,26 @@ Validation completed on 2026-03-29:
 - `cargo fmt --all -- --check`
 - `cargo clippy --all-targets -- -D warnings` → 현재 작업과 무관한 기존 lint (`src/security/firejail.rs:163`, `inefficient_to_string`)로 실패. 이번 변경 범위를 벗어나므로 미수정.
 
+Additional validation for Phase 2 on 2026-03-29:
+- `cargo test context_book:: --lib`
+- `avahi-browse -rt _contextbook._tcp` → 실서버 광고 확인 (`context-book-local`, `127.0.1.1:8080`, TXT feature 광고 존재)
+- `curl http://127.0.1.1:8080/` → unauthenticated preflight 정상 (`service=context-book`, `status=ok`)
+
 ### Phase 2 (Connectivity)
-- bootstrap/connect/refresh + SSE consume + dedup + cursor persistence
-- `connect`의 `403 BOOTSTRAP_APPROVAL_REQUIRED` reapproval flow 반영
-- polling fallback + `409 CURSOR_NOT_FOUND` 처리
-- auth/secrets 재사용 경로 연결
-- refresh endpoint/protocol 계약(`oauth2/token` 기본, legacy `/auth/refresh` 호환 여부) 구현 반영
-- graceful shutdown / resume 계약 반영
-- runtime proxy + outbound host validation 경로 연결
+- [x] bootstrap/connect/refresh + SSE consume + dedup + cursor persistence
+- [x] `connect`의 `403 BOOTSTRAP_APPROVAL_REQUIRED` reapproval flow 반영
+- [x] polling fallback + `409 CURSOR_NOT_FOUND` 처리
+- [x] auth/secrets 재사용 경로 연결
+- [x] refresh endpoint/protocol 계약(`oauth2/token` 기본, legacy `/auth/refresh` 호환 여부) 구현 반영
+- [x] graceful shutdown / resume 계약 반영
+- [x] runtime proxy + outbound host validation 경로 연결
 - post-bootstrap contract validation 및 degraded 모드 결정 경로 연결
+
+Phase 2 current status (2026-03-29):
+- 완료된 3개 구현 묶음: `context_book::client` 추가, bootstrap/connect/register/reapproval wait-complete flow 구현, OAuth `POST /oauth2/token` refresh 및 auth profile 재사용 연결
+- 완료된 3개 구현 묶음: worker SSE consume + heartbeat suppression + event dedup + cursor persistence + best-effort shutdown `Inactive` 전이
+- 완료된 3개 구현 묶음: polling fallback + `409 CURSOR_NOT_FOUND` cursor reset + resume persistence + runtime proxy/host validation 연결
+- 다음 턴 시작 지점: `Phase 2`의 마지막 남은 작업인 `post-bootstrap contract validation 및 degraded mode 결정 경로`부터 진행한다. 이 작업이 끝나면 `Phase 3`의 첫 작업인 `desired/effective subscription 관리`로 넘어간다.
 
 ### Phase 3 (Subscriptions + Read Path)
 - desired/effective subscription 관리

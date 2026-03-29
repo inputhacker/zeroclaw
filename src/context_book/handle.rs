@@ -13,12 +13,15 @@ pub struct ContextBookRuntimeSnapshot {
     pub enabled: bool,
     pub owner_mode: String,
     pub worker_state: String,
+    pub agent_id: Option<String>,
     pub lifecycle_state: String,
     pub connection_state: String,
     pub shutdown_requested: bool,
     pub status_message: Option<String>,
     pub last_error: Option<String>,
     pub last_status_at: String,
+    pub last_event_id: Option<String>,
+    pub cursor_generation: i64,
     pub last_connect_at: Option<String>,
     pub last_sync_at: Option<String>,
     pub cache_db_path: String,
@@ -45,12 +48,15 @@ impl ContextBookHandleState {
             enabled: resolved.enabled,
             owner_mode: "service_only".to_string(),
             worker_state: worker_state.to_string(),
+            agent_id: None,
             lifecycle_state: "inactive".to_string(),
             connection_state: "disconnected".to_string(),
             shutdown_requested: false,
             status_message: Some("phase1 foundation initialized".to_string()),
             last_error: resolved.validation_error.clone(),
             last_status_at: now_rfc3339(),
+            last_event_id: None,
+            cursor_generation: 0,
             last_connect_at: None,
             last_sync_at: None,
             cache_db_path: resolved.cache_db_path.display().to_string(),
@@ -120,7 +126,6 @@ impl ContextBookHandleState {
     pub fn mark_idle(&self, message: &str) {
         self.update_runtime(|runtime| {
             runtime.worker_state = "idle".to_string();
-            runtime.lifecycle_state = "inactive".to_string();
             runtime.connection_state = "disconnected".to_string();
             runtime.shutdown_requested = false;
             runtime.status_message = Some(message.to_string());
@@ -157,6 +162,77 @@ impl ContextBookHandleState {
     pub fn set_store_initialized(&self, initialized: bool) {
         self.update_runtime(|runtime| {
             runtime.store_initialized = initialized;
+        });
+    }
+
+    pub fn mark_session_ready(&self, agent_id: &str, message: &str) {
+        let agent_id = agent_id.to_string();
+        self.update_runtime(|runtime| {
+            runtime.agent_id = Some(agent_id);
+            runtime.worker_state = "connected".to_string();
+            runtime.lifecycle_state = "active".to_string();
+            runtime.connection_state = "disconnected".to_string();
+            runtime.status_message = Some(message.to_string());
+            runtime.last_error = None;
+        });
+    }
+
+    pub fn mark_stream_connected(&self, agent_id: &str, message: &str) {
+        let agent_id = agent_id.to_string();
+        self.update_runtime(|runtime| {
+            runtime.agent_id = Some(agent_id);
+            runtime.worker_state = "streaming".to_string();
+            runtime.lifecycle_state = "active".to_string();
+            runtime.connection_state = "connected".to_string();
+            runtime.status_message = Some(message.to_string());
+            runtime.last_connect_at = Some(now_rfc3339());
+            runtime.last_error = None;
+        });
+    }
+
+    pub fn mark_retrying(&self, message: &str) {
+        self.update_runtime(|runtime| {
+            runtime.worker_state = "retrying".to_string();
+            runtime.connection_state = "disconnected".to_string();
+            runtime.status_message = Some(message.to_string());
+        });
+    }
+
+    pub fn mark_event_applied(&self, event_id: &str) {
+        let event_id = event_id.to_string();
+        self.update_runtime(|runtime| {
+            runtime.last_event_id = Some(event_id);
+            runtime.last_sync_at = Some(now_rfc3339());
+            runtime.status_message = Some("context_book event applied".to_string());
+        });
+    }
+
+    pub fn reset_cursor(&self, message: &str) {
+        self.update_runtime(|runtime| {
+            runtime.last_event_id = None;
+            runtime.cursor_generation += 1;
+            runtime.status_message = Some(message.to_string());
+        });
+    }
+
+    pub fn restore_persisted_runtime(&self) {
+        let Ok(Some(persisted)) = self.store.load_runtime_state() else {
+            return;
+        };
+
+        self.update_runtime(|runtime| {
+            runtime.owner_mode = persisted.owner_mode;
+            runtime.worker_state = persisted.worker_state;
+            runtime.agent_id = persisted.agent_id;
+            runtime.lifecycle_state = persisted.lifecycle_state;
+            runtime.connection_state = persisted.connection_state;
+            runtime.status_message = persisted.status_message;
+            runtime.last_error = persisted.last_error;
+            runtime.last_event_id = persisted.last_event_id;
+            runtime.cursor_generation = persisted.cursor_generation;
+            runtime.last_connect_at = persisted.last_connect_at;
+            runtime.last_sync_at = persisted.last_sync_at;
+            runtime.last_status_at = persisted.updated_at;
         });
     }
 

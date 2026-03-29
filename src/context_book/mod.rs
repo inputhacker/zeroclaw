@@ -7,7 +7,11 @@ pub mod store;
 pub mod worker;
 
 #[allow(unused_imports)]
-pub use client::{ContextBookAgentIdentity, ContextBookClient, ContextBookClientErrorKind};
+pub use client::{
+    ContextBookAgentIdentity, ContextBookClient, ContextBookClientErrorKind,
+    ContextBookContextCreateRequest, ContextBookContextUpdateRequest, ContextBookVoteCastRequest,
+    ContextBookVoteCreateRequest, ContextBookVoteUpdateRequest,
+};
 #[allow(unused_imports)]
 pub use config::ResolvedContextBookConfig;
 #[allow(unused_imports)]

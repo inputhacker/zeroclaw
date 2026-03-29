@@ -618,6 +618,47 @@ impl ContextBookStore {
         })
     }
 
+    pub fn load_context(&self, context_id: &str) -> Result<Option<ContextBookContextSnapshot>> {
+        if !self.path.exists() {
+            return Ok(None);
+        }
+
+        self.with_connection(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT context_id, author_agent_id, title, contents, tag, status,
+                        created_at, updated_at, raw_json, synced_at
+                 FROM cb_context_snapshots
+                 WHERE context_id = ?1",
+            )?;
+            stmt.query_row(params![context_id], map_context_snapshot_row)
+                .optional()
+                .context("failed to load cached context snapshot")
+        })
+    }
+
+    pub fn save_context_snapshot(&self, context: &ContextBookContextSnapshot) -> Result<()> {
+        self.initialize()?;
+        self.with_connection(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            upsert_context_tx(&tx, context)?;
+            tx.commit()
+                .context("failed to commit single context snapshot transaction")?;
+            Ok(())
+        })
+    }
+
+    pub fn delete_context(&self, context_id: &str) -> Result<()> {
+        self.initialize()?;
+        self.with_connection(|conn| {
+            conn.execute(
+                "DELETE FROM cb_context_snapshots WHERE context_id = ?1",
+                params![context_id],
+            )
+            .context("failed to delete cached context snapshot")?;
+            Ok(())
+        })
+    }
+
     pub fn save_votes(&self, votes: &[ContextBookVoteSnapshot]) -> Result<()> {
         self.initialize()?;
         self.with_connection(|conn| {
@@ -682,6 +723,47 @@ impl ContextBookStore {
 
             let updated_at = items.iter().map(|item| item.synced_at.clone()).max();
             Ok(Some(ContextBookCachedItems { items, updated_at }))
+        })
+    }
+
+    pub fn load_vote(&self, vote_id: &str) -> Result<Option<ContextBookVoteSnapshot>> {
+        if !self.path.exists() {
+            return Ok(None);
+        }
+
+        self.with_connection(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT vote_id, owner_agent_id, vote_score, vote_context, voter_agent_ids_json,
+                        required_score, executable, created_at, updated_at, raw_json, synced_at
+                 FROM cb_vote_snapshots
+                 WHERE vote_id = ?1",
+            )?;
+            stmt.query_row(params![vote_id], map_vote_snapshot_row)
+                .optional()
+                .context("failed to load cached vote snapshot")
+        })
+    }
+
+    pub fn save_vote_snapshot(&self, vote: &ContextBookVoteSnapshot) -> Result<()> {
+        self.initialize()?;
+        self.with_connection(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            upsert_vote_tx(&tx, vote)?;
+            tx.commit()
+                .context("failed to commit single vote snapshot transaction")?;
+            Ok(())
+        })
+    }
+
+    pub fn delete_vote(&self, vote_id: &str) -> Result<()> {
+        self.initialize()?;
+        self.with_connection(|conn| {
+            conn.execute(
+                "DELETE FROM cb_vote_snapshots WHERE vote_id = ?1",
+                params![vote_id],
+            )
+            .context("failed to delete cached vote snapshot")?;
+            Ok(())
         })
     }
 
@@ -841,26 +923,7 @@ fn replace_contexts_tx(
     tx.execute("DELETE FROM cb_context_snapshots", [])
         .context("failed to clear cached context snapshots")?;
     for context in contexts {
-        tx.execute(
-            "INSERT INTO cb_context_snapshots (
-                 context_id, author_agent_id, title, contents, tag, status,
-                 created_at, updated_at, raw_json, synced_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-            params![
-                context.context_id,
-                context.author_agent_id,
-                context.title,
-                context.contents,
-                context.tag,
-                context.status,
-                context.created_at,
-                context.updated_at,
-                serde_json::to_string(&context.raw_json)
-                    .context("failed to serialize cached context raw_json")?,
-                context.synced_at,
-            ],
-        )
-        .context("failed to persist cached context snapshot")?;
+        upsert_context_tx(tx, context)?;
     }
     Ok(())
 }
@@ -872,30 +935,138 @@ fn replace_votes_tx(
     tx.execute("DELETE FROM cb_vote_snapshots", [])
         .context("failed to clear cached vote snapshots")?;
     for vote in votes {
-        tx.execute(
-            "INSERT INTO cb_vote_snapshots (
-                 vote_id, owner_agent_id, vote_score, vote_context, voter_agent_ids_json,
-                 required_score, executable, created_at, updated_at, raw_json, synced_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-            params![
-                vote.vote_id,
-                vote.owner_agent_id,
-                vote.vote_score,
-                vote.vote_context,
-                serde_json::to_string(&vote.voter_agent_ids)
-                    .context("failed to serialize cached vote voter_agent_ids")?,
-                vote.required_score,
-                vote.executable.map(i64::from),
-                vote.created_at,
-                vote.updated_at,
-                serde_json::to_string(&vote.raw_json)
-                    .context("failed to serialize cached vote raw_json")?,
-                vote.synced_at,
-            ],
-        )
-        .context("failed to persist cached vote snapshot")?;
+        upsert_vote_tx(tx, vote)?;
     }
     Ok(())
+}
+
+fn upsert_context_tx(
+    tx: &rusqlite::Transaction<'_>,
+    context: &ContextBookContextSnapshot,
+) -> Result<()> {
+    tx.execute(
+        "INSERT INTO cb_context_snapshots (
+             context_id, author_agent_id, title, contents, tag, status,
+             created_at, updated_at, raw_json, synced_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+         ON CONFLICT(context_id) DO UPDATE SET
+             author_agent_id = excluded.author_agent_id,
+             title = excluded.title,
+             contents = excluded.contents,
+             tag = excluded.tag,
+             status = excluded.status,
+             created_at = excluded.created_at,
+             updated_at = excluded.updated_at,
+             raw_json = excluded.raw_json,
+             synced_at = excluded.synced_at",
+        params![
+            context.context_id,
+            context.author_agent_id,
+            context.title,
+            context.contents,
+            context.tag,
+            context.status,
+            context.created_at,
+            context.updated_at,
+            serde_json::to_string(&context.raw_json)
+                .context("failed to serialize cached context raw_json")?,
+            context.synced_at,
+        ],
+    )
+    .context("failed to persist cached context snapshot")?;
+    Ok(())
+}
+
+fn upsert_vote_tx(tx: &rusqlite::Transaction<'_>, vote: &ContextBookVoteSnapshot) -> Result<()> {
+    tx.execute(
+        "INSERT INTO cb_vote_snapshots (
+             vote_id, owner_agent_id, vote_score, vote_context, voter_agent_ids_json,
+             required_score, executable, created_at, updated_at, raw_json, synced_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+         ON CONFLICT(vote_id) DO UPDATE SET
+             owner_agent_id = excluded.owner_agent_id,
+             vote_score = excluded.vote_score,
+             vote_context = excluded.vote_context,
+             voter_agent_ids_json = excluded.voter_agent_ids_json,
+             required_score = excluded.required_score,
+             executable = excluded.executable,
+             created_at = excluded.created_at,
+             updated_at = excluded.updated_at,
+             raw_json = excluded.raw_json,
+             synced_at = excluded.synced_at",
+        params![
+            vote.vote_id,
+            vote.owner_agent_id,
+            vote.vote_score,
+            vote.vote_context,
+            serde_json::to_string(&vote.voter_agent_ids)
+                .context("failed to serialize cached vote voter_agent_ids")?,
+            vote.required_score,
+            vote.executable.map(i64::from),
+            vote.created_at,
+            vote.updated_at,
+            serde_json::to_string(&vote.raw_json)
+                .context("failed to serialize cached vote raw_json")?,
+            vote.synced_at,
+        ],
+    )
+    .context("failed to persist cached vote snapshot")?;
+    Ok(())
+}
+
+fn map_context_snapshot_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<ContextBookContextSnapshot> {
+    let raw_json = row.get::<_, String>(8)?;
+    Ok(ContextBookContextSnapshot {
+        context_id: row.get(0)?,
+        author_agent_id: row.get(1)?,
+        title: row.get(2)?,
+        contents: row.get(3)?,
+        tag: row.get(4)?,
+        status: row.get(5)?,
+        created_at: row.get(6)?,
+        updated_at: row.get(7)?,
+        raw_json: serde_json::from_str(&raw_json).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                8,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?,
+        synced_at: row.get(9)?,
+    })
+}
+
+fn map_vote_snapshot_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ContextBookVoteSnapshot> {
+    let voter_agent_ids_json = row.get::<_, String>(4)?;
+    let raw_json = row.get::<_, String>(9)?;
+    let executable = row.get::<_, Option<i64>>(6)?.map(|value| value != 0);
+    Ok(ContextBookVoteSnapshot {
+        vote_id: row.get(0)?,
+        owner_agent_id: row.get(1)?,
+        vote_score: row.get(2)?,
+        vote_context: row.get(3)?,
+        voter_agent_ids: serde_json::from_str(&voter_agent_ids_json).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                4,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?,
+        required_score: row.get(5)?,
+        executable,
+        created_at: row.get(7)?,
+        updated_at: row.get(8)?,
+        raw_json: serde_json::from_str(&raw_json).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                9,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?,
+        synced_at: row.get(10)?,
+    })
 }
 
 fn normalize_agent_ids(values: &[String]) -> Vec<String> {

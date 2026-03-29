@@ -353,7 +353,7 @@ Phase 2 current status (2026-03-29):
 - [x] events 기반 캐시 동기화
 - [x] query tools (`contexts/votes/subscriptions/status`)
 - [x] read-through 정책과 cache freshness 표면화
-- [ ] doctor/health에 stale or degraded 상태 반영
+- [x] doctor/health에 stale or degraded 상태 반영
 
 Phase 3 current status (2026-03-29):
 - 완료된 3개 구현 묶음: desired/effective subscription SQLite persistence 추가 (`cb_subscription_state`, `cb_desired_subscriptions`, `cb_effective_subscriptions`)
@@ -362,30 +362,50 @@ Phase 3 current status (2026-03-29):
 - 완료된 3개 구현 묶음: worker event routing에서 `subscription.updated`, `agent.*`, `context.*`, `vote.*`에 대한 read-through cache sync 연결, `cb_agent_snapshots`/`cb_context_snapshots`/`cb_vote_snapshots` 추가, `event dedup + snapshot replace + cursor commit` transaction 경계 반영
 - 완료된 3개 구현 묶음: `context_book_contexts_query`, `context_book_votes_query` tool 추가 및 `status/subscriptions` 응답에 cache inventory/freshness 표면화 연결
 - 완료된 3개 구현 묶음: `ContextBookClient`의 `GET /agents`, `GET /contexts`, `GET /votes` read API 연결 및 live bootstrap test에서 authenticated read path 확인
-- 다음 턴 시작 지점: `Phase 3`의 마지막 작업인 `doctor/health에 stale or degraded 상태 반영`부터 진행한다.
-- 그 다음 우선순위는 `Phase 4`의 `context CRUD`와 `vote CRUD + cast` write path 진입이다.
+- 완료된 3개 구현 묶음: `context_book` component health에 `warn` 상태 추가, degraded contract / stale cache collection(`agents|contexts|votes`)을 health와 doctor에 함께 반영
+- 다음 턴 시작 지점: `Phase 5`의 첫 작업인 `로컬+원격 context 기반 vote/cast 의사결정 헬퍼`부터 진행한다.
+- 그 다음 우선순위는 `Phase 5`의 `heartbeat/cron read helper`와 `memory 비침투 유지 검증`이다.
 
-Validation completed for Phase 3 read-path work on 2026-03-29:
+Validation completed for Phase 3 and Phase 4 work on 2026-03-29:
 - `cargo fmt --all`
 - `cargo check --lib --tests`
+- `cargo test context_book:: --lib`
 - `cargo test apply_event_sync_replaces_cached_snapshots_in_same_transaction --lib`
 - `cargo test worker_resets_cursor_and_uses_polling_fallback --lib`
 - `cargo test contexts_query_tool_filters_cached_items --lib`
 - `cargo test votes_query_tool_filters_cached_items --lib`
+- `cargo test client_supports_context_and_vote_write_routes --lib`
+- `cargo test context_writes_sync_local_cache --lib`
+- `cargo test cast_vote_rejects_owner_and_duplicate_from_cache --lib`
 - `cargo test status_tool_reports_runtime_snapshot --lib`
+- `cargo test daemon_state_reports_context_book_contract_details --lib`
+- `cargo test mark_component_warn_preserves_warning_state --lib`
+- `cargo test all_tools_excludes_browser_when_disabled --lib`
 - `cargo test all_tools_includes_browser_when_enabled --lib`
 - `CONTEXT_BOOK_BOOTSTRAP_SHARED_SECRET=... cargo test live_client_bootstraps_against_context_book_server --lib -- --ignored --nocapture`
+- `avahi-browse -rt _contextbook._tcp` → 실서버 광고 확인 (`context-book-local`, `127.0.1.1:8080`, `features=subscriptions,events_resume,dashboard`)
+- `curl http://127.0.1.1:8080/` → unauthenticated preflight 정상 (`service=context-book`, `status=ok`)
+- 수동 live REST smoke:
+  - bootstrap/register/init + dashboard approve + register/complete + `PATCH /agents/{agentId}/status` 성공
+  - `POST/PATCH/DELETE /contexts` → `201/200/204`
+  - `POST/PATCH/DELETE /votes` + `POST /votes/{voteId}/cast` → `201/200/200/204`
 - `cargo fmt --all -- --check`
 - `cargo clippy --all-targets -- -D warnings` → 이번 변경에서 추가한 clippy 이슈는 정리했고, 현재는 기존 lint만 남음 (`src/security/firejail.rs:163`, `inefficient_to_string`)
-- `cargo test` → 현재 작업과 무관한 기존 실패 2건으로 실패:
-  - `providers::bedrock::tests::bearer_token_from_env`
-  - `providers::bedrock::tests::chat_fails_without_credentials`
+- `cargo test` → 통과
 
 ### Phase 4 (Write Path)
-- context CRUD 툴/서비스
-- vote CRUD + cast 툴/서비스
-- 권한/제약(owner, Active, duplicate cast) 처리
-- 원격 성공 후 로컬 캐시 sync의 실패 보정 규칙 정의
+- [x] context CRUD 툴/서비스
+- [x] vote CRUD + cast 툴/서비스
+- [x] 권한/제약(owner, Active, duplicate cast) 처리
+- [x] 원격 성공 후 로컬 캐시 sync의 실패 보정 규칙 정의
+
+Phase 4 current status (2026-03-29):
+- 완료된 3개 구현 묶음: `ContextBookClient`에 `POST/PATCH/DELETE /contexts`, `POST/PATCH/DELETE /votes`, `POST /votes/{voteId}/cast` write API 추가
+- 완료된 3개 구현 묶음: `ContextBookService`에 Active 전이, author/owner/duplicate cast 로컬 가드, remote success 후 local single-snapshot sync + full refresh fallback 보정 규칙 추가
+- 완료된 3개 구현 묶음: `context_book_context_create|update|delete`, `context_book_vote_create|update|delete|cast` tool 추가 및 tool registry/security `Act` wiring 연결
+- 완료된 3개 구현 묶음: live 서버 write 응답 wrapper(`{"context": ...}`, `{"vote": ...}`) 대응 parser 보강 및 mock/live 검증 반영
+- 다음 턴 시작 지점: `Phase 5`의 첫 작업인 `로컬+원격 context 기반 vote/cast 의사결정 헬퍼`부터 진행한다.
+- 그 다음 우선순위는 `Phase 5`의 `heartbeat/cron에서 필요 시 참조하는 read helper`와 `memory 비침투 유지 검증`이다.
 
 ### Phase 5 (Policy + Scheduler/Heartbeat Hook)
 - 로컬+원격 context 기반 vote/cast 의사결정 헬퍼
@@ -405,21 +425,21 @@ Validation completed for Phase 3 read-path work on 2026-03-29:
 
 우선순위 순:
 
-1. `Phase 3` 마무리: doctor/health stale or degraded 반영
-- `context_book` cache inventory(`agents/contexts/votes`)의 freshness를 doctor/health에 연결
-- stale 판정 기준과 degraded mode surface를 같은 상태 모델로 일관화
+1. `Phase 5` 시작: 로컬+원격 context 기반 vote/cast 의사결정 헬퍼
+- cached context/vote와 remote read-through를 조합해 정책 입력을 만드는 helper 추가
+- 일반 chat turn 자동 주입 없이 cron/heartbeat/tool 경로에서만 참조하도록 유지
 
-2. `Phase 4` 진입: context CRUD write path
-- `POST/PATCH/DELETE /contexts` service/tool 구현
-- remote success 후 local cache sync 보정 규칙과 Active/author 제약 처리
+2. `Phase 5` 계속: heartbeat/cron read helper + memory 비침투 검증
+- scheduler/heartbeat에서 Context Book 참조가 필요할 때 사용할 read helper 추가
+- context/vote 데이터가 기존 `memory`로 자동 주입되지 않는지 regression test 보강
 
-3. `Phase 4` 계속: vote CRUD + cast
-- `POST/PATCH/DELETE /votes`, `POST /votes/{voteId}/cast` 구현
-- owner cast 금지, duplicate cast 방지, 원격 성공 후 로컬 sync 보정
-
-4. `vote.deleted` / data-plane contract verification 보강
+3. `Phase 6` 진입: `vote.deleted` / data-plane contract verification 보강
 - 현재 read path는 `vote.deleted`를 처리하지만 runtime contract snapshot의 explicit live verification은 아직 남아 있음
 - 다음 세션에서는 spec/live를 대조해 capability source 또는 probe를 보강
+
+4. `Phase 6` 계속: restart/recovery/contention hardening
+- restart 이후 desired subscription / cursor / auth profile 복구 테스트 보강
+- SQLite contention / transaction 경계 / credential rotation 재검증 동작 확인
 
 ## 9. Testing & Verification Checklist
 
@@ -515,4 +535,4 @@ Validation completed for Phase 3 read-path work on 2026-03-29:
 4. 추가로 `daemon-only worker ownership`, `general user turn은 tool-only integration`, `outbound proxy/host validation`, `ctxbk spec 접근성` 네 항목을 먼저 확인
 5. 각 Phase 종료 시 체크리스트와 테스트 결과 업데이트
 6. 변경된 파일/동작/리스크를 문서에 즉시 반영
-7. 다음 세션 시작 직후에는 `8.5 Next Session Priorities`의 1번부터 처리하고, live refresh mismatch(`POST /oauth2/token` → `404`)가 정리되기 전까지는 `Phase 3`를 시작하지 않는다
+7. 다음 세션 시작 직후에는 `8.5 Next Session Priorities`의 1번부터 처리하고, live refresh mismatch(`POST /oauth2/token` → `404`)는 `no_refresh` degraded contract 전제로 계속 추적하되 `Phase 5+` 진행의 blocker로 취급하지 않는다

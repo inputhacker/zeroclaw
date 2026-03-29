@@ -30,10 +30,17 @@ pub mod cloud_patterns;
 pub mod codex_cli;
 pub mod composio;
 pub mod content_search;
+pub mod context_book_context_create;
+pub mod context_book_context_delete;
+pub mod context_book_context_update;
 pub mod context_book_contexts_query;
 pub mod context_book_status;
 pub mod context_book_subscriptions_get;
 pub mod context_book_subscriptions_set;
+pub mod context_book_vote_cast;
+pub mod context_book_vote_create;
+pub mod context_book_vote_delete;
+pub mod context_book_vote_update;
 pub mod context_book_votes_query;
 pub mod cron_add;
 pub mod cron_list;
@@ -132,10 +139,17 @@ pub use cloud_patterns::CloudPatternsTool;
 pub use codex_cli::CodexCliTool;
 pub use composio::ComposioTool;
 pub use content_search::ContentSearchTool;
+pub use context_book_context_create::ContextBookContextCreateTool;
+pub use context_book_context_delete::ContextBookContextDeleteTool;
+pub use context_book_context_update::ContextBookContextUpdateTool;
 pub use context_book_contexts_query::ContextBookContextsQueryTool;
 pub use context_book_status::ContextBookStatusTool;
 pub use context_book_subscriptions_get::ContextBookSubscriptionsGetTool;
 pub use context_book_subscriptions_set::ContextBookSubscriptionsSetTool;
+pub use context_book_vote_cast::ContextBookVoteCastTool;
+pub use context_book_vote_create::ContextBookVoteCreateTool;
+pub use context_book_vote_delete::ContextBookVoteDeleteTool;
+pub use context_book_vote_update::ContextBookVoteUpdateTool;
 pub use context_book_votes_query::ContextBookVotesQueryTool;
 pub use cron_add::CronAddTool;
 pub use cron_list::CronListTool;
@@ -455,6 +469,18 @@ pub fn all_tools_with_runtime(
         Arc::new(WeatherTool::new()),
         Arc::new(CanvasTool::new(canvas_store.unwrap_or_default())),
         Arc::new(ContextBookStatusTool::new(context_book_handle.clone())),
+        Arc::new(ContextBookContextCreateTool::new(
+            context_book_handle.clone(),
+            security.clone(),
+        )),
+        Arc::new(ContextBookContextUpdateTool::new(
+            context_book_handle.clone(),
+            security.clone(),
+        )),
+        Arc::new(ContextBookContextDeleteTool::new(
+            context_book_handle.clone(),
+            security.clone(),
+        )),
         Arc::new(ContextBookContextsQueryTool::new(
             context_book_handle.clone(),
         )),
@@ -462,6 +488,22 @@ pub fn all_tools_with_runtime(
             context_book_handle.clone(),
         )),
         Arc::new(ContextBookSubscriptionsSetTool::new(
+            context_book_handle.clone(),
+            security.clone(),
+        )),
+        Arc::new(ContextBookVoteCreateTool::new(
+            context_book_handle.clone(),
+            security.clone(),
+        )),
+        Arc::new(ContextBookVoteUpdateTool::new(
+            context_book_handle.clone(),
+            security.clone(),
+        )),
+        Arc::new(ContextBookVoteDeleteTool::new(
+            context_book_handle.clone(),
+            security.clone(),
+        )),
+        Arc::new(ContextBookVoteCastTool::new(
             context_book_handle.clone(),
             security.clone(),
         )),
@@ -1141,9 +1183,16 @@ mod tests {
         assert!(names.contains(&"pushover"));
         assert!(names.contains(&"proxy_config"));
         assert!(names.contains(&"context_book_status"));
+        assert!(names.contains(&"context_book_context_create"));
+        assert!(names.contains(&"context_book_context_update"));
+        assert!(names.contains(&"context_book_context_delete"));
         assert!(names.contains(&"context_book_contexts_query"));
         assert!(names.contains(&"context_book_subscriptions_get"));
         assert!(names.contains(&"context_book_subscriptions_set"));
+        assert!(names.contains(&"context_book_vote_create"));
+        assert!(names.contains(&"context_book_vote_update"));
+        assert!(names.contains(&"context_book_vote_delete"));
+        assert!(names.contains(&"context_book_vote_cast"));
         assert!(names.contains(&"context_book_votes_query"));
     }
 
@@ -1189,9 +1238,16 @@ mod tests {
         assert!(names.contains(&"pushover"));
         assert!(names.contains(&"proxy_config"));
         assert!(names.contains(&"context_book_status"));
+        assert!(names.contains(&"context_book_context_create"));
+        assert!(names.contains(&"context_book_context_update"));
+        assert!(names.contains(&"context_book_context_delete"));
         assert!(names.contains(&"context_book_contexts_query"));
         assert!(names.contains(&"context_book_subscriptions_get"));
         assert!(names.contains(&"context_book_subscriptions_set"));
+        assert!(names.contains(&"context_book_vote_create"));
+        assert!(names.contains(&"context_book_vote_update"));
+        assert!(names.contains(&"context_book_vote_delete"));
+        assert!(names.contains(&"context_book_vote_cast"));
         assert!(names.contains(&"context_book_votes_query"));
     }
 

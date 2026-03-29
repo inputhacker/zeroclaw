@@ -68,6 +68,15 @@ pub fn mark_component_ok(component: &str) {
 }
 
 #[allow(clippy::needless_pass_by_value)]
+pub fn mark_component_warn(component: &str, warning: impl ToString) {
+    let warning = warning.to_string();
+    upsert_component(component, move |entry| {
+        entry.status = "warn".into();
+        entry.last_error = Some(warning);
+    });
+}
+
+#[allow(clippy::needless_pass_by_value)]
 pub fn mark_component_error(component: &str, error: impl ToString) {
     let err = error.to_string();
     upsert_component(component, move |entry| {
@@ -149,6 +158,22 @@ mod tests {
         assert_eq!(recovered.status, "ok");
         assert!(recovered.last_error.is_none());
         assert!(recovered.last_ok.is_some());
+    }
+
+    #[test]
+    fn mark_component_warn_preserves_warning_state() {
+        let component = unique_component("health-warn");
+
+        mark_component_warn(&component, "degraded contract");
+
+        let snapshot = snapshot();
+        let entry = snapshot
+            .components
+            .get(&component)
+            .expect("component should exist after mark_component_warn");
+
+        assert_eq!(entry.status, "warn");
+        assert_eq!(entry.last_error.as_deref(), Some("degraded contract"));
     }
 
     #[test]

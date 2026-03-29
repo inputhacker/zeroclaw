@@ -168,6 +168,56 @@ struct VoteResponse {
     updated_at: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextBookContextCreateRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_id: Option<String>,
+    pub title: String,
+    pub contents: String,
+    pub tag: String,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextBookContextUpdateRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contents: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tag: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextBookVoteCreateRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vote_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vote_score: Option<f64>,
+    pub vote_context: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextBookVoteUpdateRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vote_score: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vote_context: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextBookVoteCastRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vote_score: Option<f64>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct SubscriptionsResponse {
     #[serde(default, alias = "consumerAgentId")]
@@ -584,6 +634,210 @@ impl ContextBookClient {
                 self.contract_error(format!("failed to parse subscriptions response: {error}"))
             })?;
         Ok(body.into_snapshot())
+    }
+
+    pub async fn create_context(
+        &self,
+        session: &ContextBookSession,
+        request: &ContextBookContextCreateRequest,
+    ) -> Result<ContextBookContextSnapshot, ContextBookClientError> {
+        let url = session
+            .base_url
+            .join("contexts")
+            .map_err(|error| self.contract_error(format!("invalid contexts URL: {error}")))?;
+        let response = self
+            .http_client
+            .post(url)
+            .bearer_auth(&session.access_token)
+            .json(request)
+            .send()
+            .await
+            .map_err(|error| {
+                self.network_error(format!("failed to create Context Book context: {error}"))
+            })?;
+        let response = self
+            .expect_success(response, "failed to create Context Book context")
+            .await?;
+        let body = response.json::<Value>().await.map_err(|error| {
+            self.contract_error(format!(
+                "failed to parse Context Book context create response: {error}"
+            ))
+        })?;
+        parse_context_snapshot(body)
+            .map_err(|error| self.contract_error(format!("invalid context payload: {error}")))
+    }
+
+    pub async fn update_context(
+        &self,
+        session: &ContextBookSession,
+        context_id: &str,
+        request: &ContextBookContextUpdateRequest,
+    ) -> Result<ContextBookContextSnapshot, ContextBookClientError> {
+        let url = session
+            .base_url
+            .join(&format!("contexts/{context_id}"))
+            .map_err(|error| self.contract_error(format!("invalid context update URL: {error}")))?;
+        let response = self
+            .http_client
+            .patch(url)
+            .bearer_auth(&session.access_token)
+            .json(request)
+            .send()
+            .await
+            .map_err(|error| {
+                self.network_error(format!("failed to update Context Book context: {error}"))
+            })?;
+        let response = self
+            .expect_success(response, "failed to update Context Book context")
+            .await?;
+        let body = response.json::<Value>().await.map_err(|error| {
+            self.contract_error(format!(
+                "failed to parse Context Book context update response: {error}"
+            ))
+        })?;
+        parse_context_snapshot(body)
+            .map_err(|error| self.contract_error(format!("invalid context payload: {error}")))
+    }
+
+    pub async fn delete_context(
+        &self,
+        session: &ContextBookSession,
+        context_id: &str,
+    ) -> Result<(), ContextBookClientError> {
+        let url = session
+            .base_url
+            .join(&format!("contexts/{context_id}"))
+            .map_err(|error| self.contract_error(format!("invalid context delete URL: {error}")))?;
+        let response = self
+            .http_client
+            .delete(url)
+            .bearer_auth(&session.access_token)
+            .send()
+            .await
+            .map_err(|error| {
+                self.network_error(format!("failed to delete Context Book context: {error}"))
+            })?;
+        self.expect_success(response, "failed to delete Context Book context")
+            .await?;
+        Ok(())
+    }
+
+    pub async fn create_vote(
+        &self,
+        session: &ContextBookSession,
+        request: &ContextBookVoteCreateRequest,
+    ) -> Result<ContextBookVoteSnapshot, ContextBookClientError> {
+        let url = session
+            .base_url
+            .join("votes")
+            .map_err(|error| self.contract_error(format!("invalid votes URL: {error}")))?;
+        let response = self
+            .http_client
+            .post(url)
+            .bearer_auth(&session.access_token)
+            .json(request)
+            .send()
+            .await
+            .map_err(|error| {
+                self.network_error(format!("failed to create Context Book vote: {error}"))
+            })?;
+        let response = self
+            .expect_success(response, "failed to create Context Book vote")
+            .await?;
+        let body = response.json::<Value>().await.map_err(|error| {
+            self.contract_error(format!(
+                "failed to parse Context Book vote create response: {error}"
+            ))
+        })?;
+        parse_vote_snapshot(body)
+            .map_err(|error| self.contract_error(format!("invalid vote payload: {error}")))
+    }
+
+    pub async fn update_vote(
+        &self,
+        session: &ContextBookSession,
+        vote_id: &str,
+        request: &ContextBookVoteUpdateRequest,
+    ) -> Result<ContextBookVoteSnapshot, ContextBookClientError> {
+        let url = session
+            .base_url
+            .join(&format!("votes/{vote_id}"))
+            .map_err(|error| self.contract_error(format!("invalid vote update URL: {error}")))?;
+        let response = self
+            .http_client
+            .patch(url)
+            .bearer_auth(&session.access_token)
+            .json(request)
+            .send()
+            .await
+            .map_err(|error| {
+                self.network_error(format!("failed to update Context Book vote: {error}"))
+            })?;
+        let response = self
+            .expect_success(response, "failed to update Context Book vote")
+            .await?;
+        let body = response.json::<Value>().await.map_err(|error| {
+            self.contract_error(format!(
+                "failed to parse Context Book vote update response: {error}"
+            ))
+        })?;
+        parse_vote_snapshot(body)
+            .map_err(|error| self.contract_error(format!("invalid vote payload: {error}")))
+    }
+
+    pub async fn delete_vote(
+        &self,
+        session: &ContextBookSession,
+        vote_id: &str,
+    ) -> Result<(), ContextBookClientError> {
+        let url = session
+            .base_url
+            .join(&format!("votes/{vote_id}"))
+            .map_err(|error| self.contract_error(format!("invalid vote delete URL: {error}")))?;
+        let response = self
+            .http_client
+            .delete(url)
+            .bearer_auth(&session.access_token)
+            .send()
+            .await
+            .map_err(|error| {
+                self.network_error(format!("failed to delete Context Book vote: {error}"))
+            })?;
+        self.expect_success(response, "failed to delete Context Book vote")
+            .await?;
+        Ok(())
+    }
+
+    pub async fn cast_vote(
+        &self,
+        session: &ContextBookSession,
+        vote_id: &str,
+        request: &ContextBookVoteCastRequest,
+    ) -> Result<ContextBookVoteSnapshot, ContextBookClientError> {
+        let url = session
+            .base_url
+            .join(&format!("votes/{vote_id}/cast"))
+            .map_err(|error| self.contract_error(format!("invalid vote cast URL: {error}")))?;
+        let response = self
+            .http_client
+            .post(url)
+            .bearer_auth(&session.access_token)
+            .json(request)
+            .send()
+            .await
+            .map_err(|error| {
+                self.network_error(format!("failed to cast Context Book vote: {error}"))
+            })?;
+        let response = self
+            .expect_success(response, "failed to cast Context Book vote")
+            .await?;
+        let body = response.json::<Value>().await.map_err(|error| {
+            self.contract_error(format!(
+                "failed to parse Context Book vote cast response: {error}"
+            ))
+        })?;
+        parse_vote_snapshot(body)
+            .map_err(|error| self.contract_error(format!("invalid vote payload: {error}")))
     }
 
     pub async fn validate_runtime_contract(
@@ -1567,6 +1821,16 @@ fn parse_context_snapshots(value: Value) -> anyhow::Result<Vec<ContextBookContex
         .collect()
 }
 
+fn parse_context_snapshot(value: Value) -> anyhow::Result<ContextBookContextSnapshot> {
+    if let Some(context) = value.get("context") {
+        return parse_context_snapshot(context.clone());
+    }
+    parse_context_snapshots(value)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("Context Book context response was empty"))
+}
+
 fn parse_vote_snapshots(value: Value) -> anyhow::Result<Vec<ContextBookVoteSnapshot>> {
     let synced_at = Utc::now().to_rfc3339();
     parse_list_response::<VoteResponse>(value)?
@@ -1588,6 +1852,16 @@ fn parse_vote_snapshots(value: Value) -> anyhow::Result<Vec<ContextBookVoteSnaps
             })
         })
         .collect()
+}
+
+fn parse_vote_snapshot(value: Value) -> anyhow::Result<ContextBookVoteSnapshot> {
+    if let Some(vote) = value.get("vote") {
+        return parse_vote_snapshot(vote.clone());
+    }
+    parse_vote_snapshots(value)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("Context Book vote response was empty"))
 }
 
 fn parse_list_response<T>(value: Value) -> anyhow::Result<Vec<T>>
@@ -1686,7 +1960,7 @@ mod tests {
         extract::{Path as AxumPath, State},
         http::{HeaderMap, StatusCode},
         response::IntoResponse,
-        routing::{get, post},
+        routing::{get, patch, post},
     };
     use std::sync::{
         Arc,
@@ -2122,6 +2396,231 @@ mod tests {
             ContextBookRefreshMode::LegacyAuthRefresh
         );
         assert!(contract.degraded_modes.is_empty());
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn client_supports_context_and_vote_write_routes() {
+        async fn create_context(axum::Json(body): axum::Json<Value>) -> impl IntoResponse {
+            assert_eq!(body["contextId"], "workspace_ctx10");
+            assert_eq!(body["title"], "Launch Plan");
+            assert_eq!(body["contents"], "Ship it");
+            assert_eq!(body["tag"], "eng");
+            assert_eq!(body["status"], "Published");
+            axum::Json(json!({
+                "context": {
+                    "contextId": "workspace_ctx10",
+                    "authorAgentId": "workspace",
+                    "title": "Launch Plan",
+                    "contents": "Ship it",
+                    "tag": "eng",
+                    "status": "Published",
+                    "createdAt": "2026-03-29T00:00:00Z",
+                    "updatedAt": "2026-03-29T00:00:00Z"
+                }
+            }))
+        }
+
+        async fn update_context(
+            AxumPath(context_id): AxumPath<String>,
+            axum::Json(body): axum::Json<Value>,
+        ) -> impl IntoResponse {
+            assert_eq!(context_id, "workspace_ctx10");
+            assert_eq!(body["contents"], "Ship it now");
+            axum::Json(json!({
+                "context": {
+                    "contextId": "workspace_ctx10",
+                    "authorAgentId": "workspace",
+                    "title": "Launch Plan",
+                    "contents": "Ship it now",
+                    "tag": "eng",
+                    "status": "Published",
+                    "createdAt": "2026-03-29T00:00:00Z",
+                    "updatedAt": "2026-03-29T00:00:05Z"
+                }
+            }))
+        }
+
+        async fn delete_context(AxumPath(context_id): AxumPath<String>) -> impl IntoResponse {
+            assert_eq!(context_id, "workspace_ctx10");
+            StatusCode::NO_CONTENT
+        }
+
+        async fn create_vote(axum::Json(body): axum::Json<Value>) -> impl IntoResponse {
+            assert_eq!(body["voteId"], "workspace_vote10");
+            assert_eq!(body["voteScore"], 1.0);
+            assert_eq!(body["voteContext"], "approve launch");
+            axum::Json(json!({
+                "vote": {
+                    "voteId": "workspace_vote10",
+                    "ownerAgentId": "workspace",
+                    "voteScore": 1,
+                    "voteContext": "approve launch",
+                    "voterAgentIds": ["workspace"],
+                    "requiredScore": 2,
+                    "executable": false,
+                    "createdAt": "2026-03-29T00:00:00Z",
+                    "updatedAt": "2026-03-29T00:00:00Z"
+                }
+            }))
+        }
+
+        async fn update_vote(
+            AxumPath(vote_id): AxumPath<String>,
+            axum::Json(body): axum::Json<Value>,
+        ) -> impl IntoResponse {
+            assert_eq!(vote_id, "workspace_vote10");
+            assert_eq!(body["voteScore"], 2.0);
+            axum::Json(json!({
+                "vote": {
+                    "voteId": "workspace_vote10",
+                    "ownerAgentId": "workspace",
+                    "voteScore": 2,
+                    "voteContext": "approve launch",
+                    "voterAgentIds": ["workspace"],
+                    "requiredScore": 2,
+                    "executable": true,
+                    "createdAt": "2026-03-29T00:00:00Z",
+                    "updatedAt": "2026-03-29T00:00:10Z"
+                }
+            }))
+        }
+
+        async fn cast_vote(
+            AxumPath(vote_id): AxumPath<String>,
+            axum::Json(body): axum::Json<Value>,
+        ) -> impl IntoResponse {
+            assert_eq!(vote_id, "workspace_vote10");
+            assert_eq!(body["voteScore"], 1.0);
+            axum::Json(json!({
+                "vote": {
+                    "voteId": "workspace_vote10",
+                    "ownerAgentId": "workspace",
+                    "voteScore": 3,
+                    "voteContext": "approve launch",
+                    "voterAgentIds": ["workspace", "peer-a"],
+                    "requiredScore": 2,
+                    "executable": true,
+                    "createdAt": "2026-03-29T00:00:00Z",
+                    "updatedAt": "2026-03-29T00:00:15Z"
+                }
+            }))
+        }
+
+        async fn delete_vote(AxumPath(vote_id): AxumPath<String>) -> impl IntoResponse {
+            assert_eq!(vote_id, "workspace_vote10");
+            StatusCode::NO_CONTENT
+        }
+
+        let app = Router::new()
+            .route("/contexts", post(create_context))
+            .route(
+                "/contexts/{context_id}",
+                patch(update_context).delete(delete_context),
+            )
+            .route("/votes", post(create_vote))
+            .route("/votes/{vote_id}", patch(update_vote).delete(delete_vote))
+            .route("/votes/{vote_id}/cast", post(cast_vote));
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve axum");
+        });
+
+        let tmp = TempDir::new().expect("temp dir");
+        let mut config = test_config(&tmp);
+        config.context_book.manual_url = Some(format!("http://{addr}"));
+        config.context_book.allowed_hosts = vec!["127.0.0.1".into()];
+        config.context_book.allow_private_hosts = true;
+
+        let client = ContextBookClient::new(&config);
+        let session = ContextBookSession {
+            base_url: Url::parse(&format!("http://{addr}/")).expect("base URL should parse"),
+            agent_id: "workspace".into(),
+            access_token: "access-token".into(),
+            refresh_token: Some("refresh-token".into()),
+            expires_at: None,
+        };
+
+        let created_context = client
+            .create_context(
+                &session,
+                &ContextBookContextCreateRequest {
+                    context_id: Some("workspace_ctx10".into()),
+                    title: "Launch Plan".into(),
+                    contents: "Ship it".into(),
+                    tag: "eng".into(),
+                    status: "Published".into(),
+                },
+            )
+            .await
+            .expect("create context");
+        assert_eq!(created_context.context_id, "workspace_ctx10");
+
+        let updated_context = client
+            .update_context(
+                &session,
+                "workspace_ctx10",
+                &ContextBookContextUpdateRequest {
+                    contents: Some("Ship it now".into()),
+                    ..ContextBookContextUpdateRequest::default()
+                },
+            )
+            .await
+            .expect("update context");
+        assert_eq!(updated_context.contents, "Ship it now");
+        client
+            .delete_context(&session, "workspace_ctx10")
+            .await
+            .expect("delete context");
+
+        let created_vote = client
+            .create_vote(
+                &session,
+                &ContextBookVoteCreateRequest {
+                    vote_id: Some("workspace_vote10".into()),
+                    vote_score: Some(1.0),
+                    vote_context: "approve launch".into(),
+                },
+            )
+            .await
+            .expect("create vote");
+        assert_eq!(created_vote.vote_id, "workspace_vote10");
+
+        let updated_vote = client
+            .update_vote(
+                &session,
+                "workspace_vote10",
+                &ContextBookVoteUpdateRequest {
+                    vote_score: Some(2.0),
+                    ..ContextBookVoteUpdateRequest::default()
+                },
+            )
+            .await
+            .expect("update vote");
+        assert_eq!(updated_vote.vote_score, 2.0);
+
+        let cast_vote = client
+            .cast_vote(
+                &session,
+                "workspace_vote10",
+                &ContextBookVoteCastRequest {
+                    vote_score: Some(1.0),
+                },
+            )
+            .await
+            .expect("cast vote");
+        assert_eq!(cast_vote.vote_score, 3.0);
+        assert_eq!(cast_vote.voter_agent_ids, vec!["workspace", "peer-a"]);
+
+        client
+            .delete_vote(&session, "workspace_vote10")
+            .await
+            .expect("delete vote");
 
         server.abort();
         let _ = server.await;

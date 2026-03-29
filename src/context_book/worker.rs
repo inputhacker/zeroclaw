@@ -2,14 +2,17 @@ use super::ContextBookHandle;
 use super::client::{ContextBookClient, ContextBookClientErrorKind};
 use super::events::{ContextBookSseParser, ParsedContextBookSseFrame};
 use super::handle::{ContextBookContractValidationState, ContextBookDegradedMode};
+use super::service::ContextBookStatusReport;
 use super::store::ContextBookEventSyncUpdate;
 use crate::config::Config;
 use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
 use futures_util::StreamExt;
 use tokio::time::{Duration, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
 
 const HEALTH_TICK_SECS: u64 = 30;
+const HEALTH_STALE_SECONDS: i64 = 120;
 
 pub async fn run(
     config: Config,
@@ -34,7 +37,7 @@ pub async fn run(
     handle.restore_persisted_runtime();
     handle.mark_idle("context_book worker initialized; waiting for connectivity");
     persist_runtime_state(&handle)?;
-    crate::health::mark_component_ok("context_book");
+    refresh_component_health(&handle);
 
     let client = ContextBookClient::new(&config);
     let reconnect_backoff = handle.resolved_config().reconnect_backoff_ms.max(1);
@@ -59,7 +62,7 @@ pub async fn run(
                     }
                     handle.mark_stopped("context_book worker stopped after daemon shutdown");
                     persist_runtime_state(&handle)?;
-                    crate::health::mark_component_ok("context_book");
+                    refresh_component_health(&handle);
                     return Ok(());
                 }
                 _ = interval.tick() => {}
@@ -75,7 +78,7 @@ pub async fn run(
                     handle.mark_idle("context_book SSE idle; waiting for next reconnect tick");
                     persist_runtime_state(&handle)?;
                 }
-                crate::health::mark_component_ok("context_book");
+                refresh_component_health(&handle);
             }
             Err(error) => {
                 handle.mark_error(error.to_string());
@@ -93,6 +96,72 @@ fn persist_runtime_state(handle: &ContextBookHandle) -> Result<()> {
         .store()
         .save_runtime_state(&handle.snapshot())
         .context("failed to persist context_book runtime snapshot")
+}
+
+fn refresh_component_health(handle: &ContextBookHandle) {
+    let status = handle.status_report();
+    if let Some(error) = status
+        .runtime
+        .last_error
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        crate::health::mark_component_error("context_book", error);
+        return;
+    }
+
+    let mut warnings = Vec::new();
+    if !status.contract.degraded_modes.is_empty() {
+        warnings.push(format!(
+            "degraded modes: {}",
+            status
+                .contract
+                .degraded_modes
+                .iter()
+                .map(|mode| serde_json::to_string(mode).unwrap_or_else(|_| "\"unknown\"".into()))
+                .map(|mode| mode.trim_matches('"').to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+
+    let stale_collections = stale_cache_collections(&status);
+    if !stale_collections.is_empty() {
+        warnings.push(format!(
+            "stale cache collections: {}",
+            stale_collections.join(", ")
+        ));
+    }
+
+    if warnings.is_empty() {
+        crate::health::mark_component_ok("context_book");
+    } else {
+        crate::health::mark_component_warn("context_book", warnings.join("; "));
+    }
+}
+
+fn stale_cache_collections(status: &ContextBookStatusReport) -> Vec<String> {
+    [
+        ("agents", &status.cache_inventory.agents),
+        ("contexts", &status.cache_inventory.contexts),
+        ("votes", &status.cache_inventory.votes),
+    ]
+    .into_iter()
+    .filter_map(|(name, summary)| {
+        let updated_at = summary.updated_at.as_deref()?;
+        let age = age_seconds(updated_at)?;
+        (summary.count > 0 && age > HEALTH_STALE_SECONDS).then(|| format!("{name}({age}s)"))
+    })
+    .collect()
+}
+
+fn age_seconds(value: &str) -> Option<i64> {
+    let parsed = DateTime::parse_from_rfc3339(value).ok()?;
+    Some(
+        Utc::now()
+            .signed_duration_since(parsed.with_timezone(&Utc))
+            .num_seconds(),
+    )
 }
 
 async fn connect_and_sync_once(

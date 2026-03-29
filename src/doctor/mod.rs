@@ -914,6 +914,9 @@ fn check_daemon_state(config: &Config, items: &mut Vec<DiagItem>) {
         let subscriptions = context_book
             .get("persisted_subscriptions")
             .and_then(serde_json::Value::as_object);
+        let cache_inventory = context_book
+            .get("cache_inventory")
+            .and_then(serde_json::Value::as_object);
         let enabled = runtime
             .get("enabled")
             .and_then(serde_json::Value::as_bool)
@@ -1096,6 +1099,62 @@ fn check_daemon_state(config: &Config, items: &mut Vec<DiagItem>) {
                     cat,
                     "context_book cached subscriptions unavailable",
                 ));
+            }
+
+            if let Some(cache_inventory) = cache_inventory {
+                for collection in ["agents", "contexts", "votes"] {
+                    let Some(summary) = cache_inventory
+                        .get(collection)
+                        .and_then(serde_json::Value::as_object)
+                    else {
+                        continue;
+                    };
+                    let count = summary
+                        .get("count")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0);
+                    match summary
+                        .get("updated_at")
+                        .or_else(|| summary.get("updatedAt"))
+                        .and_then(serde_json::Value::as_str)
+                    {
+                        Some(updated_at) => {
+                            if let Some(updated_at) = parse_rfc3339(updated_at) {
+                                let age =
+                                    Utc::now().signed_duration_since(updated_at).num_seconds();
+                                if age <= CONTEXT_BOOK_STALE_SECONDS {
+                                    items.push(DiagItem::ok(
+                                        cat,
+                                        format!(
+                                            "context_book cached {collection} fresh (count={count}, age={age}s)"
+                                        ),
+                                    ));
+                                } else {
+                                    items.push(DiagItem::warn(
+                                        cat,
+                                        format!(
+                                            "context_book cached {collection} stale (count={count}, age={age}s)"
+                                        ),
+                                    ));
+                                }
+                            }
+                        }
+                        None if count > 0 => {
+                            items.push(DiagItem::warn(
+                                cat,
+                                format!(
+                                    "context_book cached {collection} freshness unavailable (count={count})"
+                                ),
+                            ));
+                        }
+                        None => {
+                            items.push(DiagItem::ok(
+                                cat,
+                                format!("context_book cached {collection} empty"),
+                            ));
+                        }
+                    }
+                }
             }
         }
     } else {
@@ -1571,6 +1630,21 @@ mod tests {
                 "persisted_subscriptions": {
                     "desired_producer_agent_ids": ["peer-a", "peer-b"],
                     "effective_producer_agent_ids": ["peer-a"]
+                },
+                "cache_inventory": {
+                    "seen_event_count": 4,
+                    "agents": {
+                        "count": 2,
+                        "updated_at": Utc::now().to_rfc3339()
+                    },
+                    "contexts": {
+                        "count": 3,
+                        "updated_at": (Utc::now() - chrono::Duration::seconds(CONTEXT_BOOK_STALE_SECONDS + 30)).to_rfc3339()
+                    },
+                    "votes": {
+                        "count": 1,
+                        "updated_at": Utc::now().to_rfc3339()
+                    }
                 }
             }
         });
@@ -1597,6 +1671,18 @@ mod tests {
         }));
         assert!(items.iter().any(|item| {
             item.message.contains("context_book cache freshness OK")
+                && item.severity == Severity::Ok
+        }));
+        assert!(items.iter().any(|item| {
+            item.message.contains("context_book cached agents fresh")
+                && item.severity == Severity::Ok
+        }));
+        assert!(items.iter().any(|item| {
+            item.message.contains("context_book cached contexts stale")
+                && item.severity == Severity::Warn
+        }));
+        assert!(items.iter().any(|item| {
+            item.message.contains("context_book cached votes fresh")
                 && item.severity == Severity::Ok
         }));
     }

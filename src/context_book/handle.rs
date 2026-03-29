@@ -15,15 +15,18 @@ pub struct ContextBookRuntimeSnapshot {
     pub worker_state: String,
     pub lifecycle_state: String,
     pub connection_state: String,
+    pub shutdown_requested: bool,
     pub status_message: Option<String>,
     pub last_error: Option<String>,
     pub last_status_at: String,
+    pub last_connect_at: Option<String>,
+    pub last_sync_at: Option<String>,
     pub cache_db_path: String,
     pub store_initialized: bool,
 }
 
 pub struct ContextBookHandleState {
-    resolved: ResolvedContextBookConfig,
+    resolved: RwLock<ResolvedContextBookConfig>,
     store: Arc<ContextBookStore>,
     runtime: RwLock<ContextBookRuntimeSnapshot>,
 }
@@ -44,22 +47,46 @@ impl ContextBookHandleState {
             worker_state: worker_state.to_string(),
             lifecycle_state: "inactive".to_string(),
             connection_state: "disconnected".to_string(),
+            shutdown_requested: false,
             status_message: Some("phase1 foundation initialized".to_string()),
             last_error: resolved.validation_error.clone(),
             last_status_at: now_rfc3339(),
+            last_connect_at: None,
+            last_sync_at: None,
             cache_db_path: resolved.cache_db_path.display().to_string(),
             store_initialized: false,
         };
 
         Arc::new(Self {
-            resolved,
+            resolved: RwLock::new(resolved),
             store,
             runtime: RwLock::new(runtime),
         })
     }
 
-    pub fn resolved_config(&self) -> &ResolvedContextBookConfig {
-        &self.resolved
+    pub fn resolved_config(&self) -> ResolvedContextBookConfig {
+        self.resolved.read().clone()
+    }
+
+    pub fn refresh_resolved_config(&self, resolved: ResolvedContextBookConfig) {
+        {
+            let mut current = self.resolved.write();
+            *current = resolved.clone();
+        }
+
+        self.update_runtime(|runtime| {
+            runtime.enabled = resolved.enabled;
+            runtime.cache_db_path = resolved.cache_db_path.display().to_string();
+            runtime.last_error = resolved.validation_error.clone();
+            if !resolved.enabled {
+                runtime.owner_mode = "service_only".to_string();
+                runtime.worker_state = "disabled".to_string();
+                runtime.lifecycle_state = "inactive".to_string();
+                runtime.connection_state = "disconnected".to_string();
+                runtime.shutdown_requested = false;
+                runtime.status_message = Some("context_book disabled in config".to_string());
+            }
+        });
     }
 
     pub fn store(&self) -> Arc<ContextBookStore> {
@@ -76,6 +103,7 @@ impl ContextBookHandleState {
             runtime.worker_state = "disabled".to_string();
             runtime.lifecycle_state = "inactive".to_string();
             runtime.connection_state = "disconnected".to_string();
+            runtime.shutdown_requested = false;
             runtime.status_message = Some("context_book disabled in config".to_string());
         });
     }
@@ -84,6 +112,7 @@ impl ContextBookHandleState {
         self.update_runtime(|runtime| {
             runtime.owner_mode = "daemon_supervised".to_string();
             runtime.worker_state = "starting".to_string();
+            runtime.shutdown_requested = false;
             runtime.status_message = Some("daemon-owned context_book worker starting".to_string());
         });
     }
@@ -93,8 +122,9 @@ impl ContextBookHandleState {
             runtime.worker_state = "idle".to_string();
             runtime.lifecycle_state = "inactive".to_string();
             runtime.connection_state = "disconnected".to_string();
+            runtime.shutdown_requested = false;
             runtime.status_message = Some(message.to_string());
-            runtime.last_error = self.resolved.validation_error.clone();
+            runtime.last_error = self.resolved.read().validation_error.clone();
         });
     }
 
@@ -104,6 +134,23 @@ impl ContextBookHandleState {
             runtime.worker_state = "error".to_string();
             runtime.status_message = Some("context_book worker error".to_string());
             runtime.last_error = Some(error);
+        });
+    }
+
+    pub fn mark_shutdown_requested(&self) {
+        self.update_runtime(|runtime| {
+            runtime.shutdown_requested = true;
+            runtime.status_message = Some("daemon requested context_book shutdown".to_string());
+        });
+    }
+
+    pub fn mark_stopped(&self, message: &str) {
+        self.update_runtime(|runtime| {
+            runtime.worker_state = "stopped".to_string();
+            runtime.lifecycle_state = "inactive".to_string();
+            runtime.connection_state = "disconnected".to_string();
+            runtime.shutdown_requested = false;
+            runtime.status_message = Some(message.to_string());
         });
     }
 
@@ -120,7 +167,7 @@ impl ContextBookHandleState {
         });
 
         ContextBookStatusReport {
-            resolved: self.resolved.clone(),
+            resolved: self.resolved_config(),
             runtime: self.snapshot(),
             persisted_runtime,
         }

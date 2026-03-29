@@ -6,8 +6,10 @@ use std::future::Future;
 use std::path::PathBuf;
 use tokio::task::JoinHandle;
 use tokio::time::Duration;
+use tokio_util::sync::CancellationToken;
 
 const STATUS_FLUSH_SECONDS: u64 = 5;
+const SHUTDOWN_GRACE_MILLIS: u64 = 750;
 
 /// Wait for shutdown signal (SIGINT or SIGTERM).
 /// SIGHUP is explicitly ignored so the daemon survives terminal/SSH disconnects.
@@ -52,7 +54,8 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
         .reliability
         .channel_max_backoff_secs
         .max(initial_backoff);
-    let context_book_handle = crate::context_book::shared_handle(&config);
+    let context_book_handle = crate::context_book::bootstrap(&config).handle;
+    let shutdown = CancellationToken::new();
 
     crate::health::mark_component_ok("daemon");
 
@@ -65,6 +68,7 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
     let mut handles: Vec<JoinHandle<()>> = vec![spawn_state_writer(
         config.clone(),
         Some(context_book_handle.clone()),
+        shutdown.child_token(),
     )];
 
     {
@@ -74,6 +78,7 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
             "gateway",
             initial_backoff,
             max_backoff,
+            shutdown.child_token(),
             move || {
                 let cfg = gateway_cfg.clone();
                 let host = gateway_host.clone();
@@ -89,6 +94,7 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
                 "channels",
                 initial_backoff,
                 max_backoff,
+                shutdown.child_token(),
                 move || {
                     let cfg = channels_cfg.clone();
                     async move { Box::pin(crate::channels::start_channels(cfg)).await }
@@ -106,6 +112,7 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
             "heartbeat",
             initial_backoff,
             max_backoff,
+            shutdown.child_token(),
             move || {
                 let cfg = heartbeat_cfg.clone();
                 async move { Box::pin(run_heartbeat_worker(cfg)).await }
@@ -119,6 +126,7 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
             "scheduler",
             initial_backoff,
             max_backoff,
+            shutdown.child_token(),
             move || {
                 let cfg = scheduler_cfg.clone();
                 async move { Box::pin(crate::cron::scheduler::run(cfg)).await }
@@ -132,14 +140,24 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
     if config.context_book.enabled {
         let context_book_cfg = config.clone();
         let handle = context_book_handle.clone();
+        let context_book_shutdown = shutdown.child_token();
         handles.push(spawn_component_supervisor(
             "context_book",
             initial_backoff,
             max_backoff,
+            shutdown.child_token(),
             move || {
                 let cfg = context_book_cfg.clone();
                 let handle = handle.clone();
-                async move { Box::pin(crate::context_book::worker::run(cfg, handle)).await }
+                let shutdown = context_book_shutdown.child_token();
+                async move {
+                    Box::pin(crate::context_book::worker::run(
+                        cfg,
+                        handle,
+                        Some(shutdown),
+                    ))
+                    .await
+                }
             },
         ));
     } else {
@@ -159,6 +177,8 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
     // Wait for shutdown signal (SIGINT or SIGTERM)
     wait_for_shutdown_signal().await?;
     crate::health::mark_component_error("daemon", "shutdown requested");
+    shutdown.cancel();
+    tokio::time::sleep(Duration::from_millis(SHUTDOWN_GRACE_MILLIS)).await;
 
     for handle in &handles {
         handle.abort();
@@ -178,7 +198,11 @@ pub fn state_file_path(config: &Config) -> PathBuf {
         .join("daemon_state.json")
 }
 
-fn spawn_state_writer(config: Config, context_book: Option<ContextBookHandle>) -> JoinHandle<()> {
+fn spawn_state_writer(
+    config: Config,
+    context_book: Option<ContextBookHandle>,
+    shutdown: CancellationToken,
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         let path = state_file_path(&config);
         if let Some(parent) = path.parent() {
@@ -187,7 +211,10 @@ fn spawn_state_writer(config: Config, context_book: Option<ContextBookHandle>) -
 
         let mut interval = tokio::time::interval(Duration::from_secs(STATUS_FLUSH_SECONDS));
         loop {
-            interval.tick().await;
+            tokio::select! {
+                () = shutdown.cancelled() => break,
+                _ = interval.tick() => {}
+            }
             let mut json = crate::health::snapshot_json();
             if let Some(obj) = json.as_object_mut() {
                 obj.insert(
@@ -210,6 +237,7 @@ fn spawn_component_supervisor<F, Fut>(
     name: &'static str,
     initial_backoff_secs: u64,
     max_backoff_secs: u64,
+    shutdown: CancellationToken,
     mut run_component: F,
 ) -> JoinHandle<()>
 where
@@ -221,6 +249,11 @@ where
         let max_backoff = max_backoff_secs.max(backoff);
 
         loop {
+            if shutdown.is_cancelled() {
+                tracing::info!("Daemon component '{name}' stop requested");
+                break;
+            }
+
             crate::health::mark_component_ok(name);
             match run_component().await {
                 Ok(()) => {
@@ -236,7 +269,13 @@ where
             }
 
             crate::health::bump_component_restart(name);
-            tokio::time::sleep(Duration::from_secs(backoff)).await;
+            tokio::select! {
+                () = shutdown.cancelled() => {
+                    tracing::info!("Daemon component '{name}' stopping before restart");
+                    break;
+                }
+                () = tokio::time::sleep(Duration::from_secs(backoff)) => {}
+            }
             // Double backoff AFTER sleeping so first error uses initial_backoff
             backoff = backoff.saturating_mul(2).min(max_backoff);
         }
@@ -871,9 +910,13 @@ mod tests {
 
     #[tokio::test]
     async fn supervisor_marks_error_and_restart_on_failure() {
-        let handle = spawn_component_supervisor("daemon-test-fail", 1, 1, || async {
-            anyhow::bail!("boom")
-        });
+        let handle = spawn_component_supervisor(
+            "daemon-test-fail",
+            1,
+            1,
+            CancellationToken::new(),
+            || async { anyhow::bail!("boom") },
+        );
 
         tokio::time::sleep(Duration::from_millis(50)).await;
         handle.abort();
@@ -893,7 +936,13 @@ mod tests {
 
     #[tokio::test]
     async fn supervisor_marks_unexpected_exit_as_error() {
-        let handle = spawn_component_supervisor("daemon-test-exit", 1, 1, || async { Ok(()) });
+        let handle = spawn_component_supervisor(
+            "daemon-test-exit",
+            1,
+            1,
+            CancellationToken::new(),
+            || async { Ok(()) },
+        );
 
         tokio::time::sleep(Duration::from_millis(50)).await;
         handle.abort();

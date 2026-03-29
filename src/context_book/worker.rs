@@ -2,10 +2,15 @@ use super::ContextBookHandle;
 use crate::config::Config;
 use anyhow::{Context, Result};
 use tokio::time::{Duration, MissedTickBehavior};
+use tokio_util::sync::CancellationToken;
 
 const HEALTH_TICK_SECS: u64 = 30;
 
-pub async fn run(_config: Config, handle: ContextBookHandle) -> Result<()> {
+pub async fn run(
+    _config: Config,
+    handle: ContextBookHandle,
+    shutdown: Option<CancellationToken>,
+) -> Result<()> {
     handle.mark_daemon_supervised();
 
     if let Some(error) = handle.resolved_config().validation_error.clone() {
@@ -29,7 +34,22 @@ pub async fn run(_config: Config, handle: ContextBookHandle) -> Result<()> {
     interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     loop {
-        interval.tick().await;
+        if let Some(token) = &shutdown {
+            tokio::select! {
+                () = token.cancelled() => {
+                    handle.mark_shutdown_requested();
+                    persist_runtime_state(&handle)?;
+                    handle.mark_stopped("context_book worker stopped after daemon shutdown");
+                    persist_runtime_state(&handle)?;
+                    crate::health::mark_component_ok("context_book");
+                    return Ok(());
+                }
+                _ = interval.tick() => {}
+            }
+        } else {
+            interval.tick().await;
+        }
+
         handle.mark_idle("phase1 noop worker active; connectivity not started yet");
         persist_runtime_state(&handle)?;
         crate::health::mark_component_ok("context_book");
@@ -60,7 +80,7 @@ mod tests {
         config.context_book.enabled = true;
 
         let handle = shared_handle(&config);
-        let worker = tokio::spawn(run(config, handle.clone()));
+        let worker = tokio::spawn(run(config, handle.clone(), None));
 
         tokio::time::sleep(Duration::from_millis(50)).await;
         worker.abort();
@@ -73,6 +93,35 @@ mod tests {
                 .persisted_runtime
                 .as_ref()
                 .is_some_and(|runtime| runtime.worker_state == "idle")
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_persists_stopped_state_on_shutdown_signal() {
+        let tmp = TempDir::new().expect("temp dir");
+        let mut config = Config {
+            workspace_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.context_book.enabled = true;
+
+        let handle = shared_handle(&config);
+        let shutdown = CancellationToken::new();
+        let worker = tokio::spawn(run(config, handle.clone(), Some(shutdown.child_token())));
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        shutdown.cancel();
+        let result = worker.await.expect("worker join");
+
+        assert!(result.is_ok());
+        let status = handle.status_report();
+        assert_eq!(status.runtime.worker_state, "stopped");
+        assert!(
+            status
+                .persisted_runtime
+                .as_ref()
+                .is_some_and(|runtime| runtime.worker_state == "stopped")
         );
     }
 }

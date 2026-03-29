@@ -21,19 +21,6 @@ impl ContextBookService {
     }
 
     pub fn status_report(&self) -> ContextBookStatusReport {
-        let persisted_runtime = self
-            .handle
-            .store()
-            .load_runtime_state()
-            .unwrap_or_else(|error| {
-                tracing::debug!("context_book status could not load persisted runtime: {error}");
-                None
-            });
-
-        ContextBookStatusReport {
-            resolved: self.handle.resolved_config().clone(),
-            runtime: self.handle.snapshot(),
-            persisted_runtime,
-        }
+        self.handle.status_report()
     }
 }

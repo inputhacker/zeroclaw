@@ -19,6 +19,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::OnceLock;
 
+#[derive(Clone)]
+pub struct ContextBookBootstrap {
+    pub handle: ContextBookHandle,
+    pub service: ContextBookService,
+}
+
 static HANDLE_REGISTRY: OnceLock<Mutex<HashMap<String, ContextBookHandle>>> = OnceLock::new();
 
 fn registry() -> &'static Mutex<HashMap<String, ContextBookHandle>> {
@@ -34,17 +40,28 @@ fn handle_key(config: &Config) -> String {
 }
 
 pub fn shared_handle(config: &Config) -> ContextBookHandle {
+    bootstrap(config).handle
+}
+
+pub fn bootstrap(config: &Config) -> ContextBookBootstrap {
     let key = handle_key(config);
     let mut registry = registry().lock();
+    let resolved = config::ResolvedContextBookConfig::resolve(config);
     if let Some(handle) = registry.get(&key) {
-        return handle.clone();
+        handle.refresh_resolved_config(resolved);
+        return ContextBookBootstrap {
+            handle: handle.clone(),
+            service: ContextBookService::new(handle.clone()),
+        };
     }
 
-    let resolved = config::ResolvedContextBookConfig::resolve(config);
     let store = Arc::new(store::ContextBookStore::new(resolved.cache_db_path.clone()));
     let handle = handle::ContextBookHandleState::shared(resolved, store);
     registry.insert(key, handle.clone());
-    handle
+    ContextBookBootstrap {
+        handle: handle.clone(),
+        service: ContextBookService::new(handle),
+    }
 }
 
 #[cfg(test)]
@@ -65,5 +82,29 @@ mod tests {
         let second = shared_handle(&config);
 
         assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn bootstrap_refreshes_resolved_contract_for_existing_handle() {
+        let tmp = TempDir::new().expect("temp dir");
+        let mut config = Config {
+            workspace_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+
+        let first = bootstrap(&config).handle;
+        assert_eq!(first.resolved_config().manual_url, None);
+
+        config.context_book.manual_url = Some("https://context.example".into());
+        config.context_book.allowed_hosts = vec!["context.example".into()];
+
+        let second = bootstrap(&config).handle;
+
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(
+            second.resolved_config().manual_url.as_deref(),
+            Some("https://context.example")
+        );
     }
 }

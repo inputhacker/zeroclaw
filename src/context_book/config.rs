@@ -6,6 +6,7 @@ use serde::Serialize;
 use std::net::IpAddr;
 use std::path::PathBuf;
 
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Serialize)]
 pub struct ResolvedContextBookConfig {
     pub enabled: bool,
@@ -24,7 +25,29 @@ pub struct ResolvedContextBookConfig {
     pub allowed_hosts: Vec<String>,
     pub allow_private_hosts: bool,
     pub cache_db_path: PathBuf,
+    pub bearer_token_source: ContextBookBearerTokenSource,
+    pub refresh_owner: ContextBookRefreshOwner,
+    pub refresh_protocol: ContextBookRefreshProtocol,
+    pub legacy_refresh_enabled: bool,
     pub validation_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextBookBearerTokenSource {
+    AuthService,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextBookRefreshOwner {
+    ContextBookClient,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextBookRefreshProtocol {
+    OAuth2Token,
 }
 
 impl ResolvedContextBookConfig {
@@ -57,6 +80,10 @@ impl ResolvedContextBookConfig {
             allowed_hosts,
             allow_private_hosts: raw.allow_private_hosts,
             cache_db_path,
+            bearer_token_source: ContextBookBearerTokenSource::AuthService,
+            refresh_owner: ContextBookRefreshOwner::ContextBookClient,
+            refresh_protocol: ContextBookRefreshProtocol::OAuth2Token,
+            legacy_refresh_enabled: false,
             validation_error,
         }
     }
@@ -202,6 +229,19 @@ mod tests {
                 .join("context_book")
                 .join("cache.db")
         );
+        assert_eq!(
+            resolved.bearer_token_source,
+            ContextBookBearerTokenSource::AuthService
+        );
+        assert_eq!(
+            resolved.refresh_owner,
+            ContextBookRefreshOwner::ContextBookClient
+        );
+        assert_eq!(
+            resolved.refresh_protocol,
+            ContextBookRefreshProtocol::OAuth2Token
+        );
+        assert!(!resolved.legacy_refresh_enabled);
         assert!(resolved.validation_error.is_none());
     }
 

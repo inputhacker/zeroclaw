@@ -147,9 +147,12 @@ mod tests {
             worker_state: "idle".into(),
             lifecycle_state: "inactive".into(),
             connection_state: "disconnected".into(),
+            shutdown_requested: false,
             status_message: Some("phase1 noop worker active".into()),
             last_error: None,
             last_status_at: "2026-03-29T00:00:00Z".into(),
+            last_connect_at: None,
+            last_sync_at: None,
             cache_db_path: store.path().display().to_string(),
             store_initialized: true,
         };

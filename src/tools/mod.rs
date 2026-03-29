@@ -406,7 +406,7 @@ pub fn all_tools_with_runtime(
 ) {
     let has_shell_access = runtime.has_shell_access();
     let sandbox = create_sandbox(&root_config.security);
-    let context_book_handle = crate::context_book::shared_handle(root_config);
+    let context_book_handle = crate::context_book::bootstrap(root_config).handle;
     let mut tool_arcs: Vec<Arc<dyn Tool>> = vec![
         Arc::new(
             ShellTool::new_with_sandbox(security.clone(), runtime, sandbox)

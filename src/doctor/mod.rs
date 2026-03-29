@@ -7,6 +7,7 @@ use std::path::Path;
 const DAEMON_STALE_SECONDS: i64 = 30;
 const SCHEDULER_STALE_SECONDS: i64 = 120;
 const CHANNEL_STALE_SECONDS: i64 = 300;
+const CONTEXT_BOOK_STALE_SECONDS: i64 = 120;
 const COMMAND_VERSION_PREVIEW_CHARS: usize = 60;
 
 // ── Diagnostic item ──────────────────────────────────────────────
@@ -901,6 +902,12 @@ fn check_daemon_state(config: &Config, items: &mut Vec<DiagItem>) {
 
     if let Some(context_book) = snapshot.get("context_book") {
         let runtime = context_book.get("runtime").unwrap_or(context_book);
+        let resolved = context_book
+            .get("resolved")
+            .and_then(serde_json::Value::as_object);
+        let persisted = context_book
+            .get("persisted_runtime")
+            .and_then(serde_json::Value::as_object);
         let enabled = runtime
             .get("enabled")
             .and_then(serde_json::Value::as_bool)
@@ -937,6 +944,92 @@ fn check_daemon_state(config: &Config, items: &mut Vec<DiagItem>) {
                 cat,
                 format!(
                     "context_book pending (state={worker_state}, connection_state={connection_state})"
+                ),
+            ));
+        }
+
+        if enabled {
+            let store_initialized = runtime
+                .get("store_initialized")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            if store_initialized {
+                items.push(DiagItem::ok(cat, "context_book cache store initialized"));
+            } else {
+                items.push(DiagItem::warn(
+                    cat,
+                    "context_book cache store not initialized",
+                ));
+            }
+
+            if runtime
+                .get("shutdown_requested")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+            {
+                items.push(DiagItem::warn(
+                    cat,
+                    "context_book shutdown requested; waiting for worker to stop",
+                ));
+            }
+
+            if let Some(updated_at) = persisted
+                .and_then(|persisted| persisted.get("updated_at"))
+                .and_then(serde_json::Value::as_str)
+            {
+                if let Some(updated_at) = parse_rfc3339(updated_at) {
+                    let age = Utc::now().signed_duration_since(updated_at).num_seconds();
+                    if age <= CONTEXT_BOOK_STALE_SECONDS {
+                        items.push(DiagItem::ok(
+                            cat,
+                            format!("context_book cache freshness OK ({age}s ago)"),
+                        ));
+                    } else {
+                        items.push(DiagItem::warn(
+                            cat,
+                            format!("context_book cache freshness stale ({age}s ago)"),
+                        ));
+                    }
+                }
+            } else {
+                items.push(DiagItem::warn(
+                    cat,
+                    "context_book cache freshness unavailable (no persisted runtime yet)",
+                ));
+            }
+
+            if runtime
+                .get("last_sync_at")
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.is_empty())
+                .is_none()
+            {
+                items.push(DiagItem::warn(
+                    cat,
+                    "context_book has not synchronized remote events yet",
+                ));
+            }
+
+            let bearer_token_source = resolved
+                .and_then(|resolved| resolved.get("bearer_token_source"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown");
+            let refresh_owner = resolved
+                .and_then(|resolved| resolved.get("refresh_owner"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown");
+            let refresh_protocol = resolved
+                .and_then(|resolved| resolved.get("refresh_protocol"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown");
+            let legacy_refresh = resolved
+                .and_then(|resolved| resolved.get("legacy_refresh_enabled"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            items.push(DiagItem::ok(
+                cat,
+                format!(
+                    "context_book auth contract: bearer via {bearer_token_source}, refresh via {refresh_owner} ({refresh_protocol}, legacy={legacy_refresh})"
                 ),
             ));
         }
@@ -1366,5 +1459,61 @@ mod tests {
         assert_eq!(agent_messages.len(), 2);
         assert!(agent_messages[0].contains("agent \"alpha\""));
         assert!(agent_messages[1].contains("agent \"zeta\""));
+    }
+
+    #[test]
+    fn daemon_state_reports_context_book_contract_details() {
+        let tmp = TempDir::new().unwrap();
+        let config = Config {
+            workspace_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        let state_file = crate::daemon::state_file_path(&config);
+
+        let snapshot = serde_json::json!({
+            "updated_at": Utc::now().to_rfc3339(),
+            "components": {
+                "scheduler": {
+                    "status": "ok",
+                    "last_ok": Utc::now().to_rfc3339(),
+                }
+            },
+            "context_book": {
+                "resolved": {
+                    "enabled": true,
+                    "bearer_token_source": "auth_service",
+                    "refresh_owner": "context_book_client",
+                    "refresh_protocol": "oauth2_token",
+                    "legacy_refresh_enabled": false
+                },
+                "runtime": {
+                    "enabled": true,
+                    "worker_state": "idle",
+                    "connection_state": "disconnected",
+                    "store_initialized": true,
+                    "shutdown_requested": false,
+                    "last_sync_at": null
+                },
+                "persisted_runtime": {
+                    "updated_at": Utc::now().to_rfc3339()
+                }
+            }
+        });
+
+        std::fs::write(&state_file, serde_json::to_vec_pretty(&snapshot).unwrap()).unwrap();
+
+        let mut items = Vec::new();
+        check_daemon_state(&config, &mut items);
+
+        assert!(items.iter().any(|item| {
+            item.message
+                .contains("context_book auth contract: bearer via auth_service")
+                && item.severity == Severity::Ok
+        }));
+        assert!(items.iter().any(|item| {
+            item.message.contains("context_book cache freshness OK")
+                && item.severity == Severity::Ok
+        }));
     }
 }

@@ -468,6 +468,7 @@ pub struct ContextBookAgentIdentityOverrideConfig {
     pub display_name: Option<String>,
 }
 
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct ContextBookConfig {
     /// Enable Context Book integration.

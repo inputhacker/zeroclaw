@@ -513,11 +513,11 @@ Validation completed for Phase 8 work on 2026-03-30:
 - `cargo fmt --all -- --check`
 - `cargo clippy --all-targets -- -D warnings`
 - `cargo test --bin zeroclaw --no-run` → 통과 (`Finished 'test' profile ...`, `Executable unittests src/main.rs (...)`)
-- `cargo test` → 이전 repository-wide linker blocker 지점(`bin "zeroclaw" test`)을 넘어 전체 test target 재컴파일/실행 단계로 진행 중; 문서 작성 시점에는 long-running compile/test pass를 계속 수행 중
+- `cargo test` → 통과 (repository-wide end-to-end green 확인; unit/integration/system/doc test 경로 모두 성공, live test는 expected ignored 유지)
 
 Validation blockers / recorded failures:
 - 2026-03-30 기준 기존 repository-wide linker blocker였던 `bin "zeroclaw" test`의 `rust-lld: error: undefined hidden symbol` 재현은 `[profile.test] incremental = false` 적용 후 `cargo test --bin zeroclaw --no-run` 기준으로 해소됨
-- 남은 확인 과제는 "link 실패 재현"이 아니라 repository-wide `cargo test` 전체 실행 시간을 포함한 end-to-end green 여부 최종 확인이다
+- repository-wide `cargo test` end-to-end green 확인까지 완료되어, Phase 8의 필수 검증 blocker는 해소됨
 
 ## 9. Testing & Verification Checklist
 

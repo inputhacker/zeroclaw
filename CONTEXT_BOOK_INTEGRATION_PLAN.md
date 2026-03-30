@@ -218,6 +218,20 @@ Repository: `zeroclaw`
 - SQLite는 WAL 모드와 명시적 schema init을 사용하고, worker/tool 동시 접근을 전제로 lock contention을 줄인다.
 - 대용량 원문 payload는 필요한 경우에만 `raw_json`으로 저장하고, size cap / pruning 정책을 둔다.
 
+### 6.6 Installer / Skill Packaging Strategy
+
+Context Book skills는 설치 시점에 외부 `ctxbk` checkout이 없어도 사용할 수 있어야 한다.
+
+- 설치 번들은 `ctxbk/skills/working_skills/` 의 실제 동작용 skill 두 개만 포함한다:
+  - `context-book`
+  - `context-book-discovery`
+- `guide_skills/*` 는 구현/검증용 참고 자료이므로 `zeroclaw` 저장소에 vendor하지 않고, install 대상에도 포함하지 않는다.
+- `install.sh` 는 `bundled/context-book-skills/working_skills/<skill-name>/` 를 사용자의 `workspace/skills/<skill-name>/` 로 직접 복사한다.
+- 설치 로직은 기존 사용자 skill 디렉토리를 덮어쓰지 않는다. 동일 이름 skill이 이미 있으면 skip하고 사용자 쪽 변경을 보존한다.
+- working skill(`context-book`, `context-book-discovery`)은 `scripts/*.py`, `scripts/*.sh` 를 포함하므로, 설치 시 `config.toml` 의 `[skills] allow_scripts = true` 가 비어 있으면 자동으로 활성화한다.
+- 사용자가 이미 `allow_scripts` 값을 명시했다면 installer는 이를 덮어쓰지 않고, `false` 인 경우 working skills가 로드되지 않을 수 있음을 경고만 한다.
+- 이 패키징은 install/bootstrap 편의 목적일 뿐이며, ZeroClaw의 실제 Context Book SSE/runtime 구현 source of truth 는 여전히 `src/context_book/*` 와 spec 문서다.
+
 ## 7. Runtime Flow (Direct REST+SSE)
 
 0. Outbound Policy Check

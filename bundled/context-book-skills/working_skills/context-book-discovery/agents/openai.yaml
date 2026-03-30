@@ -1,0 +1,3 @@
+display_name: Context Book Discovery
+short_description: Discover a Context Book endpoint over mDNS/DNS-SD
+default_prompt: Discover the best Context Book base URL for an external runtime, applying manual override precedence, TXT compatibility checks, optional feature requirements, and preflight reachability before handoff to bootstrap.

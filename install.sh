@@ -991,6 +991,109 @@ You are **${agent_name}**. Built in Rust. 3MB binary. Zero bloat.
   unset -f _write_if_missing
 }
 
+ensure_context_book_skill_scripts_config() {
+  # Enables script-backed bundled Context Book working skills unless the user
+  # already chose an explicit `skills.allow_scripts` value.
+  #
+  # $1 — config.toml path
+  local config_path="$1"
+  local existing_value tmp_file
+
+  [[ -f "$config_path" ]] || return 0
+
+  existing_value="$(
+    grep -Em1 '^[[:space:]]*allow_scripts[[:space:]]*=' "$config_path" \
+      | sed -E 's/^[^=]*=[[:space:]]*//' \
+      | sed -E 's/[[:space:]]*#.*$//' \
+      | tr -d '[:space:]' \
+      || true
+  )"
+
+  if [[ -n "$existing_value" ]]; then
+    case "${existing_value,,}" in
+      1|true|yes|on)
+        step_dot "skills.allow_scripts already enabled"
+        ;;
+      *)
+        warn "Bundled Context Book working skills were installed, but $config_path keeps skills.allow_scripts=$existing_value."
+        warn "Guide skills will load, but script-backed working skills remain disabled until you set [skills] allow_scripts = true."
+        ;;
+    esac
+    return 0
+  fi
+
+  tmp_file="$(mktemp "${TMPDIR:-/tmp}/zeroclaw-config.XXXXXX")"
+  if grep -Eq '^[[:space:]]*\[skills\][[:space:]]*$' "$config_path"; then
+    awk '
+      BEGIN { inserted = 0 }
+      {
+        print
+        if (!inserted && $0 ~ /^[[:space:]]*\[skills\][[:space:]]*$/) {
+          print "allow_scripts = true"
+          inserted = 1
+        }
+      }
+    ' "$config_path" > "$tmp_file"
+  else
+    cp "$config_path" "$tmp_file"
+    printf '\n[skills]\nallow_scripts = true\n' >> "$tmp_file"
+  fi
+
+  mv "$tmp_file" "$config_path"
+  chmod 600 "$config_path" 2>/dev/null || true
+  step_ok "Enabled script-backed skills for bundled Context Book helpers"
+}
+
+install_bundled_context_book_skills() {
+  # Copies the vendored Context Book working skills into the workspace so they
+  # are available immediately after install.
+  #
+  # $1 — bundle root (e.g. repo/bundled/context-book-skills)
+  # $2 — workspace directory
+  # $3 — config.toml path
+  local bundle_root="$1"
+  local workspace_dir="$2"
+  local config_path="$3"
+  local skills_dir="$workspace_dir/skills"
+  local skill_name source_dir dest_dir
+  local installed_count=0
+  local skipped_count=0
+  local -a bundled_working_skills=(
+    "context-book"
+    "context-book-discovery"
+  )
+
+  if [[ ! -d "$bundle_root" ]]; then
+    warn "Bundled Context Book skills were not found at $bundle_root."
+    warn "If you need them installed automatically, run install.sh from a source checkout or a repo-backed bootstrap path."
+    return 0
+  fi
+
+  mkdir -p "$skills_dir"
+
+  for skill_name in "${bundled_working_skills[@]}"; do
+    source_dir="$bundle_root/working_skills/$skill_name"
+    [[ -d "$source_dir" ]] || continue
+    dest_dir="$skills_dir/$skill_name"
+    if [[ -e "$dest_dir" ]]; then
+      skipped_count=$((skipped_count + 1))
+      continue
+    fi
+    cp -R "$source_dir" "$dest_dir"
+    installed_count=$((installed_count + 1))
+  done
+
+  if (( installed_count > 0 )); then
+    step_ok "Installed ${installed_count} bundled Context Book skill(s)"
+  elif (( skipped_count > 0 )); then
+    step_dot "Bundled Context Book skills already present, skipping copy"
+  else
+    step_dot "No bundled Context Book skills were found to install"
+  fi
+
+  ensure_context_book_skill_scripts_config "$config_path"
+}
+
 _is_wsl() {
   # Detect Windows Subsystem for Linux (WSL)
   # WSL typically has microsoft-standard or microsoft in the kernel release
@@ -1139,6 +1242,10 @@ run_docker_bootstrap() {
     "$docker_data_dir/.zeroclaw" \
     "$docker_data_dir/workspace" \
     "$PROVIDER"
+  install_bundled_context_book_skills \
+    "$WORK_DIR/bundled/context-book-skills" \
+    "$docker_data_dir/workspace" \
+    "$docker_data_dir/.zeroclaw/config.toml"
 }
 
 SCRIPT_PATH="${BASH_SOURCE[0]:-$0}"
@@ -1722,6 +1829,10 @@ fi
 _native_config_dir="${ZEROCLAW_CONFIG_DIR:-$HOME/.zeroclaw}"
 _native_workspace_dir="${ZEROCLAW_WORKSPACE:-$_native_config_dir/workspace}"
 ensure_default_config_and_workspace "$_native_config_dir" "$_native_workspace_dir" "$PROVIDER"
+install_bundled_context_book_skills \
+  "$WORK_DIR/bundled/context-book-skills" \
+  "$_native_workspace_dir" \
+  "$_native_config_dir/config.toml"
 
 # --- Gateway service management ---
 if [[ -n "$ZEROCLAW_BIN" ]]; then

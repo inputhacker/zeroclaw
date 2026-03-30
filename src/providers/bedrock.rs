@@ -1188,6 +1188,12 @@ impl Provider for BedrockProvider {
 mod tests {
     use super::*;
     use crate::providers::traits::ChatMessage;
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     /// RAII guard that sets/unsets an env var and restores the original on drop.
     struct EnvGuard {
@@ -1367,26 +1373,28 @@ mod tests {
 
     #[test]
     fn creates_without_credentials() {
+        let _guard = env_lock().lock().expect("env lock");
         // Provider should construct even without env vars.
         let _provider = BedrockProvider::new();
     }
 
-    #[tokio::test]
-    async fn chat_fails_without_credentials() {
+    #[test]
+    fn chat_fails_without_credentials() {
+        let _guard = env_lock().lock().expect("env lock");
+        let _bearer_guard = EnvGuard::set("BEDROCK_API_KEY", None);
+        let _ak_guard = EnvGuard::set("AWS_ACCESS_KEY_ID", None);
+        let _sk_guard = EnvGuard::set("AWS_SECRET_ACCESS_KEY", None);
+        let _session_guard = EnvGuard::set("AWS_SESSION_TOKEN", None);
         let provider = BedrockProvider {
             auth: None,
             max_tokens: DEFAULT_MAX_TOKENS,
         };
-        let result = provider
-            .chat_with_system(None, "hello", "anthropic.claude-sonnet-4-6", 0.7)
-            .await;
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
+        let err = match provider.require_auth() {
+            Ok(_) => panic!("missing auth should fail"),
+            Err(error) => error.to_string(),
+        };
         assert!(
-            err.contains("credentials not set")
-                || err.contains("169.254.169.254")
-                || err.to_lowercase().contains("credential")
-                || err.to_lowercase().contains("builder error"),
+            err.contains("credentials not set") || err.to_lowercase().contains("credential"),
             "Expected missing-credentials style error, got: {err}"
         );
     }
@@ -1404,6 +1412,7 @@ mod tests {
 
     #[test]
     fn bearer_token_from_env() {
+        let _guard = env_lock().lock().expect("env lock");
         let _guard = EnvGuard::set("BEDROCK_API_KEY", Some("env-bearer-token"));
         // Clear SigV4 vars to ensure Bearer is chosen.
         let _ak_guard = EnvGuard::set("AWS_ACCESS_KEY_ID", None);
@@ -1418,6 +1427,7 @@ mod tests {
 
     #[test]
     fn bearer_token_precedence() {
+        let _guard = env_lock().lock().expect("env lock");
         let _bearer_guard = EnvGuard::set("BEDROCK_API_KEY", Some("bearer-key"));
         let _ak_guard = EnvGuard::set("AWS_ACCESS_KEY_ID", Some("AKIAEXAMPLE"));
         let _sk_guard = EnvGuard::set("AWS_SECRET_ACCESS_KEY", Some("secret"));

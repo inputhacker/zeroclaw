@@ -158,6 +158,29 @@ async fn context_book_discovery_bootstraps_against_fake_avahi_service() {
     let _ = server.await;
 }
 
+#[tokio::test]
+async fn context_book_discovery_requires_avahi_or_manual_url() {
+    let _env_guard = env_lock().lock().await;
+    let tmp = TempDir::new().expect("temp dir");
+    let empty_path = tmp.path().join("empty-bin");
+    fs::create_dir_all(&empty_path).expect("create empty bin dir");
+    let _path_guard = EnvGuard::set("PATH", Some(empty_path.to_string_lossy().as_ref()));
+
+    let mut config = test_config(&tmp);
+    config.context_book.manual_url = None;
+    config.context_book.discovery_enabled = true;
+    config.context_book.service_type = "_contextbook._tcp.local.".to_string();
+
+    let client = ContextBookClient::new(&config);
+    let error = client
+        .ensure_session()
+        .await
+        .expect_err("discovery should fail when avahi-browse is unavailable");
+
+    assert!(error.to_string().contains("avahi-browse not found"));
+    assert!(error.to_string().contains("context_book.manual_url"));
+}
+
 #[test]
 fn context_book_bootstrap_refreshes_contract_snapshot_on_reload() {
     let tmp = TempDir::new().expect("temp dir");

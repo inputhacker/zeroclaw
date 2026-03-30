@@ -489,20 +489,34 @@ Validation blockers / recorded failures:
   - `providers::bedrock::tests::chat_fails_without_credentials`
 - 위 두 실패는 Context Book 변경 경로와 직접 관련되지 않으며, 현재 환경의 Bedrock credential/env 영향 또는 기존 test isolation 문제로 분류한다. 다음 스텝에서 repository-wide green을 목표로 할 경우 우선 정리 대상이다
 
-## 8.5 Next Session Priorities
+### Phase 8 (Repository-wide Validation + Ops Verification)
+- [x] repository-wide `cargo test` failure triage + Bedrock env-coupled test 정리
+- [x] discovery helper 전략 결정 및 최소 가드 보강
+- [x] live auth profile rotation revalidation 검증
 
-우선순위 순:
+Phase 8 current status (2026-03-30):
+- 완료된 3개 구현 묶음: `src/providers/bedrock.rs` 테스트에 env lock을 추가하고 `chat_fails_without_credentials`를 env/IMDS 영향 없는 deterministic assertion으로 바꿔 repository-wide failure 원인이던 Bedrock env coupling을 제거
+- 완료된 3개 구현 묶음: `tests/component/context_book.rs`에 `avahi-browse` 부재 시 actionable error(`context_book.manual_url` fallback)를 검증하는 테스트를 추가하고, discovery 전략은 이번 턴 기준으로 "Linux/Avahi 유지 + 비지원 환경은 manual_url 명시"로 고정
+- 완료된 3개 구현 묶음: `tests/live/context_book.rs`에 live auth profile rotation 후 shared handle refresh, contract revalidation, service write/delete cleanup까지 검증하는 ignored live test를 추가하고 실제 서버(`127.0.1.1:8080`)에 대해 통과 확인
+- 다음 턴 시작 지점: repository-wide `cargo test`를 막는 `bin "zeroclaw" test` linker blocker 조사부터 시작한다.
+- 그 다음 우선순위는 non-Linux 운영 요구가 실제로 생긴 경우에만 `dns-sd`/native DNS-SD fallback을 재검토하고, 마지막으로 bootstrap secret rotation 자체의 live 운영 절차를 별도 runbook/test로 확장하는 것이다.
 
-1. repository-wide `cargo test` failure 정리
-- 현재 남은 전체 테스트 실패는 Context Book이 아니라 `providers::bedrock::tests::bearer_token_from_env`와 `providers::bedrock::tests::chat_fails_without_credentials` 두 건이다
-- env 오염/credential isolation 문제인지 확인하고, 다음 턴 시작 직후 이 두 테스트를 최소 재현 후 고친다
+Validation completed for Phase 8 work on 2026-03-30:
+- `cargo test --lib providers::bedrock::tests::bearer_token_from_env -- --test-threads=1`
+- `cargo test --lib providers::bedrock::tests::chat_fails_without_credentials -- --test-threads=1`
+- `cargo test --test component context_book_ -- --nocapture`
+- `avahi-browse -rt _contextbook._tcp`
+- `curl -fsS http://127.0.1.1:8080/`
+- `CONTEXT_BOOK_BOOTSTRAP_SHARED_SECRET=tercespartstoob CONTEXT_BOOK_LIVE_BASE_URL=http://127.0.1.1:8080 cargo test --test live context_book_live_bootstrap_and_contract_validation -- --ignored --nocapture`
+- `CONTEXT_BOOK_BOOTSTRAP_SHARED_SECRET=tercespartstoob CONTEXT_BOOK_LIVE_BASE_URL=http://127.0.1.1:8080 cargo test --test live context_book_live_auth_profile_rotation_revalidates_writes -- --ignored --nocapture`
+- `cargo fmt --all -- --check`
+- `cargo clippy --all-targets -- -D warnings`
 
-2. discovery helper 일반화 여부 결정
-- 현재 구현은 Linux/Avahi 환경에서 `avahi-browse -rtp`를 사용한다
-- 다음 턴에는 이 경로를 유지할지, `dns-sd`/native DNS-SD fallback 또는 명시적 helper abstraction을 추가할지 결정하고 필요하면 문서/ops 예시를 보강한다
-
-3. 남은 운영 검증
-- bootstrap secret rotation이나 auth profile 전환을 실제 live server에 적용한 뒤, worker reconnect와 service-only write 경로에서 새 contract revalidation이 예상대로 일어나는지 확인한다
+Validation blockers / recorded failures:
+- `cargo test`는 Bedrock env failure가 아니라 repository-wide linker blocker로 실패:
+  - `bin "zeroclaw" test` link 단계에서 `rust-lld: error: undefined hidden symbol`가 재현됨
+  - 대표 참조 위치: `src/hardware/protocol.rs:48`, `src/providers/azure_openai.rs:42`, `src/memory/qdrant.rs:199`, `src/agent/history_pruner.rs:21`
+  - 이번 턴 Context Book/Bedrock 테스트 수정과 직접 관련된 증거는 없으므로, 다음 스텝에서 전역 linker 회귀 또는 toolchain/cache 상태 문제로 분리 조사한다
 
 ## 9. Testing & Verification Checklist
 

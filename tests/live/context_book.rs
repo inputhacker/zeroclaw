@@ -1,11 +1,15 @@
 use chrono::Utc;
 use serde_json::{Value, json};
+use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Duration;
 use tempfile::TempDir;
 use tokio::sync::Mutex;
 use zeroclaw::Config;
-use zeroclaw::context_book::{ContextBookClient, ContextBookRefreshMode};
+use zeroclaw::context_book::{
+    ContextBookClient, ContextBookContextCreateRequest, ContextBookContractValidationState,
+    ContextBookRefreshMode, ContextBookService, bootstrap,
+};
 
 fn env_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -70,34 +74,16 @@ fn live_config(tmp: &TempDir, base_url: &str) -> Config {
     config
 }
 
-#[tokio::test]
-#[ignore = "requires a live Context Book server with dashboard approval access"]
-async fn context_book_live_bootstrap_and_contract_validation() {
-    let _env_guard = env_lock().lock().await;
-    let shared_secret = std::env::var("CONTEXT_BOOK_BOOTSTRAP_SHARED_SECRET")
-        .expect("set CONTEXT_BOOK_BOOTSTRAP_SHARED_SECRET to run the live Context Book test");
-    let base_url = std::env::var("CONTEXT_BOOK_LIVE_BASE_URL")
-        .unwrap_or_else(|_| "http://127.0.1.1:8080".to_string());
-
-    let tmp = TempDir::new().expect("temp dir");
-    let config = live_config(&tmp, &base_url);
+fn spawn_bootstrap_approval(
+    base_url: String,
+    requested_agent_name: String,
+    reason: &'static str,
+) -> tokio::task::JoinHandle<()> {
     let approval_http = reqwest::Client::new();
-    let approval_base = base_url.clone();
-    let requested_agent_name = config
-        .context_book
-        .agent_identity_override
-        .agent_id
-        .clone()
-        .expect("agent id override");
-    let _secret_guard = EnvGuard::set(
-        &config.context_book.bootstrap_secret_env_key,
-        Some(shared_secret.as_str()),
-    );
-
-    let approval_task = tokio::spawn(async move {
+    tokio::spawn(async move {
         for _ in 0..40 {
             let response = approval_http
-                .get(format!("{approval_base}/dashboard/api/bootstrap/requests"))
+                .get(format!("{base_url}/dashboard/api/bootstrap/requests"))
                 .send()
                 .await
                 .expect("bootstrap queue request");
@@ -114,11 +100,11 @@ async fn context_book_live_bootstrap_and_contract_validation() {
             }) {
                 let response = approval_http
                     .post(format!(
-                        "{approval_base}/dashboard/api/bootstrap/requests/{request_id}/approve"
+                        "{base_url}/dashboard/api/bootstrap/requests/{request_id}/approve"
                     ))
                     .json(&json!({
                         "actor": "zeroclaw-live-test",
-                        "reason": "component live Context Book verification",
+                        "reason": reason,
                         "channel": "dashboard"
                     }))
                     .send()
@@ -136,7 +122,36 @@ async fn context_book_live_bootstrap_and_contract_validation() {
         }
 
         panic!("timed out waiting for bootstrap request for {requested_agent_name}");
-    });
+    })
+}
+
+#[tokio::test]
+#[ignore = "requires a live Context Book server with dashboard approval access"]
+async fn context_book_live_bootstrap_and_contract_validation() {
+    let _env_guard = env_lock().lock().await;
+    let shared_secret = std::env::var("CONTEXT_BOOK_BOOTSTRAP_SHARED_SECRET")
+        .expect("set CONTEXT_BOOK_BOOTSTRAP_SHARED_SECRET to run the live Context Book test");
+    let base_url = std::env::var("CONTEXT_BOOK_LIVE_BASE_URL")
+        .unwrap_or_else(|_| "http://127.0.1.1:8080".to_string());
+
+    let tmp = TempDir::new().expect("temp dir");
+    let config = live_config(&tmp, &base_url);
+    let requested_agent_name = config
+        .context_book
+        .agent_identity_override
+        .agent_id
+        .clone()
+        .expect("agent id override");
+    let _secret_guard = EnvGuard::set(
+        &config.context_book.bootstrap_secret_env_key,
+        Some(shared_secret.as_str()),
+    );
+
+    let approval_task = spawn_bootstrap_approval(
+        base_url.clone(),
+        requested_agent_name,
+        "component live Context Book verification",
+    );
 
     let client = ContextBookClient::new(&config);
     let session = tokio::time::timeout(Duration::from_secs(30), client.ensure_session())
@@ -186,4 +201,125 @@ async fn context_book_live_bootstrap_and_contract_validation() {
             .all(|context| !context.context_id.trim().is_empty())
     );
     assert!(votes.iter().all(|vote| !vote.vote_id.trim().is_empty()));
+}
+
+#[tokio::test]
+#[ignore = "requires a live Context Book server with dashboard approval access"]
+async fn context_book_live_auth_profile_rotation_revalidates_writes() {
+    let _env_guard = env_lock().lock().await;
+    let shared_secret = std::env::var("CONTEXT_BOOK_BOOTSTRAP_SHARED_SECRET")
+        .expect("set CONTEXT_BOOK_BOOTSTRAP_SHARED_SECRET to run the live Context Book test");
+    let base_url = std::env::var("CONTEXT_BOOK_LIVE_BASE_URL")
+        .unwrap_or_else(|_| "http://127.0.1.1:8080".to_string());
+
+    let tmp = TempDir::new().expect("temp dir");
+    let mut primary = live_config(&tmp, &base_url);
+    primary.context_book.auth_profile = Some("primary".to_string());
+    primary.context_book.agent_identity_override.agent_id = Some(format!(
+        "zeroclaw-live-primary-{}",
+        Utc::now()
+            .timestamp_nanos_opt()
+            .expect("timestamp should fit")
+    ));
+    primary.context_book.agent_identity_override.display_name =
+        Some("ZeroClaw Live Primary".to_string());
+    let _secret_guard = EnvGuard::set(
+        &primary.context_book.bootstrap_secret_env_key,
+        Some(shared_secret.as_str()),
+    );
+    let primary_agent_name = primary
+        .context_book
+        .agent_identity_override
+        .agent_id
+        .clone()
+        .expect("primary agent id");
+
+    let primary_approval = spawn_bootstrap_approval(
+        base_url.clone(),
+        primary_agent_name,
+        "live auth profile primary bootstrap",
+    );
+    let primary_client = ContextBookClient::new(&primary);
+    let primary_session =
+        tokio::time::timeout(Duration::from_secs(30), primary_client.ensure_session())
+            .await
+            .expect("primary ensure_session should finish before timeout")
+            .expect("primary live bootstrap session");
+    primary_approval
+        .await
+        .expect("primary bootstrap approval should finish cleanly");
+    primary_client
+        .activate_agent(&primary_session)
+        .await
+        .expect("activate primary live agent");
+
+    let primary_handle = bootstrap(&primary).handle;
+
+    let mut rotated = primary.clone();
+    rotated.context_book.auth_profile = Some("rotated".to_string());
+    rotated.context_book.agent_identity_override.agent_id = Some(format!(
+        "zeroclaw-live-rotated-{}",
+        Utc::now()
+            .timestamp_nanos_opt()
+            .expect("timestamp should fit")
+    ));
+    rotated.context_book.agent_identity_override.display_name =
+        Some("ZeroClaw Live Rotated".to_string());
+    let rotated_agent_name = rotated
+        .context_book
+        .agent_identity_override
+        .agent_id
+        .clone()
+        .expect("rotated agent id");
+
+    let rotated_approval = spawn_bootstrap_approval(
+        base_url.clone(),
+        rotated_agent_name.clone(),
+        "live auth profile rotation bootstrap",
+    );
+    let rotated_client = ContextBookClient::new(&rotated);
+    let rotated_session =
+        tokio::time::timeout(Duration::from_secs(30), rotated_client.ensure_session())
+            .await
+            .expect("rotated ensure_session should finish before timeout")
+            .expect("rotated live bootstrap session");
+    rotated_approval
+        .await
+        .expect("rotated bootstrap approval should finish cleanly");
+    rotated_client
+        .activate_agent(&rotated_session)
+        .await
+        .expect("activate rotated live agent");
+
+    let refreshed_handle = bootstrap(&rotated).handle;
+    assert!(Arc::ptr_eq(&primary_handle, &refreshed_handle));
+    assert_eq!(
+        refreshed_handle.contract_snapshot().validation_state,
+        ContextBookContractValidationState::Unknown
+    );
+
+    let service = ContextBookService::new(refreshed_handle.clone());
+    let context_id = format!("{}_ctx", rotated_session.agent_id.replace('-', "_"));
+    let created = service
+        .create_context(&ContextBookContextCreateRequest {
+            context_id: Some(context_id.clone()),
+            title: "Rotated Live Context".to_string(),
+            contents: "write after auth profile rotation".to_string(),
+            tag: "ops".to_string(),
+            status: "Published".to_string(),
+        })
+        .await
+        .expect("write should succeed after live auth profile rotation");
+
+    assert_eq!(created.context_id, context_id);
+    assert_eq!(created.author_agent_id, rotated_session.agent_id);
+    assert_eq!(
+        refreshed_handle.contract_snapshot().validation_state,
+        ContextBookContractValidationState::Validated
+    );
+
+    service
+        .delete_context(&created.context_id)
+        .await
+        .expect("cleanup live rotated context");
 }

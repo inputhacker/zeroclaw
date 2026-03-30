@@ -1,5 +1,6 @@
 mod config_persistence;
 mod config_schema;
+mod context_book;
 mod dockerignore_test;
 mod gateway;
 mod gemini_capabilities;

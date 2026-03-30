@@ -17,13 +17,17 @@ use reqwest::{Response, StatusCode, Url};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
+use std::process::Stdio;
 use thiserror::Error;
+use tokio::process::Command;
+use tokio::time::{Duration, timeout};
 
 const CONTEXT_BOOK_PROVIDER: &str = "context-book";
 const ACCESS_TOKEN_REFRESH_SKEW_SECS: i64 = 90;
 const REQUEST_WAIT_MS: u64 = 5_000;
 const HTTP_TIMEOUT_SECS: u64 = 30;
 const HTTP_CONNECT_TIMEOUT_SECS: u64 = 10;
+const DISCOVERY_TIMEOUT_SECS: u64 = 5;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ContextBookAgentIdentity {
@@ -230,6 +234,23 @@ struct SubscriptionsResponse {
     producer_agent_ids: Option<Vec<String>>,
 }
 
+#[derive(Debug, Clone)]
+struct DiscoveredContextBookEndpoint {
+    instance_name: String,
+    service_type: String,
+    domain: String,
+    hostname: String,
+    address: String,
+    port: u16,
+    path: String,
+    health_path: Option<String>,
+    instance_id: Option<String>,
+    env: Option<String>,
+    priority: i64,
+    weight: i64,
+    metadata: BTreeMap<String, String>,
+}
+
 impl TokenResponse {
     fn resolved_agent_id(&self, fallback: &str) -> String {
         self.agent_id
@@ -258,6 +279,32 @@ impl SubscriptionsResponse {
             ),
             updated_at: Utc::now().to_rfc3339(),
         }
+    }
+}
+
+impl DiscoveredContextBookEndpoint {
+    fn label(&self) -> String {
+        format!(
+            "{}.{}.{} -> {}:{}",
+            self.instance_name, self.service_type, self.domain, self.address, self.port
+        )
+    }
+
+    fn base_url(&self) -> Result<Url> {
+        let host = format_url_host(&self.address);
+        let raw = if self.path == "/" {
+            format!("http://{host}:{}/", self.port)
+        } else {
+            format!("http://{host}:{}{}", self.port, self.path)
+        };
+        Url::parse(&raw).context("invalid discovered base URL")
+    }
+
+    fn preflight_url(&self, base_url: &Url) -> Result<Url> {
+        join_relative_url(
+            base_url,
+            self.health_path.as_deref().unwrap_or(self.path.as_str()),
+        )
     }
 }
 
@@ -386,7 +433,7 @@ impl ContextBookClient {
     }
 
     pub async fn ensure_session(&self) -> Result<ContextBookSession, ContextBookClientError> {
-        let base_url = self.resolve_base_url()?;
+        let base_url = self.resolve_base_url().await?;
         if let Some(session) = self.load_stored_session(&base_url).await? {
             return Ok(session);
         }
@@ -1662,23 +1709,97 @@ impl ContextBookClient {
         ContextBookClientError { kind, message }
     }
 
-    fn resolve_base_url(&self) -> Result<Url, ContextBookClientError> {
-        let Some(manual_url) = self.resolved.manual_url.as_deref() else {
+    async fn resolve_base_url(&self) -> Result<Url, ContextBookClientError> {
+        if let Some(manual_url) = self.resolved.manual_url.as_deref() {
+            let url = Url::parse(manual_url).map_err(|error| {
+                self.contract_error(format!("invalid Context Book base URL: {error}"))
+            })?;
+            validate_url_against_runtime_policy(
+                &url,
+                &self.resolved.allowed_hosts,
+                self.resolved.allow_private_hosts,
+            )
+            .map_err(|error| self.contract_error(error.to_string()))?;
+            return Ok(normalize_base_url(url));
+        }
+
+        if !self.resolved.discovery_enabled {
             return Err(ContextBookClientError {
                 kind: ContextBookClientErrorKind::DiscoveryUnavailable,
-                message: "Context Book discovery is not implemented yet; configure context_book.manual_url for Phase 2 connectivity".to_string(),
+                message: "Context Book discovery is disabled and context_book.manual_url is unset"
+                    .to_string(),
             });
+        }
+
+        self.discover_base_url().await
+    }
+
+    async fn discover_base_url(&self) -> Result<Url, ContextBookClientError> {
+        let mut candidates = discover_context_book_endpoints(&self.resolved.service_type)
+            .await
+            .map_err(|message| ContextBookClientError {
+                kind: ContextBookClientErrorKind::DiscoveryUnavailable,
+                message,
+            })?;
+        candidates.sort_by_key(discovery_sort_key);
+
+        let mut failures = Vec::new();
+        for candidate in candidates {
+            if let Err(error) = validate_discovered_endpoint_against_runtime_policy(
+                &candidate,
+                &self.resolved.allowed_hosts,
+                self.resolved.allow_private_hosts,
+            ) {
+                failures.push(format!(
+                    "{} rejected by runtime policy: {error}",
+                    candidate.label()
+                ));
+                continue;
+            }
+
+            let url = candidate
+                .base_url()
+                .map_err(|error| self.contract_error(format!("invalid discovered URL: {error}")))?;
+            let preflight_url = candidate.preflight_url(&url).map_err(|error| {
+                self.contract_error(format!("invalid discovered preflight URL: {error}"))
+            })?;
+            let response = self
+                .http_client
+                .get(preflight_url.clone())
+                .send()
+                .await
+                .map_err(|error| {
+                    self.network_error(format!(
+                        "failed discovery preflight against {}: {error}",
+                        preflight_url
+                    ))
+                });
+
+            match response {
+                Ok(response) if response.status().is_success() => {
+                    return Ok(normalize_base_url(url));
+                }
+                Ok(response) => failures.push(format!(
+                    "{} preflight returned {}",
+                    candidate.label(),
+                    response.status()
+                )),
+                Err(error) => failures.push(error.message),
+            }
+        }
+
+        let details = if failures.is_empty() {
+            "no compatible discovery candidates were found".to_string()
+        } else {
+            failures.join("; ")
         };
-        let url = Url::parse(manual_url).map_err(|error| {
-            self.contract_error(format!("invalid Context Book base URL: {error}"))
-        })?;
-        validate_url_against_runtime_policy(
-            &url,
-            &self.resolved.allowed_hosts,
-            self.resolved.allow_private_hosts,
-        )
-        .map_err(|error| self.contract_error(error.to_string()))?;
-        Ok(normalize_base_url(url))
+        Err(ContextBookClientError {
+            kind: ContextBookClientErrorKind::DiscoveryUnavailable,
+            message: format!(
+                "failed to discover a reachable Context Book endpoint for {}: {details}",
+                self.resolved.service_type
+            ),
+        })
     }
 
     fn auth_error(&self, message: impl Into<String>) -> ContextBookClientError {
@@ -1784,6 +1905,227 @@ fn normalize_base_url(mut url: Url) -> Url {
         url.set_path(&format!("{path}/"));
     }
     url
+}
+
+fn discovery_sort_key(endpoint: &DiscoveredContextBookEndpoint) -> (i64, i64, String) {
+    (
+        endpoint.priority,
+        -endpoint.weight,
+        endpoint
+            .instance_id
+            .clone()
+            .unwrap_or_else(|| endpoint.label()),
+    )
+}
+
+async fn discover_context_book_endpoints(
+    service_type: &str,
+) -> std::result::Result<Vec<DiscoveredContextBookEndpoint>, String> {
+    let browse_service_type = normalize_discovery_service_type(service_type);
+    let mut command = Command::new("avahi-browse");
+    command
+        .arg("-rtp")
+        .arg(&browse_service_type)
+        .stdin(Stdio::null())
+        .stderr(Stdio::piped())
+        .stdout(Stdio::piped());
+    let output = timeout(Duration::from_secs(DISCOVERY_TIMEOUT_SECS), command.output())
+        .await
+        .map_err(|_| {
+            format!(
+                "timed out after {DISCOVERY_TIMEOUT_SECS}s waiting for avahi-browse on {browse_service_type}"
+            )
+        })?
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                "avahi-browse not found in PATH; install Avahi or configure context_book.manual_url".to_string()
+            } else {
+                format!("failed to execute avahi-browse: {error}")
+            }
+        })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if stderr.is_empty() {
+            format!("avahi-browse exited with status {}", output.status)
+        } else {
+            format!(
+                "avahi-browse exited with status {}: {stderr}",
+                output.status
+            )
+        });
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut endpoints = stdout
+        .lines()
+        .filter_map(parse_discovered_endpoint_line)
+        .filter(is_compatible_discovery_candidate)
+        .collect::<Vec<_>>();
+    endpoints.sort_by_key(discovery_sort_key);
+    if endpoints.is_empty() {
+        return Err(format!(
+            "no compatible Context Book DNS-SD advertisements found for {browse_service_type}"
+        ));
+    }
+    Ok(endpoints)
+}
+
+fn normalize_discovery_service_type(service_type: &str) -> String {
+    let trimmed = service_type.trim().trim_end_matches('.');
+    let without_local = trimmed.strip_suffix(".local").unwrap_or(trimmed);
+    if without_local.is_empty() {
+        "_contextbook._tcp".to_string()
+    } else {
+        without_local.to_string()
+    }
+}
+
+fn parse_discovered_endpoint_line(line: &str) -> Option<DiscoveredContextBookEndpoint> {
+    if !line.starts_with("=;") {
+        return None;
+    }
+
+    let fields = line.splitn(10, ';').collect::<Vec<_>>();
+    if fields.len() < 9 {
+        return None;
+    }
+
+    let hostname = fields.get(6)?.trim();
+    let address = fields.get(7)?.trim();
+    let port = fields.get(8)?.trim().parse::<u16>().ok()?;
+    let txt = fields.get(9).copied().unwrap_or_default();
+    let metadata = parse_discovery_txt(txt);
+    let path = normalize_discovery_path(metadata.get("path").map(String::as_str).unwrap_or("/"));
+    let health_path = metadata
+        .get("health")
+        .map(|value| normalize_discovery_path(value));
+
+    Some(DiscoveredContextBookEndpoint {
+        instance_name: fields.get(3)?.trim().to_string(),
+        service_type: fields.get(4)?.trim().to_string(),
+        domain: fields.get(5)?.trim().to_string(),
+        hostname: hostname.to_string(),
+        address: if address.is_empty() {
+            hostname.to_string()
+        } else {
+            address.to_string()
+        },
+        port,
+        path,
+        health_path,
+        instance_id: metadata.get("instance_id").cloned(),
+        env: metadata.get("env").cloned(),
+        priority: metadata
+            .get("priority")
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or_default(),
+        weight: metadata
+            .get("weight")
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or_default(),
+        metadata,
+    })
+}
+
+fn parse_discovery_txt(raw: &str) -> BTreeMap<String, String> {
+    let mut metadata = BTreeMap::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+
+    for ch in raw.chars() {
+        match ch {
+            '"' if in_quotes => {
+                if let Some((key, value)) = current.split_once('=') {
+                    metadata.insert(key.trim().to_ascii_lowercase(), value.trim().to_string());
+                }
+                current.clear();
+                in_quotes = false;
+            }
+            '"' => in_quotes = true,
+            _ if in_quotes => current.push(ch),
+            _ => {}
+        }
+    }
+
+    metadata
+}
+
+fn normalize_discovery_path(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed == "/" {
+        "/".to_string()
+    } else if trimmed.starts_with('/') {
+        trimmed.trim_end_matches('/').to_string()
+    } else {
+        format!("/{}", trimmed.trim_end_matches('/'))
+    }
+}
+
+fn is_compatible_discovery_candidate(endpoint: &DiscoveredContextBookEndpoint) -> bool {
+    if endpoint
+        .metadata
+        .get("service")
+        .is_none_or(|service| service != "context-book")
+    {
+        return false;
+    }
+
+    if endpoint
+        .metadata
+        .get("ver")
+        .is_none_or(|version| version != "1")
+    {
+        return false;
+    }
+
+    endpoint
+        .metadata
+        .get("api")
+        .map(|value| {
+            let mut tokens = value
+                .split(',')
+                .map(|token| token.trim().to_ascii_lowercase())
+                .collect::<Vec<_>>();
+            tokens.sort_unstable();
+            tokens.contains(&"rest".to_string()) && tokens.contains(&"sse".to_string())
+        })
+        .unwrap_or(false)
+}
+
+fn validate_discovered_endpoint_against_runtime_policy(
+    endpoint: &DiscoveredContextBookEndpoint,
+    allowed_hosts: &[String],
+    allow_private_hosts: bool,
+) -> Result<()> {
+    let hosts = [endpoint.address.as_str(), endpoint.hostname.as_str()];
+    if !allowed_hosts.is_empty()
+        && !hosts
+            .iter()
+            .filter(|host| !host.trim().is_empty())
+            .any(|host| host_matches_allowlist(host, allowed_hosts))
+    {
+        anyhow::bail!(
+            "discovered endpoint '{}' did not match context_book.allowed_hosts",
+            endpoint.label()
+        );
+    }
+
+    if !allow_private_hosts && is_private_like_host(&endpoint.address) {
+        anyhow::bail!(
+            "discovered endpoint '{}' resolved to private or loopback host '{}'",
+            endpoint.label(),
+            endpoint.address
+        );
+    }
+
+    Ok(())
+}
+
+fn format_url_host(host: &str) -> String {
+    match host.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V6(_)) => format!("[{host}]"),
+        _ => host.to_string(),
+    }
 }
 
 fn validate_url_against_runtime_policy(
@@ -2145,8 +2487,8 @@ mod tests {
         assert_eq!(identity.display_name, "workspace");
     }
 
-    #[test]
-    fn base_url_validation_rejects_unlisted_host() {
+    #[tokio::test]
+    async fn base_url_validation_rejects_unlisted_host() {
         let tmp = TempDir::new().expect("temp dir");
         let mut config = test_config(&tmp);
         config.context_book.allowed_hosts = vec!["other.example".into()];
@@ -2154,6 +2496,7 @@ mod tests {
         let client = ContextBookClient::new(&config);
         let error = client
             .resolve_base_url()
+            .await
             .expect_err("expected allowlist error");
 
         assert_eq!(error.kind, ContextBookClientErrorKind::ContractViolation);

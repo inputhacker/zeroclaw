@@ -908,6 +908,64 @@ mod tests {
             StatusCode::NO_CONTENT
         }
 
+        async fn agents() -> impl IntoResponse {
+            Json(json!([
+                {
+                    "agentId": "workspace",
+                    "lifecycleState": "Active",
+                    "connectionState": "Disconnected"
+                }
+            ]))
+        }
+
+        async fn subscriptions() -> impl IntoResponse {
+            Json(json!({
+                "consumerAgentId": "workspace",
+                "desiredProducerAgentIds": ["peer-a"],
+                "effectiveProducerAgentIds": ["peer-a"]
+            }))
+        }
+
+        async fn events_probe() -> impl IntoResponse {
+            (
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "error": {
+                        "code": "CURSOR_NOT_FOUND",
+                        "message": "missing cursor"
+                    }
+                })),
+            )
+        }
+
+        async fn delete_vote_probe(AxumPath(vote_id): AxumPath<String>) -> impl IntoResponse {
+            if vote_id == "__zeroclaw_contract_probe_vote__" {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({
+                        "error": {
+                            "code": "VOTE_NOT_FOUND",
+                            "message": "missing vote"
+                        }
+                    })),
+                );
+            }
+
+            (StatusCode::NO_CONTENT, Json(json!({})))
+        }
+
+        async fn legacy_refresh() -> impl IntoResponse {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": {
+                        "code": "REFRESH_TOKEN_REQUIRED",
+                        "message": "missing refresh token"
+                    }
+                })),
+            )
+        }
+
         async fn create_context(Json(body): Json<Value>) -> impl IntoResponse {
             assert_eq!(body["contextId"], "workspace_ctx9");
             assert_eq!(body["title"], "Morning Brief");
@@ -935,8 +993,13 @@ mod tests {
 
         let app = Router::new()
             .route("/agents/{agent_id}/status", patch(activate))
+            .route("/agents", get(agents))
+            .route("/subscriptions", get(subscriptions))
+            .route("/events", get(events_probe))
+            .route("/votes/{vote_id}", delete(delete_vote_probe))
             .route("/contexts", post(create_context))
-            .route("/contexts/{context_id}", delete(delete_context));
+            .route("/contexts/{context_id}", delete(delete_context))
+            .route("/auth/refresh", post(legacy_refresh));
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind listener");
@@ -994,7 +1057,71 @@ mod tests {
             StatusCode::NO_CONTENT
         }
 
-        let app = Router::new().route("/agents/{agent_id}/status", patch(activate));
+        async fn agents() -> impl IntoResponse {
+            Json(json!([
+                {
+                    "agentId": "workspace",
+                    "lifecycleState": "Active",
+                    "connectionState": "Disconnected"
+                }
+            ]))
+        }
+
+        async fn subscriptions() -> impl IntoResponse {
+            Json(json!({
+                "consumerAgentId": "workspace",
+                "desiredProducerAgentIds": ["peer-a"],
+                "effectiveProducerAgentIds": ["peer-a"]
+            }))
+        }
+
+        async fn events_probe() -> impl IntoResponse {
+            (
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "error": {
+                        "code": "CURSOR_NOT_FOUND",
+                        "message": "missing cursor"
+                    }
+                })),
+            )
+        }
+
+        async fn delete_vote_probe(AxumPath(vote_id): AxumPath<String>) -> impl IntoResponse {
+            if vote_id == "__zeroclaw_contract_probe_vote__" {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({
+                        "error": {
+                            "code": "VOTE_NOT_FOUND",
+                            "message": "missing vote"
+                        }
+                    })),
+                );
+            }
+
+            (StatusCode::NO_CONTENT, Json(json!({})))
+        }
+
+        async fn legacy_refresh() -> impl IntoResponse {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": {
+                        "code": "REFRESH_TOKEN_REQUIRED",
+                        "message": "missing refresh token"
+                    }
+                })),
+            )
+        }
+
+        let app = Router::new()
+            .route("/agents/{agent_id}/status", patch(activate))
+            .route("/agents", get(agents))
+            .route("/subscriptions", get(subscriptions))
+            .route("/events", get(events_probe))
+            .route("/votes/{vote_id}", delete(delete_vote_probe))
+            .route("/auth/refresh", post(legacy_refresh));
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind listener");
@@ -1067,9 +1194,50 @@ mod tests {
             StatusCode::NO_CONTENT
         }
 
+        async fn agents() -> impl IntoResponse {
+            Json(json!([
+                {
+                    "agentId": "workspace",
+                    "lifecycleState": "Active",
+                    "connectionState": "Disconnected"
+                }
+            ]))
+        }
+
+        async fn subscriptions() -> impl IntoResponse {
+            Json(json!({
+                "consumerAgentId": "workspace",
+                "desiredProducerAgentIds": ["peer-a"],
+                "effectiveProducerAgentIds": ["peer-a"]
+            }))
+        }
+
+        async fn events_probe() -> impl IntoResponse {
+            (
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "error": {
+                        "code": "CURSOR_NOT_FOUND",
+                        "message": "missing cursor"
+                    }
+                })),
+            )
+        }
+
         async fn delete_vote(AxumPath(vote_id): AxumPath<String>) -> impl IntoResponse {
+            if vote_id == "__zeroclaw_contract_probe_vote__" {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({
+                        "error": {
+                            "code": "VOTE_NOT_FOUND",
+                            "message": "missing vote"
+                        }
+                    })),
+                );
+            }
             assert_eq!(vote_id, "workspace_vote_delete");
-            StatusCode::NO_CONTENT
+            (StatusCode::NO_CONTENT, Json(json!({})))
         }
 
         async fn cast_vote(AxumPath(vote_id): AxumPath<String>) -> impl IntoResponse {
@@ -1087,8 +1255,25 @@ mod tests {
 
         let app = Router::new()
             .route("/agents/{agent_id}/status", patch(activate))
+            .route("/agents", get(agents))
+            .route("/subscriptions", get(subscriptions))
+            .route("/events", get(events_probe))
             .route("/votes/{vote_id}", delete(delete_vote))
-            .route("/votes/{vote_id}/cast", post(cast_vote));
+            .route("/votes/{vote_id}/cast", post(cast_vote))
+            .route(
+                "/auth/refresh",
+                post(|| async {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({
+                            "error": {
+                                "code": "REFRESH_TOKEN_REQUIRED",
+                                "message": "missing refresh token"
+                            }
+                        })),
+                    )
+                }),
+            );
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind listener");
@@ -1139,7 +1324,11 @@ mod tests {
             )
             .await
             .expect_err("cast after delete should fail");
-        assert!(error.to_string().contains("vote missing"));
+        assert!(
+            error
+                .to_string()
+                .contains("failed to cast Context Book vote")
+        );
         assert!(
             handle
                 .store()
@@ -1357,7 +1546,7 @@ mod tests {
         }
 
         async fn fresh_delete_vote_probe(AxumPath(vote_id): AxumPath<String>) -> impl IntoResponse {
-            assert_eq!(vote_id, "__zeroclaw_probe__");
+            assert_eq!(vote_id, "__zeroclaw_contract_probe_vote__");
             (
                 StatusCode::NOT_FOUND,
                 Json(json!({
@@ -1370,10 +1559,10 @@ mod tests {
         }
 
         async fn fresh_create_context(Json(body): Json<Value>) -> impl IntoResponse {
-            assert_eq!(body["contextId"], "workspace_new_ctx");
+            assert_eq!(body["contextId"], "workspace-new_ctx");
             assert_eq!(body["title"], "Rotated");
             Json(json!({
-                "contextId": "workspace_new_ctx",
+                "contextId": "workspace-new_ctx",
                 "authorAgentId": "workspace-new",
                 "title": "Rotated",
                 "contents": "write after reload",
@@ -1412,7 +1601,7 @@ mod tests {
         let service = ContextBookService::new(handle.clone());
         let first_error = service
             .create_context(&ContextBookContextCreateRequest {
-                context_id: Some("workspace_old_ctx".into()),
+                context_id: Some("workspace-old_ctx".into()),
                 title: "Should Fail".into(),
                 contents: "blocked by stale contract".into(),
                 tag: "ops".into(),
@@ -1445,7 +1634,7 @@ mod tests {
         let reloaded_service = ContextBookService::new(refreshed.clone());
         let created = reloaded_service
             .create_context(&ContextBookContextCreateRequest {
-                context_id: Some("workspace_new_ctx".into()),
+                context_id: Some("workspace-new_ctx".into()),
                 title: "Rotated".into(),
                 contents: "write after reload".into(),
                 tag: "ops".into(),

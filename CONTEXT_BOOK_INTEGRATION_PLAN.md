@@ -452,39 +452,54 @@ Phase 6 current status (2026-03-30):
 - 완료된 3개 구현 묶음: `src/context_book/store.rs`에 SQLite write contention 테스트를 추가해 별도 connection이 `BEGIN IMMEDIATE`로 잠금을 잡고 있는 동안에도 busy timeout 안에서 후속 write가 정상 반영되는지 검증
 - 완료된 3개 구현 묶음: `src/context_book/handle.rs`, `src/context_book/service.rs`, `src/context_book/worker.rs`, `src/context_book/mod.rs`에 config/auth selector 변경 시 contract snapshot을 `Unknown`으로 무효화하고, service write 경로 및 reconnect 경로에서 최신 config/auth profile 기준으로 contract를 재검증하도록 보강
 - 완료된 3개 구현 묶음: `src/context_book/service.rs`에 config reload + auth profile rotation 이후 stale `NoWrite` contract가 새 endpoint/profile로 재검증되어 write가 복구되는 시나리오 테스트를 추가
-- 다음 턴 시작 지점: `8.5 Next Session Priorities`의 1번인 `repository-wide lib-test linker blocker 분리/우회 후 새 Phase 6 테스트 실행 재개`부터 진행한다.
-- 그 다음 우선순위는 `mDNS discovery resolve/connect 환경 문제를 정리하고 live Context Book endpoint를 다시 확보하는 것`이다.
 
-Validation completed for additional Phase 6 work on 2026-03-30:
-- `cargo fmt --all`
-- `cargo check --lib --tests`
+### Phase 7 (Discovery + Validation Recovery)
+- [x] mDNS browse 결과를 사용한 endpoint discovery + preflight 연결
+- [x] narrower component/live test path로 Context Book 검증 재개
+- [x] live Context Book bootstrap/contract 재검증
+
+Phase 7 current status (2026-03-30):
+- 완료된 3개 구현 묶음: `src/context_book/client.rs`에 `avahi-browse -rtp` 기반 discovery resolution을 추가해 canonical `_contextbook._tcp.local.` 설정을 Avahi 입력 형식으로 정규화하고, TXT metadata(`service`, `ver`, `api`, `path/health`, `priority`, `weight`)를 파싱해 compatible endpoint만 고른 뒤 unauthenticated preflight까지 확인하도록 보강
+- 완료된 3개 구현 묶음: `tests/component/context_book.rs`, `tests/live/context_book.rs`를 추가해 monolithic `lib test` 경로와 별도로 discovery bootstrap, handle refresh/revalidation, live bootstrap/contract smoke를 검증하는 narrower test path를 확보
+- 완료된 3개 구현 묶음: `src/context_book/service.rs` unit test mock들을 현재 contract revalidation 흐름에 맞게 갱신하고, `context_book::` lib tests를 실제 실행까지 복구
+- 라이브 검증으로 재확인된 환경 사실:
+  - `avahi-browse -rt _contextbook._tcp` → `context-book-local`, `127.0.1.1:8080`, `bootstrap=trusted-network+shared-secret`
+  - `curl -fsS http://127.0.1.1:8080/` → preflight 정상 (`service=context-book`, `status=ok`)
+  - `resolvectl mdns`는 여전히 global/link 모두 `no`이므로 hostname mDNS resolve 대신 Avahi browse가 반환한 resolved IP를 직접 사용하는 경로가 필요했고, 이번 턴 구현으로 그 제약을 우회함
+- 다음 턴 시작 지점: `8.5 Next Session Priorities`의 1번인 `repository-wide cargo test 실패를 일으키는 Bedrock env-coupled test 정리`부터 진행한다.
+- 그 다음 우선순위는 `discovery helper를 Avahi 외 환경으로 일반화할지 결정`하고, 마지막으로 `bootstrap secret rotation/auth profile switch의 live 운영 검증`을 이어가는 것이다.
+
+Validation completed for Phase 7 work on 2026-03-30:
+- `avahi-browse -rt _contextbook._tcp`
+- `resolvectl mdns`
+- `ss -ltnp | rg ':8080'`
+- `curl -fsS http://127.0.1.1:8080/`
+- `cargo check --test component --test live`
 - `cargo fmt --all -- --check`
 - `cargo clippy --all-targets -- -D warnings`
-- `cargo test` → repository-wide lib-test link 단계에서 실패했지만, 이번 턴 변경점 자체는 `cargo check --lib --tests`와 `cargo clippy --all-targets -- -D warnings`에서 통과
-- `avahi-browse -rt _contextbook._tcp` → live Context Book advertisement는 관측되지만 resolve 단계에서 timeout
-- `avahi-resolve -n context-book-local.local` → host resolve timeout
-- `curl -fsS http://127.0.1.1:8080/` → 기존 계획의 preflight endpoint는 현재 세션에서 연결 실패
-- `curl -v http://context-book-local.local:8080/` → endpoint resolve/connect 실패로 preflight 미확인
+- `cargo test --lib --no-run`
+- `cargo test context_book:: --lib`
+- `cargo test --test component context_book_ -- --nocapture`
+- `CONTEXT_BOOK_BOOTSTRAP_SHARED_SECRET=tercespartstoob CONTEXT_BOOK_LIVE_BASE_URL=http://127.0.1.1:8080 cargo test --test live context_book_live_bootstrap_and_contract_validation -- --ignored --nocapture`
 
 Validation blockers / recorded failures:
-- `cargo test context_book:: --lib` → repository-wide lib-test link 단계에서 실패. 현재 변경 범위를 넘어서는 `rust-lld: undefined hidden symbol ...` 오류가 다수 발생하며 `src/channels/*`, `src/tools/*`, `src/gateway/*` 등 광범위한 기존 오브젝트가 함께 링크되는 구간에서 재현됨
-- `cargo test` → 동일한 repository-wide lib-test linker blocker로 실패. 이번 턴에도 `rust-lld: undefined hidden symbol ...` 오류가 `src/tools/web_fetch.rs`, `src/agent/*`, `wiremock`, `reqwest` 등 광범위한 기존 test object link 구간에서 재현됨
-- 이번 턴에 추가한 새 테스트(`apply_event_sync_rolls_back_snapshot_changes_when_transaction_fails`, `store_handles_sqlite_write_contention_without_losing_updates`, `config_reload_and_auth_profile_rotation_revalidate_contract_before_writes`, `bootstrap_refreshes_resolved_contract_for_existing_handle`)는 코드/타입 수준에서는 `cargo check --lib --tests`와 clippy로 검증됐지만, 실제 실행은 위 repository-wide lib-test linker blocker 때문에 확인하지 못함
-- `avahi-browse -rtp _contextbook._tcp` / `avahi-resolve -n context-book-local.local` → advertisement는 보이나 host resolve가 timeout. 현재 세션의 `resolvectl mdns` 결과가 global/link 모두 `no`라서 mDNS resolution 환경 의존 이슈 가능성이 높음
-- `curl http://127.0.1.1:8080/` 및 `curl http://context-book-local.local:8080/` → 이번 세션에서는 live preflight endpoint 연결 실패. 따라서 context book live server는 광고는 있으나 실제 reachable endpoint를 아직 확보하지 못함
-- 위 실패들은 이번 Phase 6 구현 자체의 타입/정적 분석 실패라기보다 repository-wide linker blocker와 현재 세션의 mDNS/endpoint reachability 문제로 분류한다. 다음 스텝에서 전체 test 실행과 live bootstrap 검증을 재개하기 전에 둘 다 우선 정리하거나 우회할 필요가 있다
+- 이전 세션에서 재현되던 `rust-lld: undefined hidden symbol ...` 기반 repository-wide `lib test` linker blocker는 이번 세션에서 `cargo test --lib --no-run`과 `cargo test context_book:: --lib` 기준으로 재현되지 않았음
+- `cargo test`는 이제 linker blocker가 아니라 unrelated existing failure로 깨진다:
+  - `providers::bedrock::tests::bearer_token_from_env`
+  - `providers::bedrock::tests::chat_fails_without_credentials`
+- 위 두 실패는 Context Book 변경 경로와 직접 관련되지 않으며, 현재 환경의 Bedrock credential/env 영향 또는 기존 test isolation 문제로 분류한다. 다음 스텝에서 repository-wide green을 목표로 할 경우 우선 정리 대상이다
 
 ## 8.5 Next Session Priorities
 
 우선순위 순:
 
-1. repository-wide lib-test linker blocker 분리/우회
-- `cargo test`와 새 Context Book 테스트 실행을 막는 `rust-lld: undefined hidden symbol ...` 오류를 재현 최소화하고, 필요하면 narrower integration harness 또는 feature-gated test target으로 우회 경로를 만든다
-- linker blocker 해소 직후 이번 턴에 추가한 새 Phase 6 테스트와 기존 `context_book::` / live ignored test를 우선 재실행한다
+1. repository-wide `cargo test` failure 정리
+- 현재 남은 전체 테스트 실패는 Context Book이 아니라 `providers::bedrock::tests::bearer_token_from_env`와 `providers::bedrock::tests::chat_fails_without_credentials` 두 건이다
+- env 오염/credential isolation 문제인지 확인하고, 다음 턴 시작 직후 이 두 테스트를 최소 재현 후 고친다
 
-2. live Context Book endpoint 재확보
-- mDNS advertisement는 보이지만 resolve/connect가 안 되므로 `resolvectl mdns`, Avahi setup, 또는 manual endpoint override를 점검해 실제 reachable base URL을 다시 확보한다
-- live endpoint 확보 후 `curl preflight`, bootstrap/connect, status patch, events stream open을 순서대로 재검증한다
+2. discovery helper 일반화 여부 결정
+- 현재 구현은 Linux/Avahi 환경에서 `avahi-browse -rtp`를 사용한다
+- 다음 턴에는 이 경로를 유지할지, `dns-sd`/native DNS-SD fallback 또는 명시적 helper abstraction을 추가할지 결정하고 필요하면 문서/ops 예시를 보강한다
 
 3. 남은 운영 검증
 - bootstrap secret rotation이나 auth profile 전환을 실제 live server에 적용한 뒤, worker reconnect와 service-only write 경로에서 새 contract revalidation이 예상대로 일어나는지 확인한다

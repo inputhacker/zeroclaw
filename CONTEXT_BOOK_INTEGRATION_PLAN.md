@@ -68,29 +68,35 @@ Repository: `zeroclaw`
 ## 5. Requirement Mapping (User Req 1~6)
 
 ### Req 1: 디자인 훼손 최소화
+
 - `src/context_book` 신규 모듈 + 기존 `daemon`, `config`, `tools` 최소 확장
 - 기존 trait/factory/tool registry 패턴 유지
 - 기존 auth/secrets/health/doctor 경로를 재사용하고 중복 저장소를 만들지 않음
 
 ### Req 2: 다른 agent 구독 및 상태/context/vote 수집
+
 - `PUT /subscriptions`, `GET /subscriptions`
 - `GET /events/stream?agentId=...` 소비
 - control-plane/data-plane 라우팅 분리
 
 ### Req 3: memory 즉시 추가 금지, 필요 시 참조 보존
+
 - `context_book_cache.db`에 context/vote/event snapshot 저장
 - `memory_store` 자동 연동 금지
 - heartbeat/cron/tool 호출 시 조회하여 참조
 
 ### Req 4: 로컬 context posting/update/delete
+
 - `POST /contexts`, `PATCH /contexts/{contextId}`, `DELETE /contexts/{contextId}` 지원
 - author/Active 제약 및 에러 코드 처리
 
 ### Req 5: context 기반 action 검토 후 vote posting/update/delete
+
 - 로컬+원격 context 조회 후 정책 엔진(실행가능성/동의 판단)에서 vote 결정
 - `POST /votes`, `PATCH /votes/{voteId}`, `DELETE /votes/{voteId}` 지원
 
 ### Req 6: 다른 agent vote에 대한 casting
+
 - `POST /votes/{voteId}/cast` 지원
 - owner cast 금지 및 중복 cast 방지 전처리
 
@@ -273,6 +279,7 @@ Repository: `zeroclaw`
 ## 8. Implementation Phases
 
 ### Phase 1 (Foundation)
+
 - [x] `context_book` config + module skeleton + store + status tool
 - [x] daemon worker skeleton + health integration + doctor surface
 - [x] no-op SSE loop/diagnostics 먼저 통과
@@ -323,6 +330,7 @@ Additional validation for Phase 2 on 2026-03-29:
   - `POST /oauth2/token`은 `404 Not Found`로 응답하여 refresh contract 불일치 확인
 
 ### Phase 2 (Connectivity)
+
 - [x] bootstrap/connect/refresh + SSE consume + dedup + cursor persistence
 - [x] `connect`의 `403 BOOTSTRAP_APPROVAL_REQUIRED` reapproval flow 반영
 - [x] polling fallback + `409 CURSOR_NOT_FOUND` 처리
@@ -349,6 +357,7 @@ Phase 2 current status (2026-03-29):
 - 그 다음 우선순위는 `Phase 3`의 `query tools (contexts/votes/subscriptions/status)` 확장과 `read-through 정책 + cache freshness` 표면화다.
 
 ### Phase 3 (Subscriptions + Read Path)
+
 - [x] desired/effective subscription 관리
 - [x] events 기반 캐시 동기화
 - [x] query tools (`contexts/votes/subscriptions/status`)
@@ -395,6 +404,7 @@ Validation completed for Phase 3 and Phase 4 work on 2026-03-29:
 - Phase 5 구현/검증 중 repository-wide `clippy` blocker였던 `src/security/firejail.rs`의 `inefficient_to_string` lint를 정리해 전체 검증 경로를 정상화함
 
 ### Phase 4 (Write Path)
+
 - [x] context CRUD 툴/서비스
 - [x] vote CRUD + cast 툴/서비스
 - [x] 권한/제약(owner, Active, duplicate cast) 처리
@@ -409,6 +419,7 @@ Phase 4 current status (2026-03-29):
 - 그 다음 우선순위는 `Phase 6`의 `cast 예외 케이스 검증`, `observability/log redaction/성능 점검`, `SQLite contention / restart recovery 검증`이다.
 
 ### Phase 5 (Policy + Scheduler/Heartbeat Hook)
+
 - [x] 로컬+원격 context 기반 vote/cast 의사결정 헬퍼
 - [x] heartbeat/cron에서 필요 시 참조하는 read helper 추가
 - [x] memory 비침투 유지 검증
@@ -438,6 +449,7 @@ Validation completed for Phase 5 work on 2026-03-29:
 - `CONTEXT_BOOK_LIVE_BASE_URL=http://127.0.1.1:8080 cargo test live_client_bootstraps_against_context_book_server --lib -- --ignored --nocapture`
 
 ### Phase 6 (Conformance Tests + Hardening)
+
 - [x] resume/dedup/disconnect/subscription persistence tests
 - [x] cast 예외 케이스 검증
 - [x] observability/log redaction/성능 점검
@@ -454,6 +466,7 @@ Phase 6 current status (2026-03-30):
 - 완료된 3개 구현 묶음: `src/context_book/service.rs`에 config reload + auth profile rotation 이후 stale `NoWrite` contract가 새 endpoint/profile로 재검증되어 write가 복구되는 시나리오 테스트를 추가
 
 ### Phase 7 (Discovery + Validation Recovery)
+
 - [x] mDNS browse 결과를 사용한 endpoint discovery + preflight 연결
 - [x] narrower component/live test path로 Context Book 검증 재개
 - [x] live Context Book bootstrap/contract 재검증
@@ -490,6 +503,7 @@ Validation blockers / recorded failures:
 - 위 두 실패는 Context Book 변경 경로와 직접 관련되지 않으며, 현재 환경의 Bedrock credential/env 영향 또는 기존 test isolation 문제로 분류한다. 다음 스텝에서 repository-wide green을 목표로 할 경우 우선 정리 대상이다
 
 ### Phase 8 (Repository-wide Validation + Ops Verification)
+
 - [x] repository-wide `cargo test` failure triage + Bedrock env-coupled test 정리
 - [x] discovery helper 전략 결정 및 최소 가드 보강
 - [x] live auth profile rotation revalidation 검증
@@ -498,9 +512,10 @@ Phase 8 current status (2026-03-30):
 - 완료된 3개 구현 묶음: `src/providers/bedrock.rs` 테스트에 env lock을 추가하고 `chat_fails_without_credentials`를 env/IMDS 영향 없는 deterministic assertion으로 바꿔 repository-wide failure 원인이던 Bedrock env coupling을 제거
 - 완료된 3개 구현 묶음: `tests/component/context_book.rs`에 `avahi-browse` 부재 시 actionable error(`context_book.manual_url` fallback)를 검증하는 테스트를 추가하고, discovery 전략은 이번 턴 기준으로 "Linux/Avahi 유지 + 비지원 환경은 manual_url 명시"로 고정
 - 완료된 3개 구현 묶음: `tests/live/context_book.rs`에 live auth profile rotation 후 shared handle refresh, contract revalidation, service write/delete cleanup까지 검증하는 ignored live test를 추가하고 실제 서버(`127.0.1.1:8080`)에 대해 통과 확인
+- 완료된 3개 구현 묶음: `docs/reference/api/config-reference.md`, `docs/ops/operations-runbook.md`와 대응 `docs/vi/*` 문서에 Context Book config/ops contract를 반영해 `required` 문서 후속 작업을 닫음
 - 2026-03-30 후속 조치: `Cargo.toml`에 `[profile.test] incremental = false`를 추가해 Rust 1.87 + `rust-lld` 환경에서 재현되던 monolithic `bin "zeroclaw" test` hidden-symbol linker failure를 우회했다
 - 2026-03-30 확인 결과: `cargo test --bin zeroclaw --no-run`이 링크 단계까지 통과했고, 이전처럼 `rust-lld: error: undefined hidden symbol`로 즉시 실패하지 않는다
-- 다음 우선순위는 non-Linux 운영 요구가 실제로 생긴 경우에만 `dns-sd`/native DNS-SD fallback을 재검토하고, 마지막으로 bootstrap secret rotation 자체의 live 운영 절차를 별도 runbook/test로 확장하는 것이다.
+- 다음 우선순위는 bootstrap secret rotation 자체의 live 운영 절차를 별도 runbook/test로 확장하는 것이고, non-Linux 운영 요구가 실제로 생긴 경우에만 `dns-sd`/native DNS-SD fallback을 재검토한다.
 
 Validation completed for Phase 8 work on 2026-03-30:
 - `cargo test --lib providers::bedrock::tests::bearer_token_from_env -- --test-threads=1`
@@ -599,8 +614,8 @@ Validation blockers / recorded failures:
 - shared handle 생성/주입 구조 반영
 
 3. 운영/참고 문서
-- 필요 시 `docs/reference/api/config-reference.md`에 새 config 섹션 추가
-- daemon/doctor 출력이 바뀌면 관련 reference 또는 ops 문서 갱신
+- 2026-03-30 완료: `docs/reference/api/config-reference.md`와 대응 `docs/vi/config-reference.md`에 `[context_book]` 섹션 추가
+- 2026-03-30 완료: `docs/ops/operations-runbook.md`와 대응 `docs/vi/operations-runbook.md`에 daemon/doctor 관점의 운영 확인 항목 추가
 - 보안/로그 redaction 영향이 있으면 PR notes에 rollback 및 risk 명시
 
 ## 13. Session Restart Protocol

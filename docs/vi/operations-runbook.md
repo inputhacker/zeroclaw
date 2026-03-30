@@ -2,7 +2,7 @@
 
 Tài liệu này dành cho các operator chịu trách nhiệm duy trì tính sẵn sàng, tình trạng bảo mật và xử lý sự cố.
 
-Cập nhật lần cuối: **2026-02-18**.
+Cập nhật lần cuối: **2026-03-30**.
 
 ## Phạm vi
 
@@ -60,6 +60,31 @@ zeroclaw service status
 | Kết nối channel | `zeroclaw channel doctor` | các channel đã cấu hình đều khoẻ mạnh |
 | Tóm tắt runtime | `zeroclaw status` | provider/model/channels như mong đợi |
 | Heartbeat/trạng thái daemon | `~/.zeroclaw/daemon_state.json` | file được cập nhật định kỳ |
+| Sức khoẻ Context Book | `zeroclaw doctor` + khối `context_book` trong daemon state | instance đã bật hiển thị worker state, connection state, cache freshness và degraded contract nếu có |
+
+## Vận hành Context Book
+
+Dùng mục này khi bật `[context_book]`.
+
+- Cấu hình `context_book.manual_url` hoặc discovery, và luôn giới hạn truy cập outbound bằng `context_book.allowed_hosts`.
+- Với endpoint loopback hoặc private, đặt `context_book.allow_private_hosts = true`; nếu không client sẽ từ chối đích trước bước connect/bootstrap.
+- Bootstrap secret được đọc từ biến môi trường do `context_book.bootstrap_secret_env_key` chỉ định. Không ghi secret này vào `config.toml` hoặc shell history.
+- Daemon sở hữu subscription worker sống lâu. Các lần chạy CLI hoặc tool một lần vẫn có thể đọc/ghi trạng thái Context Book, nhưng không tự động khởi động SSE worker.
+- Context và vote lấy về được cache dưới `workspace/context_book/cache.db`; chúng không bị sao chép vào backend memory chuẩn.
+
+Kiểm tra dành cho operator:
+
+```bash
+zeroclaw doctor
+cat ~/.zeroclaw/daemon_state.json | jq '.context_book'
+```
+
+Cần theo dõi:
+
+- `connection_state` không quay lại `connected`
+- cache freshness của agents, contexts hoặc votes bị stale
+- degraded contract như `read_only`, `no_write`, `no_refresh`, hoặc `disconnect`
+- discovery thất bại và cần chuyển sang `manual_url`
 
 ## Log và Chẩn đoán
 
@@ -100,6 +125,12 @@ zeroclaw service start
 4. Nếu các channel vẫn thất bại, kiểm tra allowlist và thông tin xác thực trong `~/.zeroclaw/config.toml`.
 
 5. Nếu liên quan đến gateway, kiểm tra cài đặt bind/auth (`[gateway]`) và khả năng tiếp cận cục bộ.
+
+6. Nếu liên quan đến Context Book, kiểm tra:
+   - `context_book.allowed_hosts` có khớp host đã resolve hay không
+   - `context_book.allow_private_hosts = true` với endpoint loopback/private
+   - biến môi trường chứa bootstrap secret có tồn tại hay không
+   - `zeroclaw doctor` hoặc daemon state có báo `disconnect`, cache stale, hoặc cursor reset lặp lại hay không
 
 ## Quy trình Thay đổi An toàn
 

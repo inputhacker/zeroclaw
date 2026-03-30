@@ -321,6 +321,55 @@ Lưu ý:
 - Phân tích toán tử/dấu phân cách shell nhận biết dấu ngoặc kép. Ký tự như `;` trong đối số được trích dẫn được xử lý là ký tự, không phải dấu phân cách lệnh.
 - Toán tử chuỗi shell không trích dẫn vẫn được kiểm tra bởi policy (`;`, `|`, `&&`, `||`, chạy nền và chuyển hướng).
 
+## `[context_book]`
+
+| Khóa | Mặc định | Mục đích |
+|---|---|---|
+| `enabled` | `false` | Bật tích hợp Context Book |
+| `manual_url` | chưa đặt | Ghi đè URL gốc của máy chủ Context Book |
+| `discovery_enabled` | `true` | Cho phép discovery endpoint khi chưa đặt `manual_url` |
+| `service_type` | `"_contextbook._tcp.local."` | Kiểu dịch vụ DNS-SD dùng cho discovery |
+| `subscription_mode` | `manual` | Chế độ quản lý subscription mong muốn (`manual` hoặc `auto`) |
+| `subscription_seed` | `[]` | Danh sách producer agent ID nạp trước lần đồng bộ đầu tiên |
+| `forward_to_host` | `false` | Cờ dự phòng cho host forwarding; runtime mặc định vẫn chỉ sync |
+| `polling_fallback_enabled` | `true` | Dùng `GET /events` chỉ khi SSE không khả dụng |
+| `reconnect_backoff_ms` | `1000` | Backoff reconnect ban đầu tính bằng mili giây |
+| `max_reconnect_backoff_ms` | `30000` | Backoff reconnect tối đa tính bằng mili giây |
+| `cursor_not_found_policy` | `reset` | Hành vi khi máy chủ từ chối resume cursor cục bộ |
+| `bootstrap_secret_env_key` | `"CONTEXT_BOOK_BOOTSTRAP_SECRET"` | Tên biến môi trường dùng để đọc bootstrap secret |
+| `auth_profile` | chưa đặt | Auth profile sẵn có được tái sử dụng cho bearer/refresh |
+| `allowed_hosts` | `[]` | Allowlist cho host Context Book được discovery hoặc cấu hình tay |
+| `allow_private_hosts` | `false` | Cho phép endpoint loopback/private/link-local |
+| `agent_identity_override.agent_id` | chưa đặt | Ghi đè agent ID runtime báo cáo lên Context Book |
+| `agent_identity_override.device_type` | chưa đặt | Ghi đè device type được báo cáo |
+| `agent_identity_override.display_name` | chưa đặt | Ghi đè display name được báo cáo |
+
+Lưu ý:
+
+- Context Book dùng cache DB riêng tại `workspace/context_book/cache.db`; context và vote lấy về sẽ không tự động được ghi vào backend memory thông thường.
+- Subscription worker sống lâu thuộc quyền sở hữu của daemon. Các đường chạy không có daemon vẫn có thể đọc/ghi qua tool hoặc service, nhưng không tự động khởi động SSE worker.
+- Kiểm tra host là deny-by-default. Hãy khai báo rõ `allowed_hosts`, và đặt `allow_private_hosts = true` khi dùng loopback hoặc địa chỉ RFC1918 như `127.0.0.1`.
+- Discovery hiện dùng Linux/Avahi. Trên máy không phải Linux hoặc không có Avahi, hãy đặt `manual_url` thay vì dựa vào discovery.
+- Sai khác runtime contract có thể xuất hiện dưới dạng degraded mode trong `zeroclaw doctor` hoặc output trạng thái daemon. Ví dụ, deployment không hỗ trợ token refresh vẫn dùng được ở chế độ `no_refresh`.
+- Helper của heartbeat và cron có thể đọc tham chiếu policy từ Context Book, nhưng chat turn thông thường của người dùng không tự động chèn dữ liệu Context Book vào prompt.
+
+```toml
+[context_book]
+enabled = true
+manual_url = "http://127.0.0.1:8080"
+discovery_enabled = false
+allowed_hosts = ["127.0.0.1"]
+allow_private_hosts = true
+subscription_mode = "manual"
+subscription_seed = ["agent-alpha", "agent-beta"]
+auth_profile = "context-book"
+
+[context_book.agent_identity_override]
+agent_id = "zeroclaw-daemon"
+device_type = "notepc"
+display_name = "ZeroClaw Daemon"
+```
+
 ## `[memory]`
 
 | Khóa | Mặc định | Mục đích |

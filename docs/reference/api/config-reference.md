@@ -492,6 +492,55 @@ forbidden_paths = ["/etc", "/root", "/proc", "/sys", "~/.ssh", "~/.gnupg", "~/.a
 allowed_roots = ["~/Desktop/projects", "/opt/shared-repo"]
 ```
 
+## `[context_book]`
+
+| Key | Default | Purpose |
+|---|---|---|
+| `enabled` | `false` | Enable Context Book integration |
+| `manual_url` | unset | Explicit base URL override for the Context Book server |
+| `discovery_enabled` | `true` | Allow endpoint discovery when `manual_url` is unset |
+| `service_type` | `"_contextbook._tcp.local."` | DNS-SD service type used for discovery |
+| `subscription_mode` | `manual` | Desired subscription management mode (`manual` or `auto`) |
+| `subscription_seed` | `[]` | Initial producer agent IDs to persist before first sync |
+| `forward_to_host` | `false` | Reserved host-forwarding toggle; default runtime remains sync-only |
+| `polling_fallback_enabled` | `true` | Use `GET /events` only while SSE is unavailable |
+| `reconnect_backoff_ms` | `1000` | Initial reconnect backoff in milliseconds |
+| `max_reconnect_backoff_ms` | `30000` | Maximum reconnect backoff in milliseconds |
+| `cursor_not_found_policy` | `reset` | Behavior when the server rejects the local resume cursor |
+| `bootstrap_secret_env_key` | `"CONTEXT_BOOK_BOOTSTRAP_SECRET"` | Env var name used to read the bootstrap secret |
+| `auth_profile` | unset | Existing auth profile reused for bearer/refresh state |
+| `allowed_hosts` | `[]` | Allowlist for discovered or manually configured Context Book hosts |
+| `allow_private_hosts` | `false` | Allow loopback/private/link-local Context Book endpoints |
+| `agent_identity_override.agent_id` | unset | Override the runtime agent ID reported to Context Book |
+| `agent_identity_override.device_type` | unset | Override the reported device type |
+| `agent_identity_override.display_name` | unset | Override the reported display name |
+
+Notes:
+
+- Context Book uses a dedicated cache database under `workspace/context_book/cache.db`; it does not auto-write fetched context or votes into the normal memory backend.
+- The long-lived subscription worker is daemon-owned. Non-daemon paths may read/write through tools and services, but they do not auto-start the SSE worker.
+- Host validation is deny-by-default. Set `allowed_hosts` explicitly, and set `allow_private_hosts = true` when using loopback or RFC1918 targets such as `127.0.0.1`.
+- Discovery currently uses Linux/Avahi. On non-Linux or Avahi-less hosts, set `manual_url` instead of relying on discovery.
+- Runtime contract mismatches can surface as degraded modes in `zeroclaw doctor` or daemon state output. For example, deployments without token refresh support remain usable in `no_refresh` mode.
+- Heartbeat and cron helpers may read Context Book policy references, but regular user chat turns do not auto-inject Context Book data into prompts.
+
+```toml
+[context_book]
+enabled = true
+manual_url = "http://127.0.0.1:8080"
+discovery_enabled = false
+allowed_hosts = ["127.0.0.1"]
+allow_private_hosts = true
+subscription_mode = "manual"
+subscription_seed = ["agent-alpha", "agent-beta"]
+auth_profile = "context-book"
+
+[context_book.agent_identity_override]
+agent_id = "zeroclaw-daemon"
+device_type = "notepc"
+display_name = "ZeroClaw Daemon"
+```
+
 ## `[memory]`
 
 | Key | Default | Purpose |

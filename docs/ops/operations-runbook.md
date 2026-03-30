@@ -2,7 +2,7 @@
 
 This runbook is for operators who maintain availability, security posture, and incident response.
 
-Last verified: **February 18, 2026**.
+Last verified: **March 30, 2026**.
 
 ## Scope
 
@@ -118,6 +118,31 @@ zeroclaw service status
 | Channel connectivity | `zeroclaw channel doctor` | configured channels healthy |
 | Runtime summary | `zeroclaw status` | expected provider/model/channels |
 | Daemon heartbeat/state | `~/.zeroclaw/daemon_state.json` | file updates periodically |
+| Context Book health | `zeroclaw doctor` + daemon state `context_book` block | enabled instances show worker state, connection state, cache freshness, and any degraded contract flags |
+
+## Context Book Operations
+
+Use this section when `[context_book]` is enabled.
+
+- Configure either `context_book.manual_url` or discovery, and always scope outbound access with `context_book.allowed_hosts`.
+- For loopback or private endpoints, set `context_book.allow_private_hosts = true`; otherwise the client rejects the target before connect/bootstrap.
+- The bootstrap secret is read from the env var named by `context_book.bootstrap_secret_env_key`. Keep it out of `config.toml` and shell history.
+- The daemon owns the long-lived subscription worker. One-shot CLI or tool executions can query and write Context Book state, but they do not start the SSE worker automatically.
+- Fetched contexts and votes are cached under `workspace/context_book/cache.db`; they are not copied into the standard memory backend.
+
+Operator checks:
+
+```bash
+zeroclaw doctor
+cat ~/.zeroclaw/daemon_state.json | jq '.context_book'
+```
+
+Watch for:
+
+- `connection_state` not returning to `connected`
+- stale cache freshness for agents, contexts, or votes
+- degraded contract states such as `read_only`, `no_write`, `no_refresh`, or `disconnect`
+- discovery failures that require a `manual_url` override
 
 ## Logs and Diagnostics
 
@@ -158,6 +183,12 @@ zeroclaw service start
 4. If channels still fail, verify allowlists and credentials in `~/.zeroclaw/config.toml`.
 
 5. If gateway is involved, verify bind/auth settings (`[gateway]`) and local reachability.
+
+6. If Context Book is involved, verify:
+   - `context_book.allowed_hosts` matches the resolved host
+   - `context_book.allow_private_hosts = true` for loopback/private endpoints
+   - the bootstrap secret env var is present
+   - `zeroclaw doctor` or daemon state does not show `disconnect` / stale cache / repeated cursor resets
 
 ## Safe Change Procedure
 

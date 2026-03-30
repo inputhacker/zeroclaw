@@ -46,6 +46,12 @@ pub struct ContextBookSession {
     pub expires_at: Option<DateTime<Utc>>,
 }
 
+#[derive(Debug, Clone)]
+pub struct ContextBookRuntimeInspection {
+    pub contract: ContextBookContractSnapshot,
+    pub subscriptions: ContextBookSubscriptionsSnapshot,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ContextBookAgentStatusSnapshot {
     pub agent_id: String,
@@ -887,10 +893,10 @@ impl ContextBookClient {
             .map_err(|error| self.contract_error(format!("invalid vote payload: {error}")))
     }
 
-    pub async fn validate_runtime_contract(
+    pub async fn inspect_runtime_contract(
         &self,
         session: &ContextBookSession,
-    ) -> Result<ContextBookContractSnapshot, ContextBookClientError> {
+    ) -> Result<ContextBookRuntimeInspection, ContextBookClientError> {
         let current_agent = self.current_agent_status(session).await?;
         let subscriptions = self.fetch_subscriptions_response(session).await?;
         let cursor_not_found_returns_409 = self.probe_cursor_not_found_contract(session).await?;
@@ -954,17 +960,27 @@ impl ContextBookClient {
             ContextBookContractValidationState::Degraded
         };
 
-        Ok(ContextBookContractSnapshot {
-            validation_state,
-            checked_at: Some(Utc::now().to_rfc3339()),
-            lifecycle_connection_split,
-            subscriptions_desired_effective_split: subscriptions_split,
-            cursor_not_found_returns_409: Some(cursor_not_found_returns_409),
-            vote_deleted_supported: Some(vote_deleted_supported),
-            refresh_mode,
-            degraded_modes,
-            notes,
+        Ok(ContextBookRuntimeInspection {
+            contract: ContextBookContractSnapshot {
+                validation_state,
+                checked_at: Some(Utc::now().to_rfc3339()),
+                lifecycle_connection_split,
+                subscriptions_desired_effective_split: subscriptions_split,
+                cursor_not_found_returns_409: Some(cursor_not_found_returns_409),
+                vote_deleted_supported: Some(vote_deleted_supported),
+                refresh_mode,
+                degraded_modes,
+                notes,
+            },
+            subscriptions: subscriptions.into_snapshot(),
         })
+    }
+
+    pub async fn validate_runtime_contract(
+        &self,
+        session: &ContextBookSession,
+    ) -> Result<ContextBookContractSnapshot, ContextBookClientError> {
+        Ok(self.inspect_runtime_contract(session).await?.contract)
     }
 
     async fn current_agent_status(

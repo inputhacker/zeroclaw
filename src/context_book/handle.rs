@@ -278,6 +278,9 @@ impl ContextBookHandleState {
         let error = error.into();
         self.update_runtime(|runtime| {
             runtime.worker_state = "error".to_string();
+            runtime.lifecycle_state = "inactive".to_string();
+            runtime.connection_state = "disconnected".to_string();
+            runtime.shutdown_requested = false;
             runtime.status_message = Some("context_book worker error".to_string());
             runtime.last_error = Some(error);
         });
@@ -435,5 +438,35 @@ fn degraded_mode_name(mode: ContextBookDegradedMode) -> &'static str {
         ContextBookDegradedMode::NoRefresh => "no_refresh",
         ContextBookDegradedMode::NoWrite => "no_write",
         ContextBookDegradedMode::Disconnect => "disconnect",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::Config;
+    use tempfile::TempDir;
+
+    #[test]
+    fn mark_error_clears_active_connection_state() {
+        let tmp = TempDir::new().expect("temp dir");
+        let mut config = Config {
+            workspace_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.context_book.enabled = true;
+
+        let handle = crate::context_book::bootstrap(&config).handle;
+        handle.mark_stream_connected("workspace", "context_book SSE connected");
+        handle.mark_error("failed to read Context Book SSE chunk");
+
+        let snapshot = handle.snapshot();
+        assert_eq!(snapshot.worker_state, "error");
+        assert_eq!(snapshot.lifecycle_state, "inactive");
+        assert_eq!(snapshot.connection_state, "disconnected");
+        assert_eq!(
+            snapshot.last_error.as_deref(),
+            Some("failed to read Context Book SSE chunk")
+        );
     }
 }

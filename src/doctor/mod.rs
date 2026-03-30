@@ -614,6 +614,18 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
             ));
         }
     }
+
+    if config.context_book.enabled
+        && matches!(
+            config.context_book.subscription_mode,
+            crate::config::ContextBookSubscriptionMode::Auto
+        )
+    {
+        items.push(DiagItem::warn(
+            cat,
+            "context_book.subscription_mode=auto is configured, but automatic subscription reconciliation is not implemented yet",
+        ));
+    }
 }
 
 fn provider_validation_error(name: &str) -> Option<String> {
@@ -1600,6 +1612,26 @@ mod tests {
         assert_eq!(agent_messages.len(), 2);
         assert!(agent_messages[0].contains("agent \"alpha\""));
         assert!(agent_messages[1].contains("agent \"zeta\""));
+    }
+
+    #[test]
+    fn config_validation_warns_context_book_auto_subscription_mode_is_unimplemented() {
+        let mut config = Config::default();
+        config.context_book.enabled = true;
+        config.context_book.subscription_mode = crate::config::ContextBookSubscriptionMode::Auto;
+
+        let mut items = Vec::new();
+        check_config_semantics(&config, &mut items);
+
+        let item = items.iter().find(|item| {
+            item.message
+                .contains("automatic subscription reconciliation is not implemented yet")
+        });
+        assert!(item.is_some());
+        assert_eq!(
+            item.expect("auto subscription warning").severity,
+            Severity::Warn
+        );
     }
 
     #[test]

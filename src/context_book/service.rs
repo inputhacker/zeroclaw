@@ -430,14 +430,22 @@ impl ContextBookService {
             .map_err(anyhow::Error::new)
             .with_context(|| format!("failed to activate Context Book agent before {operation}"))?;
         if self.contract_revalidation_required(&session.agent_id) {
-            let contract = client
-                .validate_runtime_contract(&session)
+            let inspection = client
+                .inspect_runtime_contract(&session)
                 .await
                 .map_err(anyhow::Error::new)
                 .with_context(|| {
                     format!("failed to revalidate Context Book contract before {operation}")
                 })?;
-            self.handle.apply_contract_snapshot(contract);
+            self.handle.apply_contract_snapshot(inspection.contract);
+            self.handle
+                .store()
+                .save_subscriptions(&inspection.subscriptions)
+                .with_context(|| {
+                    format!(
+                        "failed to persist Context Book subscriptions during contract revalidation before {operation}"
+                    )
+                })?;
         }
         self.ensure_remote_writes_available(operation)?;
         Ok((client, session))

@@ -179,16 +179,21 @@ async fn connect_and_sync_once(
         .await
         .map_err(anyhow::Error::new)
         .context("failed to activate Context Book agent")?;
-    let contract = client
-        .validate_runtime_contract(&session)
+    let inspection = client
+        .inspect_runtime_contract(&session)
         .await
         .map_err(anyhow::Error::new)
         .context("failed to validate Context Book runtime contract")?;
-    let disconnect_required = contract
+    let disconnect_required = inspection
+        .contract
         .degraded_modes
         .contains(&ContextBookDegradedMode::Disconnect);
-    let validation_state = contract.validation_state;
-    handle.apply_contract_snapshot(contract);
+    let validation_state = inspection.contract.validation_state;
+    handle.apply_contract_snapshot(inspection.contract);
+    handle
+        .store()
+        .save_subscriptions(&inspection.subscriptions)
+        .context("failed to persist contract-validated Context Book subscriptions")?;
     persist_runtime_state(handle)?;
     if disconnect_required {
         anyhow::bail!("Context Book runtime contract validation requires disconnect");
@@ -412,6 +417,7 @@ mod tests {
     use crate::context_book::shared_handle;
     use axum::{
         Router,
+        body::Body,
         extract::Query,
         extract::State,
         http::{HeaderMap, StatusCode},
@@ -647,6 +653,19 @@ mod tests {
             .expect("cached contexts");
         assert_eq!(cached_contexts.items.len(), 1);
         assert_eq!(cached_contexts.items[0].context_id, "ctx-100");
+        let cached_subscriptions = handle
+            .store()
+            .load_subscriptions()
+            .expect("load cached subscriptions")
+            .expect("cached subscriptions");
+        assert_eq!(
+            cached_subscriptions.desired_producer_agent_ids,
+            vec!["peer-a".to_string()]
+        );
+        assert_eq!(
+            cached_subscriptions.effective_producer_agent_ids,
+            vec!["peer-a".to_string()]
+        );
         assert!(status.persisted_runtime.as_ref().is_some_and(|runtime| {
             runtime.worker_state == "stopped"
                 && runtime.last_event_id.as_deref() == Some("evt-100")
@@ -964,6 +983,158 @@ mod tests {
             .expect("load cached contexts")
             .expect("cached contexts after restart");
         assert_eq!(cached_contexts.items.len(), 2);
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn worker_error_state_clears_active_connection_status() {
+        async fn patch_status() -> impl IntoResponse {
+            axum::Json(serde_json::json!({"ok": true}))
+        }
+
+        async fn agents() -> impl IntoResponse {
+            axum::Json(serde_json::json!([
+                {
+                    "agentId": "workspace",
+                    "lifecycleState": "Active",
+                    "connectionState": "Disconnected"
+                }
+            ]))
+        }
+
+        async fn subscriptions() -> impl IntoResponse {
+            axum::Json(serde_json::json!({
+                "consumerAgentId": "workspace",
+                "desiredProducerAgentIds": ["peer-a"],
+                "effectiveProducerAgentIds": ["peer-a"]
+            }))
+        }
+
+        async fn delete_vote_probe() -> impl IntoResponse {
+            (
+                StatusCode::NOT_FOUND,
+                axum::Json(serde_json::json!({
+                    "error": {
+                        "code": "VOTE_NOT_FOUND",
+                        "message": "missing vote"
+                    }
+                })),
+            )
+        }
+
+        async fn legacy_refresh() -> impl IntoResponse {
+            (
+                StatusCode::BAD_REQUEST,
+                axum::Json(serde_json::json!({
+                    "error": {
+                        "code": "REFRESH_TOKEN_REQUIRED",
+                        "message": "missing refresh token"
+                    }
+                })),
+            )
+        }
+
+        async fn events_probe() -> impl IntoResponse {
+            (
+                StatusCode::CONFLICT,
+                axum::Json(serde_json::json!({
+                    "error": {
+                        "code": "CURSOR_NOT_FOUND",
+                        "message": "missing cursor"
+                    }
+                })),
+            )
+        }
+
+        async fn events_stream() -> impl IntoResponse {
+            (
+                StatusCode::OK,
+                [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                Body::from_stream(futures_util::stream::iter(vec![Err::<
+                    axum::body::Bytes,
+                    std::io::Error,
+                >(
+                    std::io::Error::new(std::io::ErrorKind::ConnectionReset, "boom"),
+                )])),
+            )
+                .into_response()
+        }
+
+        let app_state = WorkerAppState {
+            poll_calls: Arc::new(AtomicUsize::new(0)),
+        };
+        let app = Router::new()
+            .route("/agents/workspace/status", patch(patch_status))
+            .route("/agents", get(agents))
+            .route("/subscriptions", get(subscriptions))
+            .route("/events/stream", get(events_stream))
+            .route("/events", get(events_probe))
+            .route("/votes/{vote_id}", axum::routing::delete(delete_vote_probe))
+            .route("/auth/refresh", post(legacy_refresh))
+            .with_state(app_state);
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve axum");
+        });
+
+        let tmp = TempDir::new().expect("temp dir");
+        let config = test_config(&tmp, format!("http://{addr}"));
+        let state_dir = state_dir_from_config(&config);
+        let auth_store = AuthProfilesStore::new(&state_dir, config.secrets.encrypt);
+        auth_store
+            .upsert_profile(
+                AuthProfile {
+                    id: profile_id("context-book", "default"),
+                    provider: "context-book".into(),
+                    profile_name: "default".into(),
+                    kind: AuthProfileKind::OAuth,
+                    account_id: None,
+                    workspace_id: None,
+                    token_set: Some(TokenSet {
+                        access_token: "error-token".into(),
+                        refresh_token: Some("error-refresh".into()),
+                        id_token: None,
+                        expires_at: Some(Utc::now() + ChronoDuration::minutes(30)),
+                        token_type: None,
+                        scope: None,
+                    }),
+                    token: None,
+                    metadata: BTreeMap::from([("agent_id".to_string(), "workspace".to_string())]),
+                    created_at: Utc::now(),
+                    updated_at: Utc::now(),
+                },
+                true,
+            )
+            .await
+            .expect("seed worker auth profile");
+
+        let handle = shared_handle(&config);
+        let shutdown = CancellationToken::new();
+        let worker = tokio::spawn(run(config, handle.clone(), Some(shutdown.child_token())));
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        shutdown.cancel();
+        let result = worker.await.expect("worker join");
+
+        assert!(result.is_ok());
+        let status = handle.status_report();
+        assert_eq!(status.runtime.worker_state, "stopped");
+        let persisted_runtime = status
+            .persisted_runtime
+            .expect("persisted runtime after stream error");
+        assert_eq!(persisted_runtime.lifecycle_state, "inactive");
+        assert_eq!(persisted_runtime.connection_state, "disconnected");
+        assert!(
+            persisted_runtime
+                .last_error
+                .as_deref()
+                .is_some_and(|error| error.contains("failed to read Context Book SSE chunk"))
+        );
 
         server.abort();
         let _ = server.await;

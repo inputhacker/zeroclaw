@@ -498,8 +498,9 @@ Phase 8 current status (2026-03-30):
 - 완료된 3개 구현 묶음: `src/providers/bedrock.rs` 테스트에 env lock을 추가하고 `chat_fails_without_credentials`를 env/IMDS 영향 없는 deterministic assertion으로 바꿔 repository-wide failure 원인이던 Bedrock env coupling을 제거
 - 완료된 3개 구현 묶음: `tests/component/context_book.rs`에 `avahi-browse` 부재 시 actionable error(`context_book.manual_url` fallback)를 검증하는 테스트를 추가하고, discovery 전략은 이번 턴 기준으로 "Linux/Avahi 유지 + 비지원 환경은 manual_url 명시"로 고정
 - 완료된 3개 구현 묶음: `tests/live/context_book.rs`에 live auth profile rotation 후 shared handle refresh, contract revalidation, service write/delete cleanup까지 검증하는 ignored live test를 추가하고 실제 서버(`127.0.1.1:8080`)에 대해 통과 확인
-- 다음 턴 시작 지점: repository-wide `cargo test`를 막는 `bin "zeroclaw" test` linker blocker 조사부터 시작한다.
-- 그 다음 우선순위는 non-Linux 운영 요구가 실제로 생긴 경우에만 `dns-sd`/native DNS-SD fallback을 재검토하고, 마지막으로 bootstrap secret rotation 자체의 live 운영 절차를 별도 runbook/test로 확장하는 것이다.
+- 2026-03-30 후속 조치: `Cargo.toml`에 `[profile.test] incremental = false`를 추가해 Rust 1.87 + `rust-lld` 환경에서 재현되던 monolithic `bin "zeroclaw" test` hidden-symbol linker failure를 우회했다
+- 2026-03-30 확인 결과: `cargo test --bin zeroclaw --no-run`이 링크 단계까지 통과했고, 이전처럼 `rust-lld: error: undefined hidden symbol`로 즉시 실패하지 않는다
+- 다음 우선순위는 non-Linux 운영 요구가 실제로 생긴 경우에만 `dns-sd`/native DNS-SD fallback을 재검토하고, 마지막으로 bootstrap secret rotation 자체의 live 운영 절차를 별도 runbook/test로 확장하는 것이다.
 
 Validation completed for Phase 8 work on 2026-03-30:
 - `cargo test --lib providers::bedrock::tests::bearer_token_from_env -- --test-threads=1`
@@ -511,12 +512,12 @@ Validation completed for Phase 8 work on 2026-03-30:
 - `CONTEXT_BOOK_BOOTSTRAP_SHARED_SECRET=tercespartstoob CONTEXT_BOOK_LIVE_BASE_URL=http://127.0.1.1:8080 cargo test --test live context_book_live_auth_profile_rotation_revalidates_writes -- --ignored --nocapture`
 - `cargo fmt --all -- --check`
 - `cargo clippy --all-targets -- -D warnings`
+- `cargo test --bin zeroclaw --no-run` → 통과 (`Finished 'test' profile ...`, `Executable unittests src/main.rs (...)`)
+- `cargo test` → 이전 repository-wide linker blocker 지점(`bin "zeroclaw" test`)을 넘어 전체 test target 재컴파일/실행 단계로 진행 중; 문서 작성 시점에는 long-running compile/test pass를 계속 수행 중
 
 Validation blockers / recorded failures:
-- `cargo test`는 Bedrock env failure가 아니라 repository-wide linker blocker로 실패:
-  - `bin "zeroclaw" test` link 단계에서 `rust-lld: error: undefined hidden symbol`가 재현됨
-  - 대표 참조 위치: `src/hardware/protocol.rs:48`, `src/providers/azure_openai.rs:42`, `src/memory/qdrant.rs:199`, `src/agent/history_pruner.rs:21`
-  - 이번 턴 Context Book/Bedrock 테스트 수정과 직접 관련된 증거는 없으므로, 다음 스텝에서 전역 linker 회귀 또는 toolchain/cache 상태 문제로 분리 조사한다
+- 2026-03-30 기준 기존 repository-wide linker blocker였던 `bin "zeroclaw" test`의 `rust-lld: error: undefined hidden symbol` 재현은 `[profile.test] incremental = false` 적용 후 `cargo test --bin zeroclaw --no-run` 기준으로 해소됨
+- 남은 확인 과제는 "link 실패 재현"이 아니라 repository-wide `cargo test` 전체 실행 시간을 포함한 end-to-end green 여부 최종 확인이다
 
 ## 9. Testing & Verification Checklist
 

@@ -287,6 +287,13 @@ ci-all = [
 incremental = true
 opt-level = 1
 
+[profile.test]
+# Rust 1.87 + rust-lld has intermittently produced undefined hidden symbol
+# failures when linking the monolithic `bin "zeroclaw" test` target with
+# incremental artifacts enabled. Keep dev builds incremental, but force
+# deterministic test artifacts.
+incremental = false
+
 [profile.release]
 opt-level = "z"      # Optimize for size
 lto = "fat"          # Maximum cross-crate optimization for smaller binaries

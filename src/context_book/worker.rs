@@ -3,8 +3,10 @@ use super::client::{ContextBookClient, ContextBookClientErrorKind};
 use super::events::{ContextBookSseParser, ParsedContextBookSseFrame};
 use super::handle::{ContextBookContractValidationState, ContextBookDegradedMode};
 use super::service::ContextBookStatusReport;
-use super::store::ContextBookEventSyncUpdate;
-use crate::config::Config;
+use super::store::{
+    ContextBookAgentSnapshot, ContextBookEventSyncUpdate, ContextBookSubscriptionsSnapshot,
+};
+use crate::config::{Config, ContextBookSubscriptionMode};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use futures_util::StreamExt;
@@ -33,6 +35,7 @@ pub async fn run(
         .store()
         .initialize()
         .context("failed to initialize context_book store")?;
+    seed_configured_subscriptions_if_missing(&handle)?;
     handle.set_store_initialized(true);
     handle.restore_persisted_runtime();
     handle.mark_idle("context_book worker initialized; waiting for connectivity");
@@ -189,10 +192,19 @@ async fn connect_and_sync_once(
         .degraded_modes
         .contains(&ContextBookDegradedMode::Disconnect);
     let validation_state = inspection.contract.validation_state;
+    let auto_write_allowed = auto_subscription_writes_allowed(&inspection.contract.degraded_modes);
+    let mut subscriptions = inspection.subscriptions;
+    if auto_write_allowed
+        && let Some(reconciled) =
+            reconcile_auto_subscriptions(&client, &session, handle, Some(&subscriptions), None)
+                .await?
+    {
+        subscriptions = reconciled;
+    }
     handle.apply_contract_snapshot(inspection.contract);
     handle
         .store()
-        .save_subscriptions(&inspection.subscriptions)
+        .save_subscriptions(&subscriptions)
         .context("failed to persist contract-validated Context Book subscriptions")?;
     persist_runtime_state(handle)?;
     if disconnect_required {
@@ -269,7 +281,8 @@ async fn consume_sse_stream(
                         match frame {
                             ParsedContextBookSseFrame::Heartbeat => {}
                             ParsedContextBookSseFrame::Event(event) => {
-                                let update = build_event_sync_update(client, session, &event)
+                                let update =
+                                    build_event_sync_update(client, session, handle, &event)
                                     .await
                                     .with_context(|| {
                                         format!(
@@ -310,7 +323,7 @@ async fn poll_once(
         .map_err(anyhow::Error::new)
         .context("failed to poll Context Book events")?;
     for event in events {
-        let update = build_event_sync_update(client, session, &event)
+        let update = build_event_sync_update(client, session, handle, &event)
             .await
             .with_context(|| {
                 format!(
@@ -353,6 +366,7 @@ async fn cancel_or_never(shutdown: Option<&CancellationToken>) {
 async fn build_event_sync_update(
     client: &ContextBookClient,
     session: &super::client::ContextBookSession,
+    handle: &ContextBookHandle,
     event: &super::events::ContextBookEventEnvelope,
 ) -> Result<ContextBookEventSyncUpdate> {
     let mut update = ContextBookEventSyncUpdate::default();
@@ -367,22 +381,30 @@ async fn build_event_sync_update(
             );
         }
         "agent.registered" | "agent.status.changed" | "agent.connection.changed" => {
-            update.agents = Some(
-                client
-                    .get_agents(session)
-                    .await
-                    .map_err(anyhow::Error::new)
-                    .context("failed to refresh agents after agent event")?,
-            );
+            let agents = client
+                .get_agents(session)
+                .await
+                .map_err(anyhow::Error::new)
+                .context("failed to refresh agents after agent event")?;
+            if auto_subscription_writes_allowed(&handle.contract_snapshot().degraded_modes) {
+                update.subscriptions =
+                    reconcile_auto_subscriptions(client, session, handle, None, Some(&agents))
+                        .await?;
+            }
+            update.agents = Some(agents);
         }
         "agent.unregistered" => {
-            update.agents = Some(
-                client
-                    .get_agents(session)
-                    .await
-                    .map_err(anyhow::Error::new)
-                    .context("failed to refresh agents after agent.unregistered")?,
-            );
+            let agents = client
+                .get_agents(session)
+                .await
+                .map_err(anyhow::Error::new)
+                .context("failed to refresh agents after agent.unregistered")?;
+            if auto_subscription_writes_allowed(&handle.contract_snapshot().degraded_modes) {
+                update.subscriptions =
+                    reconcile_auto_subscriptions(client, session, handle, None, Some(&agents))
+                        .await?;
+            }
+            update.agents = Some(agents);
         }
         "context.created" | "context.updated" | "context.deleted" => {
             update.contexts = Some(
@@ -405,6 +427,144 @@ async fn build_event_sync_update(
         _ => {}
     }
     Ok(update)
+}
+
+fn seed_configured_subscriptions_if_missing(handle: &ContextBookHandle) -> Result<()> {
+    if handle
+        .store()
+        .load_subscriptions()
+        .context("failed to inspect cached subscriptions before seeding")?
+        .is_some()
+    {
+        return Ok(());
+    }
+
+    let desired = configured_seed_agent_ids(&handle.resolved_config());
+    if desired.is_empty() {
+        return Ok(());
+    }
+
+    handle
+        .store()
+        .save_subscriptions(&ContextBookSubscriptionsSnapshot {
+            consumer_agent_id: None,
+            desired_producer_agent_ids: desired,
+            effective_producer_agent_ids: Vec::new(),
+            updated_at: Utc::now().to_rfc3339(),
+        })
+        .context("failed to seed configured Context Book subscriptions")
+}
+
+fn configured_seed_agent_ids(
+    resolved: &crate::context_book::config::ResolvedContextBookConfig,
+) -> Vec<String> {
+    normalize_agent_ids(
+        &resolved
+            .subscription_seed
+            .iter()
+            .filter_map(|agent_id| {
+                let trimmed = agent_id.trim();
+                (!trimmed.is_empty() && trimmed != "*").then(|| trimmed.to_string())
+            })
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn auto_subscription_writes_allowed(degraded_modes: &[ContextBookDegradedMode]) -> bool {
+    !degraded_modes.iter().any(|mode| {
+        matches!(
+            mode,
+            ContextBookDegradedMode::ReadOnly
+                | ContextBookDegradedMode::NoWrite
+                | ContextBookDegradedMode::Disconnect
+        )
+    })
+}
+
+async fn reconcile_auto_subscriptions(
+    client: &ContextBookClient,
+    session: &super::client::ContextBookSession,
+    handle: &ContextBookHandle,
+    current: Option<&ContextBookSubscriptionsSnapshot>,
+    agents: Option<&[ContextBookAgentSnapshot]>,
+) -> Result<Option<ContextBookSubscriptionsSnapshot>> {
+    if handle.resolved_config().subscription_mode != ContextBookSubscriptionMode::Auto {
+        return Ok(None);
+    }
+
+    let desired = resolve_auto_subscription_targets(client, session, handle, agents).await?;
+    let current = match current {
+        Some(current) => current.clone(),
+        None => match handle
+            .store()
+            .load_subscriptions()
+            .context("failed to load cached subscriptions for auto reconcile")?
+        {
+            Some(cached) => cached,
+            None => client
+                .get_subscriptions(session)
+                .await
+                .map_err(anyhow::Error::new)
+                .context("failed to load remote subscriptions for auto reconcile")?,
+        },
+    };
+
+    if current.desired_producer_agent_ids == desired {
+        return Ok(None);
+    }
+
+    let updated = client
+        .set_subscriptions(session, &desired)
+        .await
+        .map_err(anyhow::Error::new)
+        .context("failed to auto-reconcile Context Book subscriptions")?;
+    Ok(Some(updated))
+}
+
+async fn resolve_auto_subscription_targets(
+    client: &ContextBookClient,
+    session: &super::client::ContextBookSession,
+    handle: &ContextBookHandle,
+    agents: Option<&[ContextBookAgentSnapshot]>,
+) -> Result<Vec<String>> {
+    let resolved = handle.resolved_config();
+    let wildcard_requested = resolved
+        .subscription_seed
+        .iter()
+        .any(|agent_id| agent_id.trim() == "*");
+    let mut desired = configured_seed_agent_ids(&resolved);
+
+    if wildcard_requested {
+        let discovered_agents = match agents {
+            Some(agents) => agents.to_vec(),
+            None => client
+                .get_agents(session)
+                .await
+                .map_err(anyhow::Error::new)
+                .context("failed to load agents for auto subscription reconcile")?,
+        };
+        desired.extend(
+            discovered_agents
+                .into_iter()
+                .map(|agent| agent.agent_id)
+                .filter(|agent_id| agent_id != &session.agent_id),
+        );
+    }
+
+    desired.retain(|agent_id| agent_id != &session.agent_id);
+    Ok(normalize_agent_ids(&desired))
+}
+
+fn normalize_agent_ids(values: &[String]) -> Vec<String> {
+    let mut ids = values
+        .iter()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    ids.sort_unstable();
+    ids.dedup();
+    ids
 }
 
 #[cfg(test)]
@@ -672,6 +832,271 @@ mod tests {
                 && runtime.cursor_generation == 1
         }));
         assert_eq!(status.cache_inventory.contexts.count, 1);
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn connect_and_sync_once_auto_mode_reconciles_wildcard_subscriptions() {
+        #[derive(Clone)]
+        struct AutoSubscriptionsState {
+            agent_calls: Arc<AtomicUsize>,
+            current_desired: Arc<Mutex<Vec<String>>>,
+            put_requests: Arc<Mutex<Vec<Vec<String>>>>,
+        }
+
+        async fn patch_status() -> impl IntoResponse {
+            axum::Json(serde_json::json!({"ok": true}))
+        }
+
+        async fn agents(State(state): State<AutoSubscriptionsState>) -> impl IntoResponse {
+            let call_index = state.agent_calls.fetch_add(1, Ordering::SeqCst);
+            let body = match call_index {
+                0 => serde_json::json!([
+                    {
+                        "agentId": "workspace",
+                        "lifecycleState": "Active",
+                        "connectionState": "Disconnected"
+                    }
+                ]),
+                1 => serde_json::json!([
+                    {
+                        "agentId": "workspace",
+                        "lifecycleState": "Active",
+                        "connectionState": "Disconnected"
+                    },
+                    {
+                        "agentId": "peer-a",
+                        "lifecycleState": "Active",
+                        "connectionState": "Connected"
+                    }
+                ]),
+                _ => serde_json::json!([
+                    {
+                        "agentId": "workspace",
+                        "lifecycleState": "Active",
+                        "connectionState": "Disconnected"
+                    },
+                    {
+                        "agentId": "peer-a",
+                        "lifecycleState": "Active",
+                        "connectionState": "Connected"
+                    },
+                    {
+                        "agentId": "peer-b",
+                        "lifecycleState": "Active",
+                        "connectionState": "Connected"
+                    }
+                ]),
+            };
+            axum::Json(body)
+        }
+
+        async fn get_subscriptions(
+            State(state): State<AutoSubscriptionsState>,
+        ) -> impl IntoResponse {
+            let desired = state
+                .current_desired
+                .lock()
+                .expect("current_desired mutex")
+                .clone();
+            axum::Json(serde_json::json!({
+                "consumerAgentId": "workspace",
+                "desiredProducerAgentIds": desired,
+                "effectiveProducerAgentIds": desired,
+            }))
+        }
+
+        async fn put_subscriptions(
+            State(state): State<AutoSubscriptionsState>,
+            axum::Json(body): axum::Json<serde_json::Value>,
+        ) -> impl IntoResponse {
+            let desired = body["desiredProducerAgentIds"]
+                .as_array()
+                .expect("desiredProducerAgentIds array")
+                .iter()
+                .map(|value| {
+                    value
+                        .as_str()
+                        .expect("desiredProducerAgentIds string")
+                        .to_string()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(body["producerAgentIds"], body["desiredProducerAgentIds"]);
+            state
+                .put_requests
+                .lock()
+                .expect("put_requests mutex")
+                .push(desired.clone());
+            *state.current_desired.lock().expect("current_desired mutex") = desired.clone();
+            axum::Json(serde_json::json!({
+                "consumerAgentId": "workspace",
+                "desiredProducerAgentIds": desired,
+                "effectiveProducerAgentIds": desired,
+            }))
+        }
+
+        async fn events_probe() -> impl IntoResponse {
+            (
+                StatusCode::CONFLICT,
+                axum::Json(serde_json::json!({
+                    "error": {
+                        "code": "CURSOR_NOT_FOUND",
+                        "message": "missing cursor"
+                    }
+                })),
+            )
+        }
+
+        async fn delete_vote_probe() -> impl IntoResponse {
+            (
+                StatusCode::NOT_FOUND,
+                axum::Json(serde_json::json!({
+                    "error": {
+                        "code": "VOTE_NOT_FOUND",
+                        "message": "missing vote"
+                    }
+                })),
+            )
+        }
+
+        async fn legacy_refresh() -> impl IntoResponse {
+            (
+                StatusCode::BAD_REQUEST,
+                axum::Json(serde_json::json!({
+                    "error": {
+                        "code": "REFRESH_TOKEN_REQUIRED",
+                        "message": "missing refresh token"
+                    }
+                })),
+            )
+        }
+
+        async fn events_stream() -> impl IntoResponse {
+            (
+                StatusCode::OK,
+                [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                concat!(
+                    "id: evt-agent-1\n",
+                    "event: agent.registered\n",
+                    "data: {\"eventId\":\"evt-agent-1\",\"eventType\":\"agent.registered\",",
+                    "\"occurredAt\":\"2026-03-31T00:00:01Z\",\"producerAgentId\":\"peer-b\",",
+                    "\"entityId\":\"peer-b\",\"payload\":{},\"meta\":{}}\n\n"
+                ),
+            )
+                .into_response()
+        }
+
+        let app_state = AutoSubscriptionsState {
+            agent_calls: Arc::new(AtomicUsize::new(0)),
+            current_desired: Arc::new(Mutex::new(Vec::new())),
+            put_requests: Arc::new(Mutex::new(Vec::new())),
+        };
+        let app = Router::new()
+            .route("/agents/workspace/status", patch(patch_status))
+            .route("/agents", get(agents))
+            .route(
+                "/subscriptions",
+                get(get_subscriptions).put(put_subscriptions),
+            )
+            .route("/events/stream", get(events_stream))
+            .route("/events", get(events_probe))
+            .route("/votes/{vote_id}", axum::routing::delete(delete_vote_probe))
+            .route("/auth/refresh", post(legacy_refresh))
+            .with_state(app_state.clone());
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve axum");
+        });
+
+        let tmp = TempDir::new().expect("temp dir");
+        let mut config = test_config(&tmp, format!("http://{addr}"));
+        config.context_book.subscription_mode = ContextBookSubscriptionMode::Auto;
+        config.context_book.subscription_seed = vec!["*".into()];
+        let state_dir = state_dir_from_config(&config);
+        let auth_store = AuthProfilesStore::new(&state_dir, config.secrets.encrypt);
+        auth_store
+            .upsert_profile(
+                AuthProfile {
+                    id: profile_id("context-book", "default"),
+                    provider: "context-book".into(),
+                    profile_name: "default".into(),
+                    kind: AuthProfileKind::OAuth,
+                    account_id: None,
+                    workspace_id: None,
+                    token_set: Some(TokenSet {
+                        access_token: "worker-token".into(),
+                        refresh_token: Some("worker-refresh".into()),
+                        id_token: None,
+                        expires_at: Some(Utc::now() + ChronoDuration::minutes(30)),
+                        token_type: None,
+                        scope: None,
+                    }),
+                    token: None,
+                    metadata: BTreeMap::from([("agent_id".to_string(), "workspace".to_string())]),
+                    created_at: Utc::now(),
+                    updated_at: Utc::now(),
+                },
+                true,
+            )
+            .await
+            .expect("seed worker auth profile");
+
+        let handle = shared_handle(&config);
+        handle.store().initialize().expect("initialize store");
+
+        let progressed = connect_and_sync_once(&handle, None)
+            .await
+            .expect("connect and sync once");
+
+        assert!(progressed);
+        let cached_subscriptions = handle
+            .store()
+            .load_subscriptions()
+            .expect("load cached subscriptions")
+            .expect("cached subscriptions");
+        assert_eq!(
+            cached_subscriptions.desired_producer_agent_ids,
+            vec!["peer-a".to_string(), "peer-b".to_string()]
+        );
+        assert_eq!(
+            cached_subscriptions.effective_producer_agent_ids,
+            vec!["peer-a".to_string(), "peer-b".to_string()]
+        );
+        let put_requests = app_state
+            .put_requests
+            .lock()
+            .expect("put_requests mutex")
+            .clone();
+        assert_eq!(
+            put_requests,
+            vec![
+                vec!["peer-a".to_string()],
+                vec!["peer-a".to_string(), "peer-b".to_string()]
+            ]
+        );
+        let cached_agents = handle
+            .store()
+            .load_agents()
+            .expect("load cached agents")
+            .expect("cached agents");
+        assert_eq!(cached_agents.items.len(), 3);
+        assert_eq!(
+            cached_agents
+                .items
+                .iter()
+                .map(|agent| agent.agent_id.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                "peer-a".to_string(),
+                "peer-b".to_string(),
+                "workspace".to_string()
+            ]
+        );
 
         server.abort();
         let _ = server.await;

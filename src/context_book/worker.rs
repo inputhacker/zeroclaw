@@ -575,11 +575,11 @@ async fn resolve_auto_subscription_targets(
             discovered_agents
                 .into_iter()
                 .map(|agent| agent.agent_id)
-                .filter(|agent_id| agent_id != &session.agent_id),
+                .filter(|agent_id| !client.is_self_agent_id(session, agent_id)),
         );
     }
 
-    desired.retain(|agent_id| agent_id != &session.agent_id);
+    desired.retain(|agent_id| !client.is_self_agent_id(session, agent_id));
     Ok(normalize_agent_ids(&desired))
 }
 

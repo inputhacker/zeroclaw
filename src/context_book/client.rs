@@ -11,6 +11,7 @@ use super::store::{
 use crate::auth::profiles::{AuthProfileKind, AuthProfilesStore, TokenSet};
 use crate::auth::{AuthService, state_dir_from_config};
 use crate::config::Config;
+use crate::identity;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use reqwest::{Response, StatusCode, Url};
@@ -404,21 +405,41 @@ pub struct ContextBookClient {
     auth_service: AuthService,
     auth_store: AuthProfilesStore,
     http_client: reqwest::Client,
+    stream_http_client: reqwest::Client,
     identity: ContextBookAgentIdentity,
     bootstrap_secret: Option<String>,
 }
 
 impl ContextBookClient {
     pub fn new(config: &Config) -> Self {
-        let resolved = ResolvedContextBookConfig::resolve(config);
-        let state_dir = state_dir_from_config(config);
-        let auth_service = AuthService::from_config(config);
-        let auth_store = AuthProfilesStore::new(&state_dir, config.secrets.encrypt);
         let http_client = crate::config::build_runtime_proxy_client_with_timeouts(
             "context_book.client",
             HTTP_TIMEOUT_SECS,
             HTTP_CONNECT_TIMEOUT_SECS,
         );
+        let stream_http_client = crate::config::apply_runtime_proxy_to_builder(
+            reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(HTTP_CONNECT_TIMEOUT_SECS))
+                .tcp_keepalive(Duration::from_secs(30)),
+            "context_book.client.sse",
+        )
+        .build()
+        .unwrap_or_else(|error| {
+            tracing::warn!("Failed to build proxied Context Book SSE client: {error}");
+            reqwest::Client::new()
+        });
+        Self::with_clients(config, http_client, stream_http_client)
+    }
+
+    fn with_clients(
+        config: &Config,
+        http_client: reqwest::Client,
+        stream_http_client: reqwest::Client,
+    ) -> Self {
+        let resolved = ResolvedContextBookConfig::resolve(config);
+        let state_dir = state_dir_from_config(config);
+        let auth_service = AuthService::from_config(config);
+        let auth_store = AuthProfilesStore::new(&state_dir, config.secrets.encrypt);
 
         Self {
             bootstrap_secret: std::env::var(&resolved.bootstrap_secret_env_key).ok(),
@@ -426,6 +447,7 @@ impl ContextBookClient {
             auth_service,
             auth_store,
             http_client,
+            stream_http_client,
             identity: derive_identity(config),
         }
     }
@@ -436,6 +458,16 @@ impl ContextBookClient {
 
     pub fn resolved(&self) -> &ResolvedContextBookConfig {
         &self.resolved
+    }
+
+    pub(crate) fn is_self_agent_id(
+        &self,
+        session: &ContextBookSession,
+        candidate_agent_id: &str,
+    ) -> bool {
+        self.agent_id_aliases(session)
+            .iter()
+            .any(|agent_id| agent_id == candidate_agent_id)
     }
 
     pub async fn ensure_session(&self) -> Result<ContextBookSession, ContextBookClientError> {
@@ -530,7 +562,7 @@ impl ContextBookClient {
             .append_pair("agentId", &session.agent_id);
 
         let mut request = self
-            .http_client
+            .stream_http_client
             .get(url)
             .bearer_auth(&session.access_token)
             .header(reqwest::header::ACCEPT, "text/event-stream");
@@ -1031,9 +1063,10 @@ impl ContextBookClient {
         })?;
         let agents = parse_agents_response(body)
             .map_err(|error| self.contract_error(format!("invalid agents payload: {error}")))?;
+        let aliases = self.agent_id_aliases(session);
         Ok(agents
             .into_iter()
-            .find(|agent| agent.agent_id == session.agent_id))
+            .find(|agent| aliases.iter().any(|agent_id| agent_id == &agent.agent_id)))
     }
 
     async fn fetch_subscriptions_response(
@@ -1286,6 +1319,17 @@ impl ContextBookClient {
             return Ok(None);
         };
 
+        if self.should_rebootstrap_for_identity_change(
+            profile.metadata.get("agent_id").map(String::as_str),
+        ) {
+            tracing::info!(
+                stored_agent_id = profile.metadata.get("agent_id").map(String::as_str),
+                derived_agent_id = self.identity.agent_id.as_str(),
+                "context_book stored session agent_id no longer matches derived identity; forcing bootstrap"
+            );
+            return Ok(None);
+        }
+
         match profile.kind {
             AuthProfileKind::Token => {
                 let access_token = profile.token.unwrap_or_default();
@@ -1335,6 +1379,18 @@ impl ContextBookClient {
                 }))
             }
         }
+    }
+
+    fn should_rebootstrap_for_identity_change(&self, stored_agent_id: Option<&str>) -> bool {
+        self.bootstrap_secret.is_some()
+            && stored_agent_id
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .is_some_and(|stored_agent_id| stored_agent_id != self.identity.agent_id)
+    }
+
+    fn agent_id_aliases(&self, session: &ContextBookSession) -> Vec<String> {
+        normalize_agent_ids(&[session.agent_id.clone(), self.identity.agent_id.clone()])
     }
 
     async fn refresh_session(
@@ -1877,13 +1933,34 @@ fn derive_identity(config: &Config) -> ContextBookAgentIdentity {
         .unwrap_or("zeroclaw")
         .to_string();
     let overrides = &config.context_book.agent_identity_override;
+    let derived_display_name =
+        derive_identity_display_name(config).unwrap_or_else(|| workspace_name.clone());
+    let display_name = overrides
+        .display_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or(derived_display_name);
     let agent_id = overrides
         .agent_id
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
-        .unwrap_or_else(|| sanitize_identity_component(&workspace_name));
+        .unwrap_or_else(|| sanitize_identity_component(&display_name))
+        .trim()
+        .to_string();
+    let agent_id = if agent_id.is_empty() {
+        let fallback = sanitize_identity_component(&workspace_name);
+        if fallback.is_empty() {
+            "zeroclaw".to_string()
+        } else {
+            fallback
+        }
+    } else {
+        agent_id
+    };
     let device_type = overrides
         .device_type
         .as_deref()
@@ -1891,20 +1968,63 @@ fn derive_identity(config: &Config) -> ContextBookAgentIdentity {
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| "unknown".to_string());
-    let display_name = overrides
-        .display_name
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(|| workspace_name.clone());
 
     ContextBookAgentIdentity {
         agent_id: agent_id.clone(),
-        agent_name: agent_id,
+        agent_name: display_name.clone(),
         device_type,
         display_name,
     }
+}
+
+fn derive_identity_display_name(config: &Config) -> Option<String> {
+    derive_identity_display_name_from_aieos(config)
+        .or_else(|| derive_identity_display_name_from_markdown(&config.workspace_dir))
+}
+
+fn derive_identity_display_name_from_aieos(config: &Config) -> Option<String> {
+    let identity = identity::load_aieos_identity(&config.identity, &config.workspace_dir)
+        .ok()
+        .flatten()?;
+    let names = identity.identity.as_ref()?.names.as_ref()?;
+    non_empty_name(names.full.as_deref())
+        .or_else(|| non_empty_name(names.nickname.as_deref()))
+        .or_else(|| {
+            let first = names.first.as_deref()?.trim();
+            let last = names.last.as_deref().map(str::trim).unwrap_or_default();
+            let combined = if last.is_empty() {
+                first.to_string()
+            } else {
+                format!("{first} {last}")
+            };
+            non_empty_name(Some(&combined))
+        })
+}
+
+fn derive_identity_display_name_from_markdown(workspace_dir: &std::path::Path) -> Option<String> {
+    let identity_md = std::fs::read_to_string(workspace_dir.join("IDENTITY.md")).ok()?;
+    identity_md.lines().find_map(extract_identity_name_line)
+}
+
+fn extract_identity_name_line(line: &str) -> Option<String> {
+    let trimmed = line.trim().trim_start_matches(['#', '-', '*', ' ']);
+    let (label, value) = trimmed.split_once(':')?;
+    let label = label.trim().trim_matches('*').trim_matches('`').trim();
+    if !matches!(
+        label.to_ascii_lowercase().as_str(),
+        "name" | "display name" | "agent name"
+    ) {
+        return None;
+    }
+    non_empty_name(Some(value))
+}
+
+fn non_empty_name(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .map(|value| value.trim_matches('*').trim_matches('`').trim_matches('"'))
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
 }
 
 fn sanitize_identity_component(value: &str) -> String {
@@ -2534,6 +2654,21 @@ mod tests {
         assert_eq!(identity.display_name, "workspace");
     }
 
+    #[test]
+    fn derive_identity_prefers_identity_markdown_name() {
+        let tmp = TempDir::new().expect("temp dir");
+        let config = test_config(&tmp);
+        std::fs::create_dir_all(&config.workspace_dir).expect("create workspace dir");
+        std::fs::write(config.workspace_dir.join("IDENTITY.md"), "Name: Zero Bot\n")
+            .expect("write IDENTITY.md");
+
+        let identity = derive_identity(&config);
+
+        assert_eq!(identity.agent_id, "zero-bot");
+        assert_eq!(identity.agent_name, "Zero Bot");
+        assert_eq!(identity.display_name, "Zero Bot");
+    }
+
     #[tokio::test]
     async fn base_url_validation_rejects_unlisted_host() {
         let tmp = TempDir::new().expect("temp dir");
@@ -2921,6 +3056,108 @@ mod tests {
             ContextBookRefreshMode::LegacyAuthRefresh
         );
         assert!(contract.degraded_modes.is_empty());
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn client_validates_contract_using_derived_identity_alias() {
+        async fn agents() -> impl IntoResponse {
+            axum::Json(json!([
+                {
+                    "agentId": "zero-bot",
+                    "lifecycleState": "Active",
+                    "connectionState": "Connected"
+                }
+            ]))
+        }
+
+        async fn subscriptions() -> impl IntoResponse {
+            axum::Json(json!({
+                "consumerAgentId": "zero-bot",
+                "desiredProducerAgentIds": ["peer-a"],
+                "effectiveProducerAgentIds": ["peer-a"]
+            }))
+        }
+
+        async fn events() -> impl IntoResponse {
+            (
+                StatusCode::CONFLICT,
+                axum::Json(json!({
+                    "error": {
+                        "code": "CURSOR_NOT_FOUND",
+                        "message": "missing cursor"
+                    }
+                })),
+            )
+        }
+
+        async fn legacy_refresh() -> impl IntoResponse {
+            (
+                StatusCode::BAD_REQUEST,
+                axum::Json(json!({
+                    "error": {
+                        "code": "REFRESH_TOKEN_REQUIRED",
+                        "message": "missing refresh token"
+                    }
+                })),
+            )
+        }
+
+        async fn delete_vote_probe() -> impl IntoResponse {
+            (
+                StatusCode::NOT_FOUND,
+                axum::Json(json!({
+                    "error": {
+                        "code": "VOTE_NOT_FOUND",
+                        "message": "missing vote"
+                    }
+                })),
+            )
+        }
+
+        let app = Router::new()
+            .route("/agents", get(agents))
+            .route("/subscriptions", get(subscriptions))
+            .route("/events", get(events))
+            .route("/votes/{vote_id}", axum::routing::delete(delete_vote_probe))
+            .route("/auth/refresh", post(legacy_refresh));
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve axum");
+        });
+
+        let tmp = TempDir::new().expect("temp dir");
+        let mut config = test_config(&tmp);
+        config.context_book.manual_url = Some(format!("http://{addr}"));
+        config.context_book.allowed_hosts = vec!["127.0.0.1".into()];
+        config.context_book.allow_private_hosts = true;
+        std::fs::create_dir_all(&config.workspace_dir).expect("create workspace dir");
+        std::fs::write(config.workspace_dir.join("IDENTITY.md"), "Name: Zero Bot\n")
+            .expect("write IDENTITY.md");
+
+        let client = ContextBookClient::new(&config);
+        let session = ContextBookSession {
+            base_url: Url::parse(&format!("http://{addr}/")).expect("base URL should parse"),
+            agent_id: "workspace".into(),
+            access_token: "access-token".into(),
+            refresh_token: Some("refresh-token".into()),
+            expires_at: None,
+        };
+        let contract = client
+            .validate_runtime_contract(&session)
+            .await
+            .expect("contract validation");
+
+        assert_eq!(
+            contract.validation_state,
+            ContextBookContractValidationState::Validated
+        );
+        assert_eq!(contract.lifecycle_connection_split, Some(true));
 
         server.abort();
         let _ = server.await;
@@ -3508,6 +3745,99 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn client_rebootstraps_when_stored_agent_id_no_longer_matches_identity() {
+        async fn connect(axum::Json(body): axum::Json<Value>) -> impl IntoResponse {
+            assert_eq!(body["agentId"], json!("zero-bot"));
+            axum::Json(json!({
+                "access_token": "bootstrap-access",
+                "refresh_token": "bootstrap-refresh",
+                "expires_in": 1800,
+                "agentId": "zero-bot"
+            }))
+        }
+
+        let app = Router::new().route("/agents/connect", post(connect));
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve axum");
+        });
+
+        let tmp = TempDir::new().expect("temp dir");
+        let mut config = test_config(&tmp);
+        config.context_book.manual_url = Some(format!("http://{addr}"));
+        config.context_book.allowed_hosts = vec!["127.0.0.1".into()];
+        config.context_book.allow_private_hosts = true;
+        config.context_book.bootstrap_secret_env_key = "ZER0CLAW_CONTEXT_BOOK_TEST_SECRET".into();
+        std::fs::create_dir_all(&config.workspace_dir).expect("create workspace dir");
+        std::fs::write(config.workspace_dir.join("IDENTITY.md"), "Name: Zero Bot\n")
+            .expect("write IDENTITY.md");
+
+        let _env = EnvGuard::set(
+            &config.context_book.bootstrap_secret_env_key,
+            Some("bootstrap-secret"),
+        );
+
+        let state_dir = state_dir_from_config(&config);
+        let store = AuthProfilesStore::new(&state_dir, config.secrets.encrypt);
+        store
+            .upsert_profile(
+                crate::auth::profiles::AuthProfile {
+                    id: crate::auth::profiles::profile_id(CONTEXT_BOOK_PROVIDER, "default"),
+                    provider: CONTEXT_BOOK_PROVIDER.to_string(),
+                    profile_name: "default".to_string(),
+                    kind: AuthProfileKind::OAuth,
+                    account_id: None,
+                    workspace_id: None,
+                    token_set: Some(TokenSet {
+                        access_token: "stale-access".into(),
+                        refresh_token: Some("stale-refresh".into()),
+                        id_token: None,
+                        expires_at: Some(Utc::now() + ChronoDuration::minutes(30)),
+                        token_type: None,
+                        scope: None,
+                    }),
+                    token: None,
+                    metadata: BTreeMap::from([("agent_id".to_string(), "workspace".to_string())]),
+                    created_at: Utc::now(),
+                    updated_at: Utc::now(),
+                },
+                true,
+            )
+            .await
+            .expect("seed stale auth profile");
+
+        let client = ContextBookClient::new(&config);
+        let session = client.ensure_session().await.expect("bootstrap session");
+
+        assert_eq!(session.agent_id, "zero-bot");
+        assert_eq!(session.access_token, "bootstrap-access");
+
+        let stored = client
+            .auth_service
+            .get_profile(CONTEXT_BOOK_PROVIDER, None)
+            .await
+            .expect("load stored profile")
+            .expect("stored profile");
+        assert_eq!(
+            stored.metadata.get("agent_id").map(String::as_str),
+            Some("zero-bot")
+        );
+        assert_eq!(
+            stored
+                .token_set
+                .as_ref()
+                .map(|tokens| tokens.access_token.as_str()),
+            Some("bootstrap-access")
+        );
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
     async fn client_refreshes_stored_oauth_profile_via_legacy_auth_refresh_when_oauth2_missing() {
         async fn legacy_refresh() -> impl IntoResponse {
             axum::Json(json!({
@@ -3794,6 +4124,61 @@ mod tests {
             updated.effective_producer_agent_ids,
             vec!["peer-a".to_string()]
         );
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn open_event_stream_uses_dedicated_sse_client_without_request_timeout() {
+        async fn events_stream() -> impl IntoResponse {
+            tokio::time::sleep(StdDuration::from_millis(250)).await;
+            (
+                StatusCode::OK,
+                [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                ":\n\n",
+            )
+        }
+
+        let app = Router::new().route("/events/stream", get(events_stream));
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve axum");
+        });
+
+        let tmp = TempDir::new().expect("temp dir");
+        let mut config = test_config(&tmp);
+        config.context_book.manual_url = Some(format!("http://{addr}"));
+        config.context_book.allowed_hosts = vec!["127.0.0.1".into()];
+        config.context_book.allow_private_hosts = true;
+
+        let http_client = reqwest::Client::builder()
+            .timeout(StdDuration::from_millis(100))
+            .connect_timeout(StdDuration::from_millis(100))
+            .build()
+            .expect("build request client");
+        let stream_http_client = reqwest::Client::builder()
+            .connect_timeout(StdDuration::from_millis(100))
+            .build()
+            .expect("build stream client");
+        let client = ContextBookClient::with_clients(&config, http_client, stream_http_client);
+        let session = ContextBookSession {
+            base_url: Url::parse(&format!("http://{addr}/")).expect("base URL should parse"),
+            agent_id: "workspace".into(),
+            access_token: "access-token".into(),
+            refresh_token: None,
+            expires_at: None,
+        };
+
+        let started_at = tokio::time::Instant::now();
+        client
+            .open_event_stream(&session, None)
+            .await
+            .expect("open delayed event stream");
+        assert!(started_at.elapsed() >= StdDuration::from_millis(250));
 
         server.abort();
         let _ = server.await;

@@ -16,6 +16,22 @@ use tokio_util::sync::CancellationToken;
 const HEALTH_TICK_SECS: u64 = 30;
 const HEALTH_STALE_SECONDS: i64 = 120;
 
+fn format_error_chain(error: &anyhow::Error) -> String {
+    let mut parts = Vec::new();
+    for cause in error.chain() {
+        let message = cause.to_string();
+        if !message.is_empty() {
+            parts.push(message);
+        }
+    }
+
+    if parts.is_empty() {
+        return String::new();
+    }
+
+    parts.join(": ")
+}
+
 pub async fn run(
     _config: Config,
     handle: ContextBookHandle,
@@ -84,9 +100,21 @@ pub async fn run(
                 refresh_component_health(&handle);
             }
             Err(error) => {
-                handle.mark_error(error.to_string());
+                let error_text = format_error_chain(&error);
+                handle.mark_error(if error_text.is_empty() {
+                    error.to_string()
+                } else {
+                    error_text.clone()
+                });
                 persist_runtime_state(&handle)?;
-                crate::health::mark_component_error("context_book", error.to_string());
+                crate::health::mark_component_error(
+                    "context_book",
+                    if error_text.is_empty() {
+                        error.to_string()
+                    } else {
+                        error_text
+                    },
+                );
                 sleep_or_shutdown(Duration::from_millis(backoff_ms), shutdown.as_ref()).await;
                 backoff_ms = (backoff_ms.saturating_mul(2)).min(max_backoff);
             }
@@ -610,6 +638,12 @@ mod tests {
         config.context_book.allowed_hosts = vec!["127.0.0.1".into()];
         config.context_book.allow_private_hosts = true;
         config
+    }
+
+    #[test]
+    fn format_error_chain_includes_nested_causes() {
+        let error = anyhow::anyhow!("outer").context("middle").context("inner");
+        assert_eq!(format_error_chain(&error), "inner: middle: outer");
     }
 
     #[tokio::test]

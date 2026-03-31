@@ -440,8 +440,29 @@ impl ContextBookClient {
 
     pub async fn ensure_session(&self) -> Result<ContextBookSession, ContextBookClientError> {
         let base_url = self.resolve_base_url().await?;
-        if let Some(session) = self.load_stored_session(&base_url).await? {
-            return Ok(session);
+        match self.load_stored_session(&base_url).await {
+            Ok(Some(session)) => return Ok(session),
+            Ok(None) => {}
+            Err(stored_error)
+                if self.bootstrap_secret.is_some()
+                    && session_recovery_fallback_allowed(stored_error.kind) =>
+            {
+                tracing::warn!(
+                    "context_book stored session recovery failed; attempting bootstrap fallback: {}",
+                    stored_error.message
+                );
+                return match self.bootstrap_session(&base_url).await {
+                    Ok(session) => Ok(session),
+                    Err(bootstrap_error) => Err(ContextBookClientError {
+                        kind: bootstrap_error.kind,
+                        message: format!(
+                            "stored session recovery failed: {}; bootstrap fallback failed: {}",
+                            stored_error.message, bootstrap_error.message
+                        ),
+                    }),
+                };
+            }
+            Err(error) => return Err(error),
         }
         self.bootstrap_session(&base_url).await
     }
@@ -2430,6 +2451,16 @@ fn matches_terminal_or_approved(state: Option<&str>) -> bool {
     matches!(state, Some("Approved" | "Completed" | "Denied" | "Expired"))
 }
 
+fn session_recovery_fallback_allowed(kind: ContextBookClientErrorKind) -> bool {
+    matches!(
+        kind,
+        ContextBookClientErrorKind::AuthRequired
+            | ContextBookClientErrorKind::Unauthorized
+            | ContextBookClientErrorKind::ContractViolation
+            | ContextBookClientErrorKind::Unexpected
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3538,6 +3569,159 @@ mod tests {
 
         assert_eq!(session.access_token, "legacy-access");
         assert_eq!(session.refresh_token.as_deref(), Some("legacy-refresh"));
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn client_falls_back_to_bootstrap_when_refresh_fails() {
+        async fn legacy_refresh() -> impl IntoResponse {
+            (
+                StatusCode::UNAUTHORIZED,
+                axum::Json(json!({
+                    "error": {
+                        "code": "AUTH_INVALID_TOKEN",
+                        "message": "Invalid or expired refresh token."
+                    }
+                })),
+            )
+        }
+
+        async fn connect() -> impl IntoResponse {
+            (
+                StatusCode::NOT_FOUND,
+                axum::Json(json!({
+                    "error": {
+                        "code": "AGENT_NOT_REGISTERED",
+                        "message": "Agent is not registered."
+                    }
+                })),
+            )
+        }
+
+        async fn register_init(
+            headers: HeaderMap,
+            axum::Json(body): axum::Json<Value>,
+        ) -> impl IntoResponse {
+            assert_eq!(
+                headers
+                    .get("x-context-book-bootstrap-secret")
+                    .and_then(|value| value.to_str().ok()),
+                Some("bootstrap-secret")
+            );
+            assert_eq!(body["agentName"], json!("workspace"));
+            assert_eq!(body["deviceType"], json!("unknown"));
+            assert_eq!(body["displayName"], json!("workspace"));
+            (
+                StatusCode::ACCEPTED,
+                axum::Json(json!({
+                    "request": {
+                        "requestId": "bootreq-123",
+                        "waitToken": "bootwait-123",
+                        "approvalState": "Approved",
+                        "statusUrl": "/bootstrap/requests/bootreq-123",
+                        "completeUrl": "/bootstrap/register/complete"
+                    }
+                })),
+            )
+        }
+
+        async fn register_complete(
+            headers: HeaderMap,
+            axum::Json(body): axum::Json<Value>,
+        ) -> impl IntoResponse {
+            assert_eq!(
+                headers
+                    .get("x-context-book-bootstrap-wait-token")
+                    .and_then(|value| value.to_str().ok()),
+                Some("bootwait-123")
+            );
+            assert_eq!(body["requestId"], json!("bootreq-123"));
+            axum::Json(json!({
+                "access_token": "bootstrap-access",
+                "refresh_token": "bootstrap-refresh",
+                "expires_in": 1800,
+                "agentId": "workspace"
+            }))
+        }
+
+        let app = Router::new()
+            .route("/auth/refresh", post(legacy_refresh))
+            .route("/agents/connect", post(connect))
+            .route("/bootstrap/register/init", post(register_init))
+            .route("/bootstrap/register/complete", post(register_complete));
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve axum");
+        });
+
+        let tmp = TempDir::new().expect("temp dir");
+        let mut config = test_config(&tmp);
+        config.context_book.manual_url = Some(format!("http://{addr}"));
+        config.context_book.allowed_hosts = vec!["127.0.0.1".into()];
+        config.context_book.allow_private_hosts = true;
+        config.context_book.bootstrap_secret_env_key = "ZER0CLAW_TEST_CONTEXT_BOOK_SECRET".into();
+
+        let _env = EnvGuard::set(
+            "ZER0CLAW_TEST_CONTEXT_BOOK_SECRET",
+            Some("bootstrap-secret"),
+        );
+
+        let state_dir = state_dir_from_config(&config);
+        let store = AuthProfilesStore::new(&state_dir, config.secrets.encrypt);
+        store
+            .upsert_profile(
+                crate::auth::profiles::AuthProfile {
+                    id: crate::auth::profiles::profile_id(CONTEXT_BOOK_PROVIDER, "default"),
+                    provider: CONTEXT_BOOK_PROVIDER.to_string(),
+                    profile_name: "default".to_string(),
+                    kind: AuthProfileKind::OAuth,
+                    account_id: None,
+                    workspace_id: None,
+                    token_set: Some(TokenSet {
+                        access_token: "stale-access".into(),
+                        refresh_token: Some("stale-refresh".into()),
+                        id_token: None,
+                        expires_at: Some(Utc::now() - ChronoDuration::minutes(5)),
+                        token_type: None,
+                        scope: None,
+                    }),
+                    token: None,
+                    metadata: BTreeMap::from([("agent_id".to_string(), "workspace".to_string())]),
+                    created_at: Utc::now(),
+                    updated_at: Utc::now(),
+                },
+                true,
+            )
+            .await
+            .expect("seed auth profile");
+
+        let client = ContextBookClient::new(&config);
+        let session = client
+            .ensure_session()
+            .await
+            .expect("bootstrap fallback session");
+
+        assert_eq!(session.access_token, "bootstrap-access");
+        assert_eq!(session.refresh_token.as_deref(), Some("bootstrap-refresh"));
+
+        let stored = client
+            .auth_service
+            .get_profile(CONTEXT_BOOK_PROVIDER, None)
+            .await
+            .expect("load bootstrap-fallback profile")
+            .expect("stored bootstrap-fallback profile");
+        assert_eq!(
+            stored
+                .token_set
+                .as_ref()
+                .map(|tokens| tokens.access_token.as_str()),
+            Some("bootstrap-access")
+        );
 
         server.abort();
         let _ = server.await;

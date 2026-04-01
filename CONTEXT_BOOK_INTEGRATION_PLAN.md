@@ -27,6 +27,10 @@ Integrate Context Book into ZeroClaw as a dedicated runtime subsystem that:
   injecting peer state into memory
 - remains fully disabled when config says so
 
+Dashboard-private operator routes shown in the dashboard reference are protocol
+context only. ZeroClaw runtime integration should use the public agent-facing
+REST and SSE surface, not dashboard-private approval APIs.
+
 ## Confirmed Protocol Baseline
 
 This section is the contract the implementation must follow.
@@ -102,6 +106,8 @@ Confirmed public APIs:
 
 Important rules:
 
+- `GET /subscriptions` is consumer-scoped and returns only the authenticated
+  agent's `desiredProducerAgentIds[]` and `effectiveProducerAgentIds[]`
 - subscription state has two layers:
   - desired producer set
   - effective producer set
@@ -191,8 +197,9 @@ Important delivery rules:
 - control-plane events are globally deliverable to active consumers
 - data-plane events require effective subscription
 - producer self-echo is blocked for normal data-plane events
-- exception: a `vote.updated` caused by another agent casting a vote is also
-  delivered to the vote owner
+- exception: a non-owner `vote.updated` whose `ownerAgentId` matches the
+  consumer is also delivered to the vote owner, including casts and non-owner
+  score-only updates
 - `requiredScore` and `executable` are not present in runtime SSE payloads
 
 ## Non-Negotiable Implementation Rules
@@ -315,6 +322,9 @@ It is a daemon-owned coordination subsystem with tool-facing service methods.
 [`src/doctor/**`](./src/doctor)
 - diagnostics and doctor checks
 
+[`src/security/secrets.rs`](./src/security/secrets.rs)
+- reuse the existing `SecretStore` for session token persistence
+
 [`docs/architecture/adr-004-tool-shared-state-ownership.md`](./docs/architecture/adr-004-tool-shared-state-ownership.md)
 - use the documented shared-handle ownership model
 
@@ -322,7 +332,7 @@ It is a daemon-owned coordination subsystem with tool-facing service methods.
 
 Use a dedicated SQLite database:
 
-`{workspace}/context_book/state.db`
+`{workspace}/state/context_book/state.db`
 
 Recommended tables:
 
@@ -339,7 +349,8 @@ Recommended tables:
 
 `auth_session`
 - current bearer session state
-- access token, refresh token, token expiry metadata
+- encrypted secret-store references for access token and refresh token, plus
+  token expiry metadata
 - last refresh result and timestamps
 
 `desired_subscriptions`
@@ -347,8 +358,14 @@ Recommended tables:
 - supports explicit `*`
 
 `effective_subscriptions`
-- currently effective consumer -> producer edges
-- maintained from `subscription.updated` and reconciliation
+- current effective producer set for the local authenticated consumer
+- rebuilt from `GET /subscriptions` plus `subscription.updated`
+
+`observed_effective_edges`
+- optional event-derived view of globally observed effective consumer ->
+  producer edges
+- maintained only from `subscription.updated`
+- treated as best-effort observation, not a fully resyncable source of truth
 
 `mirrored_agents`
 - remote agent lifecycle and connection mirror
@@ -389,7 +406,8 @@ Recommended tables:
 `reconciliation_jobs`
 - targeted refresh jobs
 - vote refresh jobs after `vote.updated`
-- full resync jobs after cursor loss or manual repair
+- initial snapshot sync jobs
+- bounded resync jobs after cursor loss or manual repair
 
 `outbox`
 - deferred outbound write intents after transient REST failure
@@ -403,11 +421,13 @@ already needs that for the agent's own reasoning.
 Remote peer state is different and must stay out of memory:
 
 - remote agent lifecycle and connection state
-- remote subscription state
 - remote contexts
 - remote votes
 - remote vote-derived state such as `requiredScore` and `executable`
 - durable runtime event history
+
+Local desired/effective subscription state and any event-derived
+`subscription.updated` observations must also stay outside memory.
 
 Access to remote peer state must be explicit through:
 
@@ -434,8 +454,7 @@ agent_id = "zeroclaw-main"
 device_type = "notepc"
 display_name = "ZeroClaw Main"
 bootstrap_secret = ""
-register_on_start = true
-connect_on_start = true
+bootstrap_mode = "auto"
 approval_wait_strategy = "poll"
 approval_poll_interval_secs = 5
 sse_enabled = true
@@ -449,7 +468,7 @@ stream_connect_timeout_secs = 30
 access_token_refresh_margin_secs = 60
 retry_initial_backoff_secs = 5
 retry_max_backoff_secs = 60
-store_path = "context_book/state.db"
+store_path = "state/context_book/state.db"
 query_limit_default = 20
 outbox_enabled = true
 ```
@@ -459,6 +478,8 @@ Notes:
 - use `agent_id`, not a speculative `agent_name`, because the protocol exposes
   a stable `agentId`
 - use `bootstrap_secret`, not a generic `api_key`
+- use `bootstrap_mode = "auto"` so register vs connect is inferred from the
+  persisted local identity and approval state instead of split booleans
 - `approval_wait_strategy` should initially support:
   - `poll`
   - `watch`
@@ -499,9 +520,14 @@ This matches
 8. If configured, call `PATCH /agents/{agentId}/status` to set `Active`.
 9. Restore desired subscriptions from local store and apply them through
    `PUT /subscriptions` when needed.
-10. Open runtime delivery via `GET /events/stream?agentId={agentId}` with
+10. If no durable cursor exists yet, run an initial snapshot sync from:
+    - `GET /agents`
+    - `GET /contexts`
+    - `GET /votes`
+    - `GET /subscriptions` for the local consumer only
+11. Open runtime delivery via `GET /events/stream?agentId={agentId}` with
     `Last-Event-ID` when available.
-11. If stream fails, degrade to `GET /events?sinceEventId=...` polling fallback
+12. If stream fails, degrade to `GET /events?sinceEventId=...` polling fallback
     until stream recovers.
 
 ### Shutdown Flow
@@ -519,7 +545,8 @@ vote CRUD, and vote casts:
 - send REST immediately
 - persist success state immediately
 - on transient failure, optionally enqueue into `outbox`
-- return the server result to the caller now
+- return the server result on success, or an explicit failure/queued result on
+  transient failure
 - do not wait for runtime SSE echo
 
 ### Runtime Event Flow
@@ -539,14 +566,19 @@ resume from the last durable cursor:
 
 1. mark the cursor stale
 2. enqueue a full reconciliation job
-3. refresh visible snapshots from:
+3. refresh snapshot-capable state from:
    - `GET /agents`
-   - `GET /subscriptions`
    - `GET /contexts`
    - `GET /votes`
-4. rebuild mirrored tables from the refreshed snapshot
-5. store the new runtime high-water mark
-6. reopen stream from the fresh cursor
+   - `GET /subscriptions` for the local consumer only
+4. rebuild agent/context/vote mirror tables from those snapshots
+5. clear and rebuild only the local consumer subscription snapshot tables from
+   `GET /subscriptions`
+6. drop any stale best-effort `observed_effective_edges` rows that cannot be
+   revalidated through public REST
+7. clear the stale durable cursor
+8. reopen stream without `Last-Event-ID`; the next delivered runtime event
+   establishes the new cursor
 
 ### Vote-Derived State Flow
 
@@ -606,7 +638,7 @@ Primary modules:
 
 Responsibilities:
 
-- create `context_book/state.db`
+- create the store at the configured `store_path`
 - define migrations for all required tables
 - add idempotent helpers for local session state, mirrored state, cursors,
   dedupe, reconciliation, and outbox
@@ -756,14 +788,18 @@ Responsibilities:
   - `vote.created`
   - `vote.updated`
   - `vote.deleted`
-- maintain desired/effective subscription mirrors
+- maintain local desired/effective subscription mirrors and best-effort
+  observed effective edges
 - refresh vote-derived fields through REST reconciliation
-- run full snapshot rebuild after cursor loss
+- run initial snapshot sync and bounded snapshot rebuild after cursor loss
 
 Acceptance criteria:
 
 - replayed runtime events do not duplicate state transitions
-- subscription effective edges remain consistent with control-plane events
+- local effective subscriptions remain consistent with `GET /subscriptions`
+  and control-plane events
+- event-derived global effective-edge observations are clearly marked
+  best-effort
 - mirrored vote derived fields remain accurate after casts
 
 ### Session 8: Tool Surface for Local Agent Actions
@@ -821,6 +857,8 @@ Primary modules:
 Responsibilities:
 
 - add read-only tools over the dedicated mirror store
+- expose local desired/effective subscriptions separately from any best-effort
+  event-derived global edge observations
 - support bounded query size and compact output
 
 Acceptance criteria:
@@ -938,7 +976,8 @@ The integration is complete only when all of the following are true:
 - ZeroClaw can receive durable runtime events through stream and polling
   fallback.
 - ZeroClaw can recover from duplicate delivery, disconnects, and stale cursors.
-- ZeroClaw can mirror peer lifecycle, subscription, context, and vote state in
+- ZeroClaw can mirror peer lifecycle, context, and vote state, plus local
+  desired/effective subscriptions and best-effort observed effective edges, in
   a dedicated store outside memory.
 - ZeroClaw can maintain accurate vote-derived fields through reconciliation.
 - Heartbeat, cron, and explicit tools can read mirrored peer state without

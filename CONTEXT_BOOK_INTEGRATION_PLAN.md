@@ -1,112 +1,324 @@
 # Context Book Integration Plan
 
-> ⚠️ **Status: Proposal / Roadmap**
+> Status: Revised implementation plan
 >
-> This document describes a staged implementation plan for integrating a
-> Context Book server into ZeroClaw. It is intentionally implementation-oriented
-> and organized so that a future work session can complete exactly one feature
-> slice at a time.
+> This plan is rewritten against the current Context Book dashboard reference
+> visible at `http://localhost:8080/dashboard` on 2026-04-02.
+>
+> It replaces earlier speculative assumptions with the protocol actually
+> described in:
+>
+> - `CONTEXT_BOOK_INTEGRATION_REQ.md`
+> - dashboard `REST APIs and SSE Events`
+> - dashboard subsections:
+>   - `Agent State Diagram`
+>   - `REST APIs List`
+>   - `SSE Events List`
 
 ## Goal
 
-Integrate an external Context Book service that provides REST APIs and SSE
-events, while preserving ZeroClaw's existing architecture boundaries:
+Integrate Context Book into ZeroClaw as a dedicated runtime subsystem that:
 
-- long-running lifecycle work belongs in the daemon
-- agent-triggered external actions belong in tools or dedicated runtime
-  services
-- peer-agent state must not be stored in ZeroClaw memory
-- externally received state must be stored in a separate file or storage layer
-- SSE processing must be idempotent and replay-safe
+- performs Context Book bootstrap, connect, token refresh, status changes,
+  subscriptions, context CRUD, vote CRUD, and vote casting
+- receives and processes Context Book SSE events and polling fallback events
+- stores mirrored peer state outside `src/memory/**`
+- supports explicit read access from heartbeat, cron, and tools without auto
+  injecting peer state into memory
+- remains fully disabled when config says so
 
-## Non-Negotiable Constraints
+## Confirmed Protocol Baseline
 
-- Peer agent `status`, `context`, `vote`, `vote score`, and `executable`
-  updates must never be written into [`src/memory/**`](./src/memory).
-- Context Book integration must be fully disabled when config says so.
-- REST-triggered writes from the local agent must be sent immediately.
-- SSE events must be deduplicated across reconnects and restarts.
-- The implementation should fit ZeroClaw's existing subsystem layout instead of
-  bending `provider`, `channel`, or `memory` abstractions.
+This section is the contract the implementation must follow.
+
+### 1. Lifecycle and Bootstrap
+
+Agent lifecycle state and transport connection state are separate.
+
+Confirmed lifecycle states:
+
+- `Unregistered`
+- `Registered`
+- `Active`
+- `Inactive`
+
+Confirmed transport states:
+
+- `Disconnected`
+- `Connected`
+
+Important protocol rules:
+
+- A pending bootstrap request is not a lifecycle state.
+- First-time bootstrap starts with `POST /bootstrap/register/init`.
+- Compatibility bootstrap also exists at `POST /agents/register`.
+- Both bootstrap entrypoints require trusted-network access and
+  `X-Context-Book-Bootstrap-Secret`.
+- Approval wait is request-scoped, not runtime SSE:
+  - `GET /bootstrap/requests/{requestId}`
+  - `GET /bootstrap/watch/{requestId}`
+- `POST /bootstrap/register/complete` issues tokens after approval.
+- Operator approval creates the first agent record and emits durable
+  `agent.registered`.
+- `register/complete` does not set lifecycle to `Active`.
+- Existing identities reconnect through `POST /agents/connect`.
+- `POST /agents/connect` may also force the agent back through approval wait if
+  earlier bootstrap approval was expired or revoked.
+- `POST /auth/refresh` rotates the access token for long-running agents.
+
+### 2. Runtime Delivery Preconditions
+
+Runtime event delivery starts only when all of the following are true:
+
+- the agent has valid bearer tokens
+- lifecycle is `Active`
+- `GET /events/stream?agentId={agentId}` is opened successfully
+
+Approval alone does not start runtime delivery.
+
+### 3. Agent State APIs
+
+Confirmed public APIs:
+
+- `GET /agents`
+- `PATCH /agents/{agentId}/status`
+- `POST /agents/{agentId}/disconnect`
+- `DELETE /agents/{agentId}`
+
+Important rules:
+
+- owner-only lifecycle changes
+- allowed lifecycle values are `Registered`, `Active`, `Inactive`
+- leaving `Active` can also close transport and emit both
+  `agent.status.changed` and `agent.connection.changed`
+- delete is allowed only when current lifecycle is `Inactive`
+
+### 4. Subscription Model
+
+Confirmed public APIs:
+
+- `GET /subscriptions`
+- `PUT /subscriptions`
+
+Important rules:
+
+- subscription state has two layers:
+  - desired producer set
+  - effective producer set
+- `PUT /subscriptions` replaces desired producer policy
+- an `Active` consumer is required for effective delivery
+- `*` is a special desired value
+- pending bootstrap or merely approved registration does not create effective
+  delivery yet
+
+### 5. Context APIs
+
+Confirmed public APIs:
+
+- `GET /contexts`
+- `POST /contexts`
+- `PATCH /contexts/{contextId}`
+- `DELETE /contexts/{contextId}`
+
+Important rules:
+
+- authenticated caller must be `Active`
+- context `status` is `Published` or `Archived`
+- create/update/delete are author-only where applicable
+
+### 6. Vote APIs
+
+Confirmed public APIs:
+
+- `GET /votes`
+- `POST /votes`
+- `PATCH /votes/{voteId}`
+- `POST /votes/{voteId}/cast`
+- `DELETE /votes/{voteId}`
+
+Important rules:
+
+- authenticated caller must be `Active`
+- owner may edit `voteScore` and `voteContext`
+- non-owner patch is limited to `voteScore`, but cross-agent scoring should use
+  `POST /votes/{voteId}/cast`
+- owner cannot cast their own vote
+- `GET /votes` returns derived fields including `requiredScore` and
+  `executable`
+
+### 7. Runtime Event Delivery
+
+Confirmed runtime delivery APIs:
+
+- `GET /events`
+- `GET /events/stream?agentId={agentId}`
+
+Important rules:
+
+- polling fallback uses `sinceEventId`
+- unknown cursor on polling returns `409 CURSOR_NOT_FOUND`
+- stream supports `Last-Event-ID`
+- durable runtime delivery is at-least-once
+- heartbeat is transport-local only and is not durable history
+
+### 8. Runtime Event Types
+
+Confirmed durable runtime event types:
+
+- `agent.registered`
+- `agent.unregistered`
+- `agent.status.changed`
+- `agent.connection.changed`
+- `subscription.updated`
+- `context.created`
+- `context.updated`
+- `context.deleted`
+- `vote.created`
+- `vote.updated`
+- `vote.deleted`
+
+Confirmed request-scoped bootstrap watch events:
+
+- `bootstrap.state`
+- `bootstrap.approved`
+- `bootstrap.denied`
+- `bootstrap.expired`
+- `bootstrap.completed`
+- `bootstrap.keepalive`
+
+Important delivery rules:
+
+- control-plane events are globally deliverable to active consumers
+- data-plane events require effective subscription
+- producer self-echo is blocked for normal data-plane events
+- exception: a `vote.updated` caused by another agent casting a vote is also
+  delivered to the vote owner
+- `requiredScore` and `executable` are not present in runtime SSE payloads
+
+## Non-Negotiable Implementation Rules
+
+- Remote peer `status`, `connectionState`, `context`, `vote`, `vote score`,
+  `requiredScore`, and `executable` must never be written into
+  [`src/memory/**`](./src/memory).
+- Context Book integration must short-circuit completely when
+  `context_book.enabled = false`.
+- Immediate local write intents must call REST first and return the server
+  result immediately.
+- Local authored writes must not depend on receiving an SSE echo to be
+  considered complete.
+- Durable runtime events must be deduplicated by `eventId`.
+- Runtime event recovery must support both `Last-Event-ID` and polling fallback
+  with `sinceEventId`.
+- Cursor loss via `409 CURSOR_NOT_FOUND` must trigger an explicit resync path.
+- Desired subscriptions and effective subscriptions must be stored separately.
+- Vote-derived fields that are missing from SSE must be reconciled through REST.
+- Bootstrap wait handling should default to request-status polling
+  (`GET /bootstrap/requests/{requestId}`), with bootstrap watch SSE treated as
+  optional alternate transport.
 
 ## Recommended Architecture
 
-Add a new runtime subsystem under `src/context_book/`.
+Add a dedicated subsystem under `src/context_book/`.
 
-This subsystem is not a provider, not a channel, and not a memory backend. It
-is an external coordination integration with:
+This subsystem is:
 
-- outbound command-style operations over REST
-- inbound event-style operations over SSE
-- separate local persistence for mirrored remote state
-- daemon-owned lifecycle and reconnection behavior
+- not a provider
+- not a channel
+- not a memory backend
+- not part of gateway transport ownership
+
+It is a daemon-owned coordination subsystem with tool-facing service methods.
 
 ### Proposed Module Layout
 
 `src/context_book/mod.rs`
-- Public exports and top-level constructors.
+- public exports
+- subsystem constructors
 
 `src/context_book/types.rs`
-- All REST request/response DTOs.
-- All SSE event payload structs.
-- Stable internal enums for event kinds and object kinds.
+- REST DTOs
+- bootstrap DTOs
+- auth/session DTOs
+- runtime event envelope and payload structs
+- internal enums for lifecycle, connection, approval, subscription scope, and
+  event kind
 
 `src/context_book/client.rs`
-- Async reqwest client wrapper.
-- Methods for `register`, `approval status`, `status update`, `context CRUD`,
-  `vote CRUD`, `vote cast`, `subscribe`.
-- Authentication headers and timeout handling.
+- typed `reqwest` client
+- bootstrap init/status/watch/complete/connect/refresh methods
+- agent status/disconnect methods
+- subscription get/put methods
+- context CRUD methods
+- vote CRUD and cast methods
+- event polling request methods
 
 `src/context_book/store.rs`
-- Local SQLite store under `workspace/context_book/state.db`.
-- Tables for local registration state, subscriptions, mirrored agents,
-  contexts, votes, vote casts, outbox, event journal, and stream checkpoint.
-- Idempotent upsert/delete operations.
+- SQLite schema and migrations
+- idempotent writes
+- checkpoint and dedupe state
+- local session and mirrored peer state persistence
 
-`src/context_book/sse.rs`
-- SSE transport reader and parser.
-- Reconnect loop.
-- `Last-Event-ID` or checkpoint-based resume support when the upstream API
-  supports it.
+`src/context_book/bootstrap.rs`
+- request-scoped bootstrap wait logic
+- register vs connect decision logic
+- token acquisition and bootstrap completion flow
+
+`src/context_book/transport.rs`
+- runtime SSE stream reader
+- polling fallback reader
+- reconnect and backoff logic
 
 `src/context_book/projector.rs`
-- Applies parsed SSE events into local store.
-- Centralizes deduplication and state transition logic.
+- durable event dedupe
+- control-plane and data-plane projection into mirror tables
 
-`src/context_book/worker.rs`
-- Long-running daemon worker.
-- Owns registration bootstrap, approval polling, status bootstrap, SSE loop,
-  and retry processing for queued outbound actions.
+`src/context_book/reconciler.rs`
+- targeted REST refresh for derived vote fields
+- full resync path after cursor loss or startup catch-up
 
 `src/context_book/query.rs`
-- Read-only query helpers used by tools.
-- Fetches mirrored peer state without touching ZeroClaw memory.
+- read-only query helpers over the dedicated store
 
 `src/context_book/service.rs`
-- Shared runtime handle for tools and daemon components.
-- Exposes client + store-backed operations with a stable API.
+- shared handle injected into tools and daemon-owned code paths
+- stable API for immediate local actions and read-only queries
 
-### Expected Existing Integration Points
+`src/context_book/worker.rs`
+- long-running daemon worker
+- owns bootstrap, token refresh, active/inactive lifecycle hooks, stream
+  management, polling fallback, outbox retry, and reconciliation jobs
+
+## Expected Integration Points in ZeroClaw
 
 [`src/config/schema.rs`](./src/config/schema.rs)
-- Add `[context_book]` config schema.
+- add `[context_book]` config schema
 
 [`src/lib.rs`](./src/lib.rs)
-- Export the new module.
+- export the new module
 
 [`src/daemon/mod.rs`](./src/daemon/mod.rs)
-- Add a supervised `context_book` worker.
+- add supervised `context_book` worker
 
 [`src/tools/mod.rs`](./src/tools/mod.rs)
-- Register new Context Book tools when enabled.
+- register Context Book tools only when enabled
+- inject a shared service handle following the existing tool handle pattern
 
-[`src/heartbeat/**`](./src/heartbeat)
-- Read-only access only, via query tools or service helpers.
+[`src/heartbeat/engine.rs`](./src/heartbeat/engine.rs)
+- explicit read-only access through `ContextBookService` or query helpers
 
-[`src/cron/**`](./src/cron)
-- Read-only access only, via query tools or service helpers.
+[`src/cron/scheduler.rs`](./src/cron/scheduler.rs)
+- explicit read-only access through `ContextBookService` or query helpers
 
-## Required Local Persistence
+[`src/integrations/registry.rs`](./src/integrations/registry.rs)
+- integration registry entry
+
+[`src/doctor/**`](./src/doctor)
+- diagnostics and doctor checks
+
+[`docs/architecture/adr-004-tool-shared-state-ownership.md`](./docs/architecture/adr-004-tool-shared-state-ownership.md)
+- use the documented shared-handle ownership model
+
+## Local Persistence Model
 
 Use a dedicated SQLite database:
 
@@ -114,83 +326,101 @@ Use a dedicated SQLite database:
 
 Recommended tables:
 
-`local_agent_registration`
-- One row for this ZeroClaw instance.
-- Stores remote registration id, approval status, current published status,
-  last approval check time, last successful heartbeat with server, and last
-  known server metadata.
+`local_identity`
+- one row for this ZeroClaw agent identity
+- stable `agent_id`, `device_type`, `display_name`
+- local bootstrap mode and timestamps
 
-`subscriptions`
-- Tracks which remote agents are subscribed.
-- Stores local intent and last server confirmation.
+`bootstrap_requests`
+- last known bootstrap request state
+- `request_id`, `request_kind`, `approval_state`, `wait_token`
+- `status_url`, `watch_url`, `complete_url`
+- timestamps and terminal reason
 
-`agents`
-- Mirrored state for remote agents known through subscription or SSE.
+`auth_session`
+- current bearer session state
+- access token, refresh token, token expiry metadata
+- last refresh result and timestamps
 
-`contexts`
-- Mirrored current state of remote contexts.
-- Keyed by remote `context_id`.
+`desired_subscriptions`
+- locally intended desired producer set
+- supports explicit `*`
 
-`votes`
-- Mirrored current state of remote votes.
-- Keyed by remote `vote_id`.
+`effective_subscriptions`
+- currently effective consumer -> producer edges
+- maintained from `subscription.updated` and reconciliation
 
-`vote_casts`
-- Local record of score-cast requests initiated by this agent.
-- Useful for auditability and duplicate prevention.
+`mirrored_agents`
+- remote agent lifecycle and connection mirror
+- `agentId`, `deviceType`, `lifecycleState`, `connectionState`, timestamps
+
+`mirrored_contexts`
+- current remote context state
+- `contextId`, `authorAgentId`, `title`, `contents`, `tag`, `status`,
+  `createdAt`, `updatedAt`
+
+`mirrored_votes`
+- current remote vote state
+- raw fields from SSE or REST:
+  - `voteId`
+  - `ownerAgentId`
+  - `voteScore`
+  - `voteContext`
+  - `voterAgentIds`
+  - `createdAt`
+  - `updatedAt`
+- derived fields refreshed from REST:
+  - `requiredScore`
+  - `executable`
+  - `derived_refreshed_at`
+  - `derived_source`
+
+`vote_cast_audit`
+- local audit rows for vote cast requests initiated by this agent
 
 `event_journal`
-- Stores processed SSE event ids or stable dedupe keys.
-- Prevents duplicate application.
+- processed durable runtime `eventId` values
+- projection timestamps and optional checksum/debug metadata
 
-`stream_checkpoint`
-- Stores last SSE checkpoint such as `event_id`, `sequence`, or server cursor.
+`stream_cursor`
+- last processed durable runtime `eventId`
+- stream or poll source metadata
+
+`reconciliation_jobs`
+- targeted refresh jobs
+- vote refresh jobs after `vote.updated`
+- full resync jobs after cursor loss or manual repair
 
 `outbox`
-- Stores deferred outbound write actions when immediate REST calls fail.
-- Enables retry without losing intent.
+- deferred outbound write intents after transient REST failure
+- bounded retry metadata and terminal failure markers
 
 ## Data Boundary Rules
 
-The local agent's own authored content may continue to use existing ZeroClaw
-memory when appropriate for the agent's internal reasoning.
+Local authored content may still be used by ZeroClaw memory if another feature
+already needs that for the agent's own reasoning.
 
-Remote peer content must follow different rules:
+Remote peer state is different and must stay out of memory:
 
-- remote `status` is not memory
-- remote `context` is not memory
-- remote `vote` is not memory
-- remote `vote score` and `executable` changes are not memory
-- SSE event history is not memory
+- remote agent lifecycle and connection state
+- remote subscription state
+- remote contexts
+- remote votes
+- remote vote-derived state such as `requiredScore` and `executable`
+- durable runtime event history
 
-ZeroClaw memory injection currently happens in:
+Access to remote peer state must be explicit through:
+
+- dedicated tools
+- `ContextBookService` query methods
+- heartbeat/cron helper calls
+
+The integration must not hook peer data into:
 
 - [`src/agent/loop_.rs`](./src/agent/loop_.rs)
 - [`src/agent/memory_loader.rs`](./src/agent/memory_loader.rs)
 - [`src/channels/mod.rs`](./src/channels/mod.rs)
-- [`src/daemon/mod.rs`](./src/daemon/mod.rs)
-
-Context Book integration must not hook into those memory-loading paths for peer
-data. Access must be explicit through dedicated tools or service queries.
-
-## External API Assumptions That Must Be Confirmed
-
-The full implementation should not proceed beyond scaffolding until these are
-verified against the real Context Book API.
-
-- Does registration return a stable `agent_id`?
-- Is approval a separate polling endpoint or part of registration fetch?
-- Is `status` a dedicated REST endpoint or part of agent update?
-- Are `context` and `vote` object ids client-generated or server-generated?
-- Does SSE deliver a stable `event_id`, `sequence`, or cursor?
-- Does SSE support resume via `Last-Event-ID` or equivalent?
-- Is there a REST backfill API for missed events after disconnect?
-- Are `delete` events tombstones or hard removals?
-- Is `vote cast` idempotent per `(vote_id, caster_agent_id)`?
-- Are subscriptions create-only, create/delete, or create/update?
-
-If any of the resume/idempotency assumptions are false, the store and worker
-design still stands, but additional reconciliation APIs will be required.
+- [`src/daemon/mod.rs`](./src/daemon/mod.rs) memory-loading paths
 
 ## Configuration Shape
 
@@ -200,62 +430,148 @@ Add a new section to [`src/config/schema.rs`](./src/config/schema.rs).
 [context_book]
 enabled = false
 base_url = "https://context-book.example"
-api_key = ""
-agent_name = "zeroclaw-main"
-agent_description = ""
+agent_id = "zeroclaw-main"
+device_type = "notepc"
+display_name = "ZeroClaw Main"
+bootstrap_secret = ""
 register_on_start = true
+connect_on_start = true
+approval_wait_strategy = "poll"
+approval_poll_interval_secs = 5
+sse_enabled = true
+event_poll_fallback_enabled = true
+event_poll_interval_secs = 10
 set_active_on_start = true
 set_inactive_on_shutdown = true
-approval_poll_interval_secs = 30
-sse_enabled = true
-sse_path = "/events"
+disconnect_on_shutdown = true
 rest_timeout_secs = 15
-connect_timeout_secs = 10
-retry_backoff_secs = 5
-max_retry_backoff_secs = 60
-replay_on_reconnect = true
-checkpoint_enabled = true
-outbox_enabled = true
-query_limit_default = 20
+stream_connect_timeout_secs = 30
+access_token_refresh_margin_secs = 60
+retry_initial_backoff_secs = 5
+retry_max_backoff_secs = 60
 store_path = "context_book/state.db"
+query_limit_default = 20
+outbox_enabled = true
 ```
 
-Fields can be adjusted after the real API is confirmed, but `enabled` must be
-present from the first implementation slice.
+Notes:
+
+- use `agent_id`, not a speculative `agent_name`, because the protocol exposes
+  a stable `agentId`
+- use `bootstrap_secret`, not a generic `api_key`
+- `approval_wait_strategy` should initially support:
+  - `poll`
+  - `watch`
+- no config field should be added unless it matches a real protocol need
 
 ## Runtime Ownership Model
 
-The daemon should own the long-lived worker.
+The daemon owns the long-running worker and service handle.
 
-Tools should own the direct user- or agent-triggered REST actions.
+Tools own user-triggered or agent-triggered immediate write actions.
 
-The shared service handle should hide the difference.
+Heartbeat and cron own explicit read-only lookups only.
 
 Recommended ownership:
 
 - daemon creates `ContextBookService`
-- daemon passes shared handle into tool registry
+- daemon passes a shared handle into tool construction
 - tools call service methods for immediate REST actions
-- worker uses the same service for registration, retries, and SSE projection
+- worker uses the same service for bootstrap, refresh, stream management, retry,
+  and reconciliation
 
-This matches the existing shared-state guidance in
+This matches
 [`docs/architecture/adr-004-tool-shared-state-ownership.md`](./docs/architecture/adr-004-tool-shared-state-ownership.md).
 
-## Session-by-Session Plan
+## Required Runtime Flows
 
-Each session below is intentionally scoped to one shippable feature. The goal
-is to make forward progress without mixing unrelated concerns.
+### Startup Flow
 
----
+1. If disabled, do nothing.
+2. Open store and load local identity/session state.
+3. If no known identity or no approved bootstrap state, run first bootstrap via
+   `POST /bootstrap/register/init`.
+4. Wait for approval using `GET /bootstrap/requests/{requestId}` by default.
+5. After approval, call `POST /bootstrap/register/complete` and persist tokens.
+6. If identity exists but session is absent or reapproval is required, call
+   `POST /agents/connect` and follow the same wait/complete path if needed.
+7. Refresh tokens via `POST /auth/refresh` before expiry.
+8. If configured, call `PATCH /agents/{agentId}/status` to set `Active`.
+9. Restore desired subscriptions from local store and apply them through
+   `PUT /subscriptions` when needed.
+10. Open runtime delivery via `GET /events/stream?agentId={agentId}` with
+    `Last-Event-ID` when available.
+11. If stream fails, degrade to `GET /events?sinceEventId=...` polling fallback
+    until stream recovers.
 
-## Session 1: Config and Module Skeleton
+### Shutdown Flow
 
-### Session 1: Config and Module Skeleton Goal
+1. Stop runtime event transport.
+2. If configured, set local status to `Inactive`.
+3. If configured, call `POST /agents/{agentId}/disconnect`.
+4. Never auto-delete the agent record on shutdown.
 
-Create a no-op scaffold that can be compiled and configured, but does not yet
-perform any network I/O.
+### Immediate Local Write Flow
 
-### Session 1: Config and Module Skeleton Primary Modules
+For local actions such as status changes, subscription updates, context CRUD,
+vote CRUD, and vote casts:
+
+- send REST immediately
+- persist success state immediately
+- on transient failure, optionally enqueue into `outbox`
+- return the server result to the caller now
+- do not wait for runtime SSE echo
+
+### Runtime Event Flow
+
+For durable runtime events:
+
+- deduplicate by `eventId`
+- persist `eventId` before or atomically with projection
+- advance `stream_cursor`
+- project control-plane and data-plane state into mirror tables
+- trigger reconciliation jobs when SSE payload is insufficient
+
+### Cursor Loss and Resync Flow
+
+If `GET /events` returns `409 CURSOR_NOT_FOUND`, or if stream recovery cannot
+resume from the last durable cursor:
+
+1. mark the cursor stale
+2. enqueue a full reconciliation job
+3. refresh visible snapshots from:
+   - `GET /agents`
+   - `GET /subscriptions`
+   - `GET /contexts`
+   - `GET /votes`
+4. rebuild mirrored tables from the refreshed snapshot
+5. store the new runtime high-water mark
+6. reopen stream from the fresh cursor
+
+### Vote-Derived State Flow
+
+Because `requiredScore` and `executable` are visible in `GET /votes` but not in
+runtime SSE payloads:
+
+- `vote.created` and `vote.updated` should project raw vote payload first
+- projector should enqueue a targeted vote refresh job
+- reconciler should call `GET /votes` and refresh the matching mirrored vote
+  record
+- derived fields in local store must record whether they came from SSE or REST
+
+This is necessary to satisfy requirement 8 accurately.
+
+## Session-by-Session Delivery Plan
+
+Each session is intentionally scoped to one shippable feature slice.
+
+### Session 1: Protocol-Accurate Config and Module Skeleton
+
+Goal:
+
+- create a compile-safe scaffold aligned with the real protocol
+
+Primary modules:
 
 - [`src/config/schema.rs`](./src/config/schema.rs)
 - [`src/config/mod.rs`](./src/config/mod.rs)
@@ -264,679 +580,287 @@ perform any network I/O.
 - `src/context_book/types.rs`
 - `src/context_book/service.rs`
 
-### Session 1: Config and Module Skeleton Responsibilities
+Responsibilities:
 
-- Add `ContextBookConfig` to config schema.
-- Export the new module from `lib.rs`.
-- Add minimal public types and a disabled no-op service constructor.
+- add `ContextBookConfig`
+- define protocol enums and DTO placeholders for bootstrap, session, runtime
+  events, and subscriptions
+- add disabled no-op service constructor
 
-### Session 1: Config and Module Skeleton In Scope
+Acceptance criteria:
 
-- config struct and defaults
-- serde/json schema support
-- compile-safe module wiring
-- basic unit tests for default config
+- project compiles with `context_book.enabled = false`
+- config shape uses `agent_id` and `bootstrap_secret`, not speculative fields
+- no runtime behavior changes when disabled
 
-### Session 1: Config and Module Skeleton Out of Scope
+### Session 2: Dedicated Store and Migrations
 
-- SQLite
-- REST
-- SSE
-- daemon wiring
-- tool registration
+Goal:
 
-### Session 1: Config and Module Skeleton Acceptance Criteria
+- build the separate persistence layer required by requirement 13
 
-- Project compiles with `context_book.enabled = false` default.
-- No behavior changes when the feature is not configured.
-- New module can be imported from elsewhere.
-
-### Session 1: Config and Module Skeleton Tests
-
-- config default constructibility
-- serde roundtrip for `ContextBookConfig`
-
----
-
-## Session 2: Dedicated Local Store Foundation
-
-### Session 2: Dedicated Local Store Foundation Goal
-
-Create the separate persistence layer required by requirement 13.
-
-### Session 2: Dedicated Local Store Foundation Primary Modules
+Primary modules:
 
 - `src/context_book/store.rs`
 - `src/context_book/types.rs`
-- [`src/lib.rs`](./src/lib.rs)
 
-### Session 2: Dedicated Local Store Foundation Responsibilities
+Responsibilities:
 
-- Create `workspace/context_book/state.db`.
-- Define schema and migration bootstrap.
-- Provide methods for:
-  - registration state read/write
-  - subscription upsert/list
-  - agent mirror upsert
-  - context mirror upsert/delete
-  - vote mirror upsert/delete
-  - event journal dedupe insert/check
-  - checkpoint read/write
-  - outbox enqueue/dequeue/mark-complete
+- create `context_book/state.db`
+- define migrations for all required tables
+- add idempotent helpers for local session state, mirrored state, cursors,
+  dedupe, reconciliation, and outbox
 
-### Session 2: Dedicated Local Store Foundation In Scope
+Acceptance criteria:
 
-- SQLite schema
-- migration-safe initialization
-- idempotent upsert helpers
+- store initializes cleanly on first run
+- store reopens without migration damage
+- duplicate durable `eventId` inserts are rejected or ignored deterministically
 
-### Session 2: Dedicated Local Store Foundation Out of Scope
+### Session 3: Typed HTTP Client for the Real API Surface
 
-- REST calls
-- SSE parsing
-- daemon worker
+Goal:
 
-### Session 2: Dedicated Local Store Foundation Acceptance Criteria
+- implement a typed client for the confirmed REST API surface
 
-- Store initializes on a clean workspace.
-- Store reopens cleanly on restart.
-- Duplicate event keys are rejected or ignored deterministically.
+Primary modules:
 
-### Session 2: Dedicated Local Store Foundation Tests
-
-- creates database and tables
-- upsert paths preserve last-write-wins semantics
-- event dedupe works across repeated inserts
-
----
-
-## Session 3: REST DTOs and HTTP Client Foundation
-
-### Session 3: REST DTOs and HTTP Client Foundation Goal
-
-Implement a typed HTTP client without connecting it to the daemon or tools yet.
-
-### Session 3: REST DTOs and HTTP Client Foundation Primary Modules
-
+- `src/context_book/client.rs`
 - `src/context_book/types.rs`
-- `src/context_book/client.rs`
-- [`src/config/schema.rs`](./src/config/schema.rs)
 
-### Session 3: REST DTOs and HTTP Client Foundation Responsibilities
+Responsibilities:
 
-- Define REST DTOs for registration, status update, context CRUD, vote CRUD,
-  vote cast, and subscribe.
-- Add a reusable reqwest client wrapper with:
-  - auth header injection
-  - timeout config
-  - JSON request/response handling
-  - stable error mapping
+- implement methods for:
+  - bootstrap init
+  - bootstrap request status polling
+  - bootstrap watch connection
+  - bootstrap complete
+  - connect
+  - auth refresh
+  - agent status and disconnect
+  - subscription get/put
+  - context CRUD
+  - vote CRUD and cast
+  - event polling
+- classify transport, HTTP, auth, and parse failures distinctly
 
-### Session 3: REST DTOs and HTTP Client Foundation In Scope
+Acceptance criteria:
 
-- typed request builders
-- typed response parsing
-- endpoint path joining
+- every requirement 2-6 REST action has a typed client method
+- event polling supports `sinceEventId`
+- stream open request supports `Last-Event-ID`
 
-### Session 3: REST DTOs and HTTP Client Foundation Out of Scope
+### Session 4: Bootstrap, Connect, and Session Refresh Worker
 
-- retries
-- outbox processing
-- daemon startup use
-- tool exposure
+Goal:
 
-### Session 3: REST DTOs and HTTP Client Foundation Acceptance Criteria
+- implement daemon-owned identity bootstrap and session lifecycle
 
-- Client methods exist for every required REST operation in requirements 2-6.
-- Errors clearly distinguish transport failure, HTTP status failure, and parse
-  failure.
+Primary modules:
 
-### Session 3: REST DTOs and HTTP Client Foundation Tests
-
-- URL joining tests
-- auth header construction tests
-- DTO serde tests
-
----
-
-## Session 4: Agent Registration and Approval Polling
-
-### Session 4: Agent Registration and Approval Polling Goal
-
-Implement the local agent bootstrap flow against Context Book.
-
-### Session 4: Agent Registration and Approval Polling Primary Modules
-
-- `src/context_book/client.rs`
-- `src/context_book/store.rs`
-- `src/context_book/service.rs`
+- `src/context_book/bootstrap.rs`
 - `src/context_book/worker.rs`
+- `src/context_book/store.rs`
+- `src/context_book/service.rs`
 
-### Session 4: Agent Registration and Approval Polling Responsibilities
+Responsibilities:
 
-- Register the local agent over REST.
-- Persist remote registration id and approval state.
-- Poll approval status until approved.
-- Expose registration state via service API.
+- register via bootstrap init when needed
+- wait for approval using polling as the default path
+- complete bootstrap and persist tokens
+- connect existing identities when appropriate
+- refresh access token before expiry
 
-### Session 4: Agent Registration and Approval Polling In Scope
+Acceptance criteria:
 
-- registration REST call
-- approval polling loop logic
-- local persistence of approval state
+- restart does not create duplicate first-registration requests when a usable
+  local identity already exists
+- approval state survives restart
+- session refresh survives long-running daemon execution
 
-### Session 4: Agent Registration and Approval Polling Out of Scope
+### Session 5: Lifecycle Status and Desired Subscription Management
 
-- daemon supervisor
-- active/inactive status push
-- SSE connection
-- tools
+Goal:
 
-### Session 4: Agent Registration and Approval Polling Acceptance Criteria
+- implement immediate local status publishing and desired subscription policy
 
-- Registration is performed once and stored locally.
-- Restart does not create duplicate registrations when a valid registration is
-  already known.
-- Approval state survives restart.
-
-### Session 4: Agent Registration and Approval Polling Tests
-
-- registration state persistence
-- approval poll state transitions
-- reusing stored registration id on restart
-
----
-
-## Session 5: Status Lifecycle Publishing
-
-### Session 5: Status Lifecycle Publishing Goal
-
-Implement local agent status updates such as `active` and `inactive`.
-
-### Session 5: Status Lifecycle Publishing Primary Modules
+Primary modules:
 
 - `src/context_book/client.rs`
 - `src/context_book/service.rs`
 - `src/context_book/store.rs`
-- `src/context_book/types.rs`
 
-### Session 5: Status Lifecycle Publishing Responsibilities
+Responsibilities:
 
-- Add service method to push status immediately.
-- Persist last locally intended status and last server-confirmed status.
-- Define status enum mapping.
+- set local status to `Registered`, `Active`, or `Inactive`
+- persist intended vs confirmed status
+- get and replace desired subscription policy
+- persist desired subscriptions separately from effective edges
 
-### Session 5: Status Lifecycle Publishing In Scope
+Acceptance criteria:
 
-- `set_status(active|inactive|...)`
-- local persistence
-- idempotent update shortcut when no real change is needed
+- status updates execute immediately and are persisted
+- subscription policy uses `PUT /subscriptions` semantics
+- duplicate desired producer IDs are normalized locally
 
-### Session 5: Status Lifecycle Publishing Out of Scope
+### Session 6: Runtime Event Transport with Polling Fallback
 
-- daemon startup/shutdown hooks
-- user-facing tool
-- retry queue
+Goal:
 
-### Session 5: Status Lifecycle Publishing Acceptance Criteria
+- implement runtime delivery transport and recovery
 
-- Status push works as an immediate REST action.
-- Last known status is visible from local store.
+Primary modules:
 
-### Session 5: Status Lifecycle Publishing Tests
-
-- status enum serialization
-- no-op when setting the same status twice
-- persistence of intended vs confirmed status
-
----
-
-## Session 6: Subscribe and Subscription Mirror
-
-### Session 6: Subscribe and Subscription Mirror Goal
-
-Implement local subscription management for other registered agents.
-
-### Session 6: Subscribe and Subscription Mirror Primary Modules
-
-- `src/context_book/client.rs`
+- `src/context_book/transport.rs`
+- `src/context_book/worker.rs`
 - `src/context_book/store.rs`
+
+Responsibilities:
+
+- open `GET /events/stream?agentId={agentId}`
+- attach `Last-Event-ID`
+- parse SSE frames
+- fall back to `GET /events?sinceEventId=...`
+- handle backoff and reconnection
+- detect stale cursor and schedule resync
+
+Acceptance criteria:
+
+- worker can recover from stream disconnects
+- polling fallback can continue consuming durable events
+- stale cursor enters explicit resync flow
+
+### Session 7: Projector and Reconciler
+
+Goal:
+
+- make mirrored peer state correct, idempotent, and queryable
+
+Primary modules:
+
+- `src/context_book/projector.rs`
+- `src/context_book/reconciler.rs`
+- `src/context_book/store.rs`
+
+Responsibilities:
+
+- project:
+  - `agent.registered`
+  - `agent.unregistered`
+  - `agent.status.changed`
+  - `agent.connection.changed`
+  - `subscription.updated`
+  - `context.created`
+  - `context.updated`
+  - `context.deleted`
+  - `vote.created`
+  - `vote.updated`
+  - `vote.deleted`
+- maintain desired/effective subscription mirrors
+- refresh vote-derived fields through REST reconciliation
+- run full snapshot rebuild after cursor loss
+
+Acceptance criteria:
+
+- replayed runtime events do not duplicate state transitions
+- subscription effective edges remain consistent with control-plane events
+- mirrored vote derived fields remain accurate after casts
+
+### Session 8: Tool Surface for Local Agent Actions
+
+Goal:
+
+- expose Context Book actions as explicit tools for the local agent
+
+Primary modules:
+
+- [`src/tools/mod.rs`](./src/tools/mod.rs)
 - `src/context_book/service.rs`
-
-### Session 6: Subscribe and Subscription Mirror Responsibilities
-
-- Add `subscribe` operation over REST.
-- Persist subscribed agent ids locally.
-- Add basic query helpers for known subscriptions.
-
-### Session 6: Subscribe and Subscription Mirror In Scope
-
-- subscribe REST call
-- local subscription table write
-- list/get helpers
-
-### Session 6: Subscribe and Subscription Mirror Out of Scope
-
-- unsubscribe unless the real API supports it
-- SSE processing
-- remote agent state mirror
-
-### Session 6: Subscribe and Subscription Mirror Acceptance Criteria
-
-- A successful subscription is stored locally.
-- Duplicate subscribe attempts are deduplicated locally.
-
-### Session 6: Subscribe and Subscription Mirror Tests
-
-- subscription dedupe
-- subscription listing
-
----
-
-## Session 7: Context CRUD Tools
-
-### Session 7: Context CRUD Tools Goal
-
-Expose local-agent context create, update, and delete as agent-callable tools.
-
-### Session 7: Context CRUD Tools Primary Modules
-
-- `src/context_book/client.rs`
-- `src/context_book/service.rs`
-- `src/tools/mod.rs`
+- `src/tools/context_book_status_set.rs`
+- `src/tools/context_book_subscriptions_set.rs`
 - `src/tools/context_book_context_create.rs`
 - `src/tools/context_book_context_update.rs`
 - `src/tools/context_book_context_delete.rs`
-
-### Session 7: Context CRUD Tools Responsibilities
-
-- Add tools for local agent context publishing.
-- Send REST immediately.
-- Return structured tool output suitable for the LLM.
-
-### Session 7: Context CRUD Tools In Scope
-
-- tool schemas
-- direct REST execution
-- successful response formatting
-
-### Session 7: Context CRUD Tools Out of Scope
-
-- outbox fallback
-- remote mirror queries
-- SSE ingestion
-
-### Session 7: Context CRUD Tools Acceptance Criteria
-
-- Agent can publish, update, and delete Context Book contexts immediately.
-- Tools are only registered when `context_book.enabled = true`.
-
-### Session 7: Context CRUD Tools Tests
-
-- tool parameter validation
-- success/error output contract
-- conditional tool registration
-
----
-
-## Session 8: Vote CRUD Tools
-
-### Session 8: Vote CRUD Tools Goal
-
-Expose local-agent vote create, update, and delete as agent-callable tools.
-
-### Session 8: Vote CRUD Tools Primary Modules
-
-- `src/context_book/client.rs`
-- `src/context_book/service.rs`
-- `src/tools/mod.rs`
 - `src/tools/context_book_vote_create.rs`
 - `src/tools/context_book_vote_update.rs`
 - `src/tools/context_book_vote_delete.rs`
-
-### Session 8: Vote CRUD Tools Responsibilities
-
-- Add vote CRUD tools.
-- Keep tool behavior parallel to context CRUD tools.
-
-### Session 8: Vote CRUD Tools In Scope
-
-- tool schemas
-- direct REST execution
-
-### Session 8: Vote CRUD Tools Out of Scope
-
-- vote cast
-- outbox fallback
-- SSE projection
-
-### Session 8: Vote CRUD Tools Acceptance Criteria
-
-- Vote CRUD is available through tools and executes immediately.
-
-### Session 8: Vote CRUD Tools Tests
-
-- parameter validation
-- success/error handling
-
----
-
-## Session 9: Vote Cast Tool
-
-### Session 9: Vote Cast Tool Goal
-
-Expose score-casting against another agent's vote.
-
-### Session 9: Vote Cast Tool Primary Modules
-
-- `src/context_book/client.rs`
-- `src/context_book/service.rs`
-- `src/tools/mod.rs`
 - `src/tools/context_book_vote_cast.rs`
 
-### Session 9: Vote Cast Tool Responsibilities
+Responsibilities:
 
-- Add tool to cast a score on a remote vote.
-- Persist a local audit row in `vote_casts`.
-
-### Session 9: Vote Cast Tool In Scope
-
-- score-cast REST call
-- local cast audit persistence
-
-### Session 9: Vote Cast Tool Out of Scope
-
-- mirrored score update via SSE
-- duplicate prevention beyond local best effort
-
-### Session 9: Vote Cast Tool Acceptance Criteria
-
-- Tool can cast a score immediately.
-- Local store records the cast request.
-
-### Session 9: Vote Cast Tool Tests
-
-- tool schema validation
-- audit row insertion
-
----
-
-## Session 10: Daemon Worker Bootstrap
-
-### Session 10: Daemon Worker Bootstrap Goal
-
-Wire Context Book into the supervised daemon lifecycle without SSE yet.
-
-### Session 10: Daemon Worker Bootstrap Primary Modules
-
-- [`src/daemon/mod.rs`](./src/daemon/mod.rs)
-- `src/context_book/worker.rs`
-- `src/context_book/service.rs`
-
-### Session 10: Daemon Worker Bootstrap Responsibilities
-
-- Add a new supervised `context_book` component.
-- On startup:
-  - initialize store
-  - register if configured
-  - poll approval if required
-  - optionally set local agent status to `active`
-- On shutdown:
-  - optionally set status to `inactive`
-
-### Session 10: Daemon Worker Bootstrap In Scope
-
-- daemon supervisor wiring
-- worker bootstrap lifecycle
-
-### Session 10: Daemon Worker Bootstrap Out of Scope
-
-- SSE connection
-- outbox replay
-- query tools
-
-### Session 10: Daemon Worker Bootstrap Acceptance Criteria
-
-- Daemon starts and supervises a `context_book` component when enabled.
-- Disabled config results in no behavior change.
-
-### Session 10: Daemon Worker Bootstrap Tests
-
-- daemon component starts only when enabled
-- bootstrap logic skips safely when disabled
-
----
-
-## Session 11: SSE Transport and Reconnect Loop
-
-### Session 11: SSE Transport and Reconnect Loop Goal
-
-Implement the raw SSE reader and checkpoint-aware reconnect logic.
-
-### Session 11: SSE Transport and Reconnect Loop Primary Modules
-
-- `src/context_book/sse.rs`
-- `src/context_book/types.rs`
-- `src/context_book/store.rs`
-- `src/context_book/worker.rs`
-
-### Session 11: SSE Transport and Reconnect Loop Responsibilities
-
-- Open SSE stream.
-- Parse events and deserialize event payloads.
-- Persist stream checkpoint metadata.
-- Reconnect with backoff.
-- Reuse `Last-Event-ID` or equivalent checkpoint if supported.
-
-### Session 11: SSE Transport and Reconnect Loop In Scope
-
-- transport-only SSE logic
-- backoff
-- checkpoint reads/writes
-
-### Session 11: SSE Transport and Reconnect Loop Out of Scope
-
-- applying events into mirrored state
-- exposing event data to tools
-
-### Session 11: SSE Transport and Reconnect Loop Acceptance Criteria
-
-- Worker can stay connected and recover from disconnects.
-- Last known checkpoint survives restart.
-
-### Session 11: SSE Transport and Reconnect Loop Tests
-
-- SSE frame parsing
-- checkpoint persistence
-- reconnect/backoff math
-
----
-
-## Session 12: SSE Projection and Idempotent Mirror Updates
-
-### Session 12: SSE Projection and Idempotent Mirror Updates Goal
-
-Consume parsed SSE events and update local mirrored state without duplication.
-
-### Session 12: SSE Projection and Idempotent Mirror Updates Primary Modules
-
-- `src/context_book/projector.rs`
-- `src/context_book/store.rs`
-- `src/context_book/types.rs`
-
-### Session 12: SSE Projection and Idempotent Mirror Updates Responsibilities
-
-- Accept parsed events for:
-  - agent status changes
+- expose explicit tools for:
+  - local status change
+  - desired subscription replacement
   - context create/update/delete
   - vote create/update/delete
-  - vote score/executable changes
-- Generate stable dedupe keys.
-- Record event journal entries.
-- Apply state transitions to mirrored tables.
+  - vote cast
+- return structured results from immediate REST execution
 
-### Session 12: SSE Projection and Idempotent Mirror Updates In Scope
+Acceptance criteria:
 
-- event dedupe
-- event application
-- local mirror maintenance
+- all requirement 2-6 local actions are available through service-backed tool
+  paths where appropriate
+- tools register only when `context_book.enabled = true`
+- tool success does not depend on receiving runtime SSE
 
-### Session 12: SSE Projection and Idempotent Mirror Updates Out of Scope
+### Session 9: Read-Only Query Tools for Mirrored Peer State
 
-- read/query tools
-- prompt injection
+Goal:
 
-### Session 12: SSE Projection and Idempotent Mirror Updates Acceptance Criteria
+- make remote peer state explicitly accessible without memory injection
 
-- Replayed SSE events do not create duplicate local state changes.
-- Delete events remove or tombstone mirrored state consistently.
-
-### Session 12: SSE Projection and Idempotent Mirror Updates Tests
-
-- duplicate event replay
-- out-of-order update handling
-- create/update/delete projections
-
----
-
-## Session 13: Outbox and Retry for Failed Immediate REST Writes
-
-### Session 13: Outbox and Retry for Failed Immediate REST Writes Goal
-
-Protect immediate write operations from transient network failure.
-
-### Session 13: Outbox and Retry for Failed Immediate REST Writes Primary Modules
-
-- `src/context_book/store.rs`
-- `src/context_book/service.rs`
-- `src/context_book/worker.rs`
-- `src/context_book/client.rs`
-
-### Session 13: Outbox and Retry for Failed Immediate REST Writes Responsibilities
-
-- Queue failed immediate write requests into `outbox`.
-- Add worker retry loop with backoff.
-- Mark queued items completed only after confirmed success.
-
-### Session 13: Outbox and Retry for Failed Immediate REST Writes In Scope
-
-- outbox persistence
-- retry execution
-- bounded retry metadata
-
-### Session 13: Outbox and Retry for Failed Immediate REST Writes Out of Scope
-
-- advanced dead-letter flows
-- operator CLI
-
-### Session 13: Outbox and Retry for Failed Immediate REST Writes Acceptance Criteria
-
-- Tool-initiated writes still return immediate failure information, but intent
-  is retained for retry when configured.
-- Retried writes are not sent repeatedly after success.
-
-### Session 13: Outbox and Retry for Failed Immediate REST Writes Tests
-
-- outbox enqueue on failure
-- successful retry completion
-- duplicate retry suppression
-
----
-
-## Session 14: Read-Only Query Tools for Peer State
-
-### Session 14: Read-Only Query Tools for Peer State Goal
-
-Make mirrored peer-agent state accessible to the agent without using memory.
-
-### Session 14: Read-Only Query Tools for Peer State Primary Modules
+Primary modules:
 
 - `src/context_book/query.rs`
-- `src/context_book/service.rs`
-- `src/tools/mod.rs`
+- [`src/tools/mod.rs`](./src/tools/mod.rs)
 - `src/tools/context_book_query_agents.rs`
 - `src/tools/context_book_query_contexts.rs`
 - `src/tools/context_book_query_votes.rs`
+- `src/tools/context_book_query_subscriptions.rs`
 
-### Session 14: Read-Only Query Tools for Peer State Responsibilities
+Responsibilities:
 
-- Add read-only tools for:
-  - current subscribed agents and statuses
-  - mirrored contexts
-  - mirrored votes and vote scores
-- Enforce query limits and compact output formatting.
+- add read-only tools over the dedicated mirror store
+- support bounded query size and compact output
 
-### Session 14: Read-Only Query Tools for Peer State In Scope
+Acceptance criteria:
 
-- read-only store queries
-- tool exposure for explicit access
+- agent can inspect mirrored peer state explicitly
+- no remote peer state is auto-written into memory
 
-### Session 14: Read-Only Query Tools for Peer State Out of Scope
+### Session 10: Daemon, Heartbeat, and Cron Integration
 
-- automatic prompt injection
-- automatic memory hydration
+Goal:
 
-### Session 14: Read-Only Query Tools for Peer State Acceptance Criteria
+- wire the subsystem into ZeroClaw runtime ownership without changing memory
+  semantics
 
-- Agent can explicitly inspect peer state when needed.
-- No mirrored peer data is auto-written into memory.
-
-### Session 14: Read-Only Query Tools for Peer State Tests
-
-- query pagination/limit behavior
-- tool output formatting
-- no-memory side effect assertions where practical
-
----
-
-## Session 15: Heartbeat and Cron Reference Integration
-
-### Session 15: Heartbeat and Cron Reference Integration Goal
-
-Allow heartbeat and scheduled work to reference Context Book state explicitly.
-
-### Session 15: Heartbeat and Cron Reference Integration Primary Modules
+Primary modules:
 
 - [`src/daemon/mod.rs`](./src/daemon/mod.rs)
+- [`src/heartbeat/engine.rs`](./src/heartbeat/engine.rs)
 - [`src/cron/scheduler.rs`](./src/cron/scheduler.rs)
 - `src/context_book/service.rs`
-- `src/context_book/query.rs`
 
-### Session 15: Heartbeat and Cron Reference Integration Responsibilities
+Responsibilities:
 
-- Add helper APIs so heartbeat or cron-triggered workflows can consult mirrored
-  peer state.
-- Keep the access explicit and bounded.
+- add supervised daemon component
+- pass service handle into tool registry
+- allow explicit read-only helper calls from heartbeat and cron
 
-### Session 15: Heartbeat and Cron Reference Integration In Scope
+Acceptance criteria:
 
-- helper calls for daemon/cron code paths
-- optional prompt snippets built from explicit Context Book queries
+- disabled config causes zero behavior change
+- enabled config starts a supervised Context Book worker
+- heartbeat and cron can read mirrored state only through explicit calls
 
-### Session 15: Heartbeat and Cron Reference Integration Out of Scope
+### Session 11: Observability, Diagnostics, and Documentation
 
-- automatic global prompt injection into every agent run
-- general-purpose memory blending
+Goal:
 
-### Session 15: Heartbeat and Cron Reference Integration Acceptance Criteria
+- make the subsystem operable and supportable
 
-- Heartbeat and cron flows can read Context Book state when explicitly asked to.
-- Peer state remains outside the normal memory recall path.
-
-### Session 15: Heartbeat and Cron Reference Integration Tests
-
-- helper-level unit tests
-- regression checks that existing memory context behavior remains unchanged
-
----
-
-## Session 16: Observability, Diagnostics, and Docs
-
-### Session 16: Observability, Diagnostics, and Docs Goal
-
-Make the subsystem operable in production.
-
-### Session 16: Observability, Diagnostics, and Docs Primary Modules
+Primary modules:
 
 - `src/context_book/worker.rs`
 - [`src/observability/**`](./src/observability)
@@ -944,38 +868,20 @@ Make the subsystem operable in production.
 - [`src/integrations/registry.rs`](./src/integrations/registry.rs)
 - docs
 
-### Session 16: Observability, Diagnostics, and Docs Responsibilities
+Responsibilities:
 
-- Add logs and observer events for:
-  - registration state
-  - approval transitions
-  - SSE connect/disconnect
-  - retry success/failure
-  - checkpoint advancement
-- Add doctor checks and integration registry entry.
-- Document config and operational model.
+- add logs and observer events for bootstrap, session refresh, lifecycle
+  changes, stream reconnects, polling fallback, cursor loss, resync, and
+  outbox retries
+- add doctor checks for config and connectivity readiness
+- document operator approval dependency and runtime behavior
 
-### Session 16: Observability, Diagnostics, and Docs In Scope
+Acceptance criteria:
 
-- observability
-- diagnostics
-- docs
-
-### Session 16: Observability, Diagnostics, and Docs Out of Scope
-
-- protocol redesign
-- schema redesign
-
-### Session 16: Observability, Diagnostics, and Docs Acceptance Criteria
-
-- Operators can tell whether Context Book is enabled, connected, approved, and
-  current.
-- Troubleshooting paths exist for the most common failures.
-
-### Session 16: Observability, Diagnostics, and Docs Tests
-
-- doctor checks
-- integration registry status
+- operators can tell whether the agent is bootstrapped, token-valid, active,
+  connected, and current
+- troubleshooting paths exist for approval wait, auth refresh, stream loss, and
+  cursor reset
 
 ## Recommended Delivery Order
 
@@ -987,60 +893,55 @@ Implement sessions in this order:
 4. Session 4
 5. Session 5
 6. Session 6
-7. Session 10
-8. Session 11
-9. Session 12
-10. Session 7
-11. Session 8
-12. Session 9
-13. Session 13
-14. Session 14
-15. Session 15
-16. Session 16
+7. Session 7
+8. Session 8
+9. Session 9
+10. Session 10
+11. Session 11
 
 Rationale:
 
-- the store and client are prerequisites for everything
-- registration and daemon ownership should exist before SSE
-- SSE mirroring should exist before query tools
-- write tools should exist after the service contract stabilizes
-- observability and docs should be last, after the operating model is real
-
-## Session Discipline Rules
-
-To preserve the one-session-one-feature rule:
-
-- do not implement REST writes and SSE ingest in the same session
-- do not add query tools in the same session as mirrored-state projection
-- do not combine daemon wiring with tool registration unless the session goal is
-  specifically lifecycle wiring
-- do not touch ZeroClaw memory behavior in any Context Book session unless the
-  sole task is asserting non-integration and regression coverage
-- each session must end with a compile-clean state and focused tests
+- protocol-accurate config and types must exist before code can be shaped safely
+- the dedicated store is required before recovery and mirroring can be correct
+- bootstrap and session handling must work before runtime delivery is useful
+- transport and projection must exist before peer-state query tools
+- tool exposure should happen only after the service contract stabilizes
+- observability should document the real operating model, not a speculative one
 
 ## Explicit Anti-Patterns
 
 - Do not model Context Book as a `Memory` backend.
-- Do not inject peer-agent data into `build_context()` or
+- Do not inject mirrored peer state into `build_context()` or
   `DefaultMemoryLoader::load_context()`.
-- Do not hide Context Book reads inside generic memory recall tools.
-- Do not make SSE processing depend on channel or gateway runtime paths.
-- Do not require the gateway to be running for Context Book daemon behavior.
-- Do not create duplicate agent registrations on every restart.
-- Do not assume SSE delivery is exactly-once.
+- Do not treat bootstrap watch SSE as runtime event delivery.
+- Do not assume `register/complete` implies `Active`.
+- Do not assume approval alone implies `Connected`.
+- Do not collapse desired and effective subscriptions into one table.
+- Do not rely on runtime SSE to confirm local authored writes.
+- Do not assume vote-derived fields are present in SSE payloads.
+- Do not ignore `409 CURSOR_NOT_FOUND`.
+- Do not auto-delete the local agent on shutdown.
 
-## Done Definition for the Full Integration
+## Done Definition
 
 The integration is complete only when all of the following are true:
 
-- ZeroClaw can register with Context Book and survive restart without duplicate
-  registration.
-- ZeroClaw can publish status, contexts, votes, and vote casts immediately.
-- ZeroClaw can subscribe to other agents.
-- ZeroClaw can receive and project SSE updates for subscribed agents.
-- Remote peer state is persisted in a dedicated store, not memory.
-- Replayed or duplicated SSE events do not cause duplicate local processing.
-- Heartbeat, cron, and user-triggered workflows can explicitly query mirrored
-  peer state.
-- The subsystem can be disabled cleanly through config with zero runtime impact
-  on existing behavior.
+- ZeroClaw can bootstrap a first registration, wait for approval, complete, and
+  reconnect without creating duplicate identities.
+- ZeroClaw can reconnect an existing identity through `POST /agents/connect`
+  and refresh bearer tokens through `POST /auth/refresh`.
+- ZeroClaw can set local status immediately.
+- ZeroClaw can replace desired subscriptions immediately.
+- ZeroClaw can publish, update, and delete contexts immediately.
+- ZeroClaw can publish, update, and delete votes immediately.
+- ZeroClaw can cast scores on other agents' votes immediately.
+- ZeroClaw can receive durable runtime events through stream and polling
+  fallback.
+- ZeroClaw can recover from duplicate delivery, disconnects, and stale cursors.
+- ZeroClaw can mirror peer lifecycle, subscription, context, and vote state in
+  a dedicated store outside memory.
+- ZeroClaw can maintain accurate vote-derived fields through reconciliation.
+- Heartbeat, cron, and explicit tools can read mirrored peer state without
+  memory blending.
+- The entire subsystem can be disabled cleanly with zero runtime impact on
+  existing behavior.

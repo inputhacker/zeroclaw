@@ -3,9 +3,9 @@ use crate::context_book::client::ContextBookClient;
 use crate::context_book::store::ContextBookStore;
 use crate::context_book::types::{
     AgentLifecycleState, AgentRecordDto, AgentStatusUpdateRequest, ContextCreateRequest,
-    ContextRecordDto, ContextUpdateRequest,
+    ContextRecordDto, ContextUpdateRequest, VoteCreateRequest, VoteRecordDto,
 };
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -182,6 +182,24 @@ impl ContextBookService {
         Ok(context)
     }
 
+    pub async fn create_local_vote(&self, request: &VoteCreateRequest) -> Result<VoteRecordDto> {
+        let (client, store) = self.operational_parts()?;
+        let session = store
+            .load_auth_session()?
+            .ok_or_else(|| anyhow!("Context Book auth session is not available"))?;
+
+        let vote = client
+            .create_vote(&session.access_token, request)
+            .await
+            .context("failed to create Context Book vote")?;
+
+        store
+            .upsert_mirrored_vote(&vote, "rest")
+            .context("failed to persist Context Book vote create result")?;
+
+        Ok(vote)
+    }
+
     fn operational_parts(&self) -> Result<(&ContextBookClient, &Arc<ContextBookStore>)> {
         if !self.config().enabled {
             return Err(anyhow!("Context Book is disabled in config"));
@@ -208,7 +226,7 @@ impl Default for ContextBookService {
 mod tests {
     use super::*;
     use crate::context_book::store::LocalIdentityRecord;
-    use crate::context_book::types::{AuthSessionDto, TransportConnectionState};
+    use crate::context_book::types::{AuthSessionDto, TransportConnectionState, VoteCreateRequest};
     use tempfile::TempDir;
     use wiremock::matchers::{body_partial_json, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -526,5 +544,67 @@ mod tests {
             mirrored[0].status,
             crate::context_book::ContextStatus::Archived
         );
+    }
+
+    #[tokio::test]
+    async fn runtime_service_creates_vote_and_persists_mirror() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/votes"))
+            .and(header("authorization", "Bearer access-token"))
+            .and(body_partial_json(serde_json::json!({
+                "voteId": "vote-1",
+                "voteScore": 2.5,
+                "voteContext": "Approve deploy"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "voteId": "vote-1",
+                "ownerAgentId": "agent-1",
+                "voteScore": 2.5,
+                "voteContext": "Approve deploy",
+                "voterAgentIds": [],
+                "requiredScore": 5.0,
+                "executable": false,
+                "createdAt": "2026-04-03T00:00:00Z",
+                "updatedAt": "2026-04-03T00:00:10Z"
+            })))
+            .mount(&server)
+            .await;
+
+        let (_tmp, store) = temp_store();
+        store
+            .save_auth_session(
+                &AuthSessionDto {
+                    agent_id: "agent-1".into(),
+                    access_token: "access-token".into(),
+                    refresh_token: "refresh-token".into(),
+                    access_token_expires_at: "2026-04-04T00:00:00Z".into(),
+                },
+                "2026-04-03T00:00:00Z",
+            )
+            .expect("save session");
+
+        let mut config = ContextBookConfig::default();
+        config.enabled = true;
+        config.base_url = server.uri();
+
+        let service = ContextBookService::with_store(config, store.clone()).expect("service");
+        let created = service
+            .create_local_vote(&VoteCreateRequest {
+                vote_id: Some("vote-1".into()),
+                vote_score: Some(2.5),
+                vote_context: "Approve deploy".into(),
+            })
+            .await
+            .expect("create vote");
+
+        assert_eq!(created.vote_id, "vote-1");
+        assert_eq!(created.vote_score, Some(2.5));
+
+        let mirrored = store.list_mirrored_votes().expect("list mirrored votes");
+        assert_eq!(mirrored.len(), 1);
+        assert_eq!(mirrored[0].vote_id, "vote-1");
+        assert_eq!(mirrored[0].required_score, Some(5.0));
+        assert_eq!(mirrored[0].executable, Some(false));
     }
 }

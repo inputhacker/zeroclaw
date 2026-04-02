@@ -880,6 +880,9 @@ Status:
   `context_book_context_delete` tool that performs immediate REST context
   deletion and removes the mirrored context record from the dedicated Context
   Book store
+- Completed sub-item on 2026-04-03: added a service-backed
+  `context_book_vote_create` tool that performs immediate REST vote creation
+  and persists the confirmed vote record into the dedicated Context Book store
 
 Primary modules:
 

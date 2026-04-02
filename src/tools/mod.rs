@@ -38,6 +38,7 @@ pub mod context_book_query_contexts;
 pub mod context_book_query_subscriptions;
 pub mod context_book_query_votes;
 pub mod context_book_status_set;
+pub mod context_book_vote_create;
 pub mod cron_add;
 pub mod cron_list;
 pub mod cron_remove;
@@ -143,6 +144,7 @@ pub use context_book_query_contexts::ContextBookQueryContextsTool;
 pub use context_book_query_subscriptions::ContextBookQuerySubscriptionsTool;
 pub use context_book_query_votes::ContextBookQueryVotesTool;
 pub use context_book_status_set::ContextBookStatusSetTool;
+pub use context_book_vote_create::ContextBookVoteCreateTool;
 pub use cron_add::CronAddTool;
 pub use cron_list::CronListTool;
 pub use cron_remove::CronRemoveTool;
@@ -231,7 +233,7 @@ use crate::config::{Config, DelegateAgentConfig};
 use crate::context_book::{ContextBookQuery, ContextBookService, ContextBookStore};
 use crate::memory::Memory;
 use crate::runtime::{NativeRuntime, RuntimeAdapter};
-use crate::security::{SecurityPolicy, create_sandbox};
+use crate::security::{create_sandbox, SecurityPolicy};
 use anyhow::Context;
 use async_trait::async_trait;
 use parking_lot::RwLock;
@@ -582,6 +584,10 @@ pub fn all_tools_with_runtime(
                                     security.clone(),
                                 )));
                                 tool_arcs.push(Arc::new(ContextBookContextUpdateTool::new(
+                                    service.clone(),
+                                    security.clone(),
+                                )));
+                                tool_arcs.push(Arc::new(ContextBookVoteCreateTool::new(
                                     service.clone(),
                                     security.clone(),
                                 )));
@@ -1566,6 +1572,7 @@ mod tests {
         assert!(names.contains(&"context_book_query_votes"));
         assert!(names.contains(&"context_book_query_subscriptions"));
         assert!(names.contains(&"context_book_status_set"));
+        assert!(names.contains(&"context_book_vote_create"));
     }
 
     #[test]
@@ -1607,5 +1614,6 @@ mod tests {
         assert!(!names.contains(&"context_book_query_votes"));
         assert!(!names.contains(&"context_book_query_subscriptions"));
         assert!(!names.contains(&"context_book_status_set"));
+        assert!(!names.contains(&"context_book_vote_create"));
     }
 }

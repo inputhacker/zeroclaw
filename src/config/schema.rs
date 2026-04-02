@@ -162,6 +162,10 @@ pub struct Config {
     #[serde(default)]
     pub security_ops: SecurityOpsConfig,
 
+    /// Context Book runtime subsystem configuration (`[context_book]`).
+    #[serde(default, skip_serializing_if = "ContextBookConfig::is_disabled")]
+    pub context_book: ContextBookConfig,
+
     /// Runtime adapter configuration (`[runtime]`). Controls native vs Docker execution.
     #[serde(default)]
     pub runtime: RuntimeConfig,
@@ -8206,6 +8210,142 @@ impl Default for SecurityOpsConfig {
     }
 }
 
+/// Context Book integration configuration (`[context_book]` section).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ContextBookConfig {
+    /// Enable the dedicated Context Book subsystem. Default: false.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Base URL for the Context Book public agent API.
+    #[serde(default = "default_context_book_base_url")]
+    pub base_url: String,
+    /// Stable local agent identifier used during bootstrap.
+    #[serde(default = "default_context_book_agent_id")]
+    pub agent_id: String,
+    /// Device type label sent during bootstrap.
+    #[serde(default = "default_context_book_device_type")]
+    pub device_type: String,
+    /// Human-friendly display name sent during bootstrap.
+    #[serde(default = "default_context_book_display_name")]
+    pub display_name: String,
+    /// Trusted-network bootstrap secret.
+    #[serde(default)]
+    pub bootstrap_secret: String,
+    /// Poll interval for bootstrap approval status checks in seconds.
+    #[serde(default = "default_context_book_approval_poll_interval_secs")]
+    pub approval_poll_interval_secs: u64,
+    /// Poll interval for durable event fallback reads in seconds.
+    #[serde(default = "default_context_book_event_poll_interval_secs")]
+    pub event_poll_interval_secs: u64,
+    /// Set the local agent lifecycle to `Active` during startup.
+    #[serde(default = "default_true")]
+    pub set_active_on_start: bool,
+    /// Set the local agent lifecycle to `Inactive` during shutdown.
+    #[serde(default = "default_true")]
+    pub set_inactive_on_shutdown: bool,
+    /// Disconnect the local agent transport during shutdown.
+    #[serde(default = "default_true")]
+    pub disconnect_on_shutdown: bool,
+    /// REST request timeout in seconds.
+    #[serde(default = "default_context_book_rest_timeout_secs")]
+    pub rest_timeout_secs: u64,
+    /// SSE connect timeout in seconds.
+    #[serde(default = "default_context_book_stream_connect_timeout_secs")]
+    pub stream_connect_timeout_secs: u64,
+    /// Refresh margin before access token expiry in seconds.
+    #[serde(default = "default_context_book_access_token_refresh_margin_secs")]
+    pub access_token_refresh_margin_secs: u64,
+    /// Initial transport retry backoff in seconds.
+    #[serde(default = "default_context_book_retry_initial_backoff_secs")]
+    pub retry_initial_backoff_secs: u64,
+    /// Maximum transport retry backoff in seconds.
+    #[serde(default = "default_context_book_retry_max_backoff_secs")]
+    pub retry_max_backoff_secs: u64,
+    /// Relative store path under the workspace.
+    #[serde(default = "default_context_book_store_path")]
+    pub store_path: String,
+}
+
+impl ContextBookConfig {
+    /// Returns `true` when the subsystem is disabled.
+    pub fn is_disabled(&self) -> bool {
+        !self.enabled
+    }
+}
+
+impl Default for ContextBookConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            base_url: default_context_book_base_url(),
+            agent_id: default_context_book_agent_id(),
+            device_type: default_context_book_device_type(),
+            display_name: default_context_book_display_name(),
+            bootstrap_secret: String::new(),
+            approval_poll_interval_secs: default_context_book_approval_poll_interval_secs(),
+            event_poll_interval_secs: default_context_book_event_poll_interval_secs(),
+            set_active_on_start: true,
+            set_inactive_on_shutdown: true,
+            disconnect_on_shutdown: true,
+            rest_timeout_secs: default_context_book_rest_timeout_secs(),
+            stream_connect_timeout_secs: default_context_book_stream_connect_timeout_secs(),
+            access_token_refresh_margin_secs: default_context_book_access_token_refresh_margin_secs(
+            ),
+            retry_initial_backoff_secs: default_context_book_retry_initial_backoff_secs(),
+            retry_max_backoff_secs: default_context_book_retry_max_backoff_secs(),
+            store_path: default_context_book_store_path(),
+        }
+    }
+}
+
+fn default_context_book_base_url() -> String {
+    String::new()
+}
+
+fn default_context_book_agent_id() -> String {
+    "zeroclaw-main".into()
+}
+
+fn default_context_book_device_type() -> String {
+    "notepc".into()
+}
+
+fn default_context_book_display_name() -> String {
+    "ZeroClaw Main".into()
+}
+
+fn default_context_book_approval_poll_interval_secs() -> u64 {
+    5
+}
+
+fn default_context_book_event_poll_interval_secs() -> u64 {
+    10
+}
+
+fn default_context_book_rest_timeout_secs() -> u64 {
+    15
+}
+
+fn default_context_book_stream_connect_timeout_secs() -> u64 {
+    30
+}
+
+fn default_context_book_access_token_refresh_margin_secs() -> u64 {
+    60
+}
+
+fn default_context_book_retry_initial_backoff_secs() -> u64 {
+    5
+}
+
+fn default_context_book_retry_max_backoff_secs() -> u64 {
+    60
+}
+
+fn default_context_book_store_path() -> String {
+    "state/context_book/state.db".into()
+}
+
 // ── Config impl ──────────────────────────────────────────────────
 
 impl Default for Config {
@@ -8236,6 +8376,7 @@ impl Default for Config {
             conversational_ai: ConversationalAiConfig::default(),
             security: SecurityConfig::default(),
             security_ops: SecurityOpsConfig::default(),
+            context_book: ContextBookConfig::default(),
             runtime: RuntimeConfig::default(),
             reliability: ReliabilityConfig::default(),
             scheduler: SchedulerConfig::default(),
@@ -11336,6 +11477,7 @@ auto_save = true
             conversational_ai: ConversationalAiConfig::default(),
             security: SecurityConfig::default(),
             security_ops: SecurityOpsConfig::default(),
+            context_book: ContextBookConfig::default(),
             runtime: RuntimeConfig {
                 kind: "docker".into(),
                 ..RuntimeConfig::default()
@@ -11926,6 +12068,7 @@ default_temperature = 0.7
             conversational_ai: ConversationalAiConfig::default(),
             security: SecurityConfig::default(),
             security_ops: SecurityOpsConfig::default(),
+            context_book: ContextBookConfig::default(),
             runtime: RuntimeConfig::default(),
             reliability: ReliabilityConfig::default(),
             scheduler: SchedulerConfig::default(),

@@ -7,8 +7,8 @@ pub use schema::{
     AgentConfig, AssemblyAiSttConfig, AuditConfig, AutonomyConfig, BackupConfig,
     BrowserComputerUseConfig, BrowserConfig, BuiltinHooksConfig, ChannelsConfig,
     ClassificationRule, ClaudeCodeConfig, ClaudeCodeRunnerConfig, CloudOpsConfig, CodexCliConfig,
-    ComposioConfig, Config, ConversationalAiConfig, CostConfig, CronConfig, CronJobDecl,
-    CronScheduleDecl, DEFAULT_GWS_SERVICES, DataRetentionConfig, DeepgramSttConfig,
+    ComposioConfig, Config, ContextBookConfig, ConversationalAiConfig, CostConfig, CronConfig,
+    CronJobDecl, CronScheduleDecl, DEFAULT_GWS_SERVICES, DataRetentionConfig, DeepgramSttConfig,
     DelegateAgentConfig, DelegateToolConfig, DiscordConfig, DockerRuntimeConfig, EdgeTtsConfig,
     ElevenLabsTtsConfig, EmbeddingRouteConfig, EstopConfig, FeishuConfig, GatewayConfig,
     GeminiCliConfig, GoogleSttConfig, GoogleTtsConfig, GoogleWorkspaceAllowedOperation,
@@ -116,5 +116,16 @@ mod tests {
         assert_eq!(lark.app_id, "app-id");
         assert_eq!(feishu.app_id, "app-id");
         assert_eq!(nextcloud_talk.base_url, "https://cloud.example.com");
+    }
+
+    #[test]
+    fn reexported_context_book_config_matches_plan_defaults() {
+        let config = ContextBookConfig::default();
+
+        assert!(!config.enabled);
+        assert_eq!(config.agent_id, "zeroclaw-main");
+        assert_eq!(config.device_type, "notepc");
+        assert_eq!(config.display_name, "ZeroClaw Main");
+        assert_eq!(config.store_path, "state/context_book/state.db");
     }
 }

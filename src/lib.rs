@@ -45,6 +45,7 @@ pub mod channels;
 pub(crate) mod cli_input;
 pub mod commands;
 pub mod config;
+pub mod context_book;
 pub(crate) mod cost;
 pub mod cron;
 pub(crate) mod daemon;

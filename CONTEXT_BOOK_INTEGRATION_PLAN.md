@@ -637,6 +637,11 @@ Goal:
 
 - create a compile-safe scaffold aligned with the real protocol
 
+Status:
+
+- Completed on 2026-04-02: config schema, `src/context_book/` skeleton, DTO
+  placeholders, and disabled no-op service scaffold landed.
+
 Primary modules:
 
 - [`src/config/schema.rs`](./src/config/schema.rs)

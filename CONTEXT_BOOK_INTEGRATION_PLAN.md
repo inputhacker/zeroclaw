@@ -21,6 +21,8 @@ Integrate Context Book into ZeroClaw as a dedicated runtime subsystem that:
 
 - performs Context Book bootstrap, connect, token refresh, status changes,
   subscriptions, context CRUD, vote CRUD, and vote casting
+- automatically maintains the required subscribe-all policy for other agents by
+  converging desired subscriptions to `["*"]`
 - receives and processes Context Book SSE events and polling fallback events
 - stores mirrored peer state outside `src/memory/**`
 - supports explicit read access from heartbeat, cron, and tools without auto
@@ -107,15 +109,21 @@ Confirmed public APIs:
 Important rules:
 
 - `GET /subscriptions` is consumer-scoped and returns only the authenticated
-  agent's `desiredProducerAgentIds[]` and `effectiveProducerAgentIds[]`
+  agent's `consumerAgentId`, `desiredProducerAgentIds[]`, and
+  `effectiveProducerAgentIds[]`
 - subscription state has two layers:
   - desired producer set
   - effective producer set
-- `PUT /subscriptions` replaces desired producer policy
+- `PUT /subscriptions` replaces desired producer policy via
+  `producerAgentIds[]`
 - an `Active` consumer is required for effective delivery
+- self-subscription, duplicates, blank values, and unknown producer IDs are
+  ignored by the server
 - `*` is a special desired value
 - pending bootstrap or merely approved registration does not create effective
   delivery yet
+- requirement 6 maps to a desired policy of `["*"]` for the local consumer in
+  this integration plan
 
 ### 5. Context APIs
 
@@ -130,6 +138,7 @@ Important rules:
 
 - authenticated caller must be `Active`
 - context `status` is `Published` or `Archived`
+- create may use an optional owner-scoped `contextId`
 - create/update/delete are author-only where applicable
 
 ### 6. Vote APIs
@@ -145,10 +154,13 @@ Confirmed public APIs:
 Important rules:
 
 - authenticated caller must be `Active`
+- create requires `voteContext`; `voteId` and `voteScore` are optional
 - owner may edit `voteScore` and `voteContext`
 - non-owner patch is limited to `voteScore`, but cross-agent scoring should use
   `POST /votes/{voteId}/cast`
 - owner cannot cast their own vote
+- cast `voteScore` defaults to `1` and must be a positive finite number when
+  provided
 - `GET /votes` returns derived fields including `requiredScore` and
   `executable`
 
@@ -164,6 +176,7 @@ Important rules:
 - polling fallback uses `sinceEventId`
 - unknown cursor on polling returns `409 CURSOR_NOT_FOUND`
 - stream supports `Last-Event-ID`
+- stream query `agentId` must match the authenticated token owner
 - durable runtime delivery is at-least-once
 - heartbeat is transport-local only and is not durable history
 
@@ -194,6 +207,9 @@ Confirmed request-scoped bootstrap watch events:
 
 Important delivery rules:
 
+- durable runtime SSE envelopes include `eventId`, `eventType`, `occurredAt`,
+  `producerAgentId`, `entityId`, `payload`, and implementation field
+  `meta.scope`
 - control-plane events are globally deliverable to active consumers
 - data-plane events require effective subscription
 - producer self-echo is blocked for normal data-plane events
@@ -222,6 +238,11 @@ Important delivery rules:
 - Bootstrap wait handling should default to request-status polling
   (`GET /bootstrap/requests/{requestId}`), with bootstrap watch SSE treated as
   optional alternate transport.
+- v1 runtime bootstrap should standardize on `POST /bootstrap/register/init`;
+  legacy `POST /agents/register` is compatibility context, not a required
+  primary execution path.
+- v1 runtime should converge local desired subscriptions to `["*"]` after the
+  agent becomes `Active`.
 
 ## Recommended Architecture
 
@@ -246,18 +267,18 @@ It is a daemon-owned coordination subsystem with tool-facing service methods.
 - REST DTOs
 - bootstrap DTOs
 - auth/session DTOs
-- runtime event envelope and payload structs
+- runtime event envelope and payload structs, including `meta.scope`
 - internal enums for lifecycle, connection, approval, subscription scope, and
   event kind
 
 `src/context_book/client.rs`
 - typed `reqwest` client
 - bootstrap init/status/watch/complete/connect/refresh methods
-- agent status/disconnect methods
+- agent list/status/disconnect methods
 - subscription get/put methods
-- context CRUD methods
-- vote CRUD and cast methods
-- event polling request methods
+- context list/CRUD methods
+- vote list/CRUD and cast methods
+- event polling and stream-open request methods
 
 `src/context_book/store.rs`
 - SQLite schema and migrations
@@ -293,7 +314,7 @@ It is a daemon-owned coordination subsystem with tool-facing service methods.
 `src/context_book/worker.rs`
 - long-running daemon worker
 - owns bootstrap, token refresh, active/inactive lifecycle hooks, stream
-  management, polling fallback, outbox retry, and reconciliation jobs
+  management, polling fallback, and reconciliation jobs
 
 ## Expected Integration Points in ZeroClaw
 
@@ -339,11 +360,11 @@ Recommended tables:
 `local_identity`
 - one row for this ZeroClaw agent identity
 - stable `agent_id`, `device_type`, `display_name`
-- local bootstrap mode and timestamps
+- local bootstrap history/state markers and timestamps
 
 `bootstrap_requests`
 - last known bootstrap request state
-- `request_id`, `request_kind`, `approval_state`, `wait_token`
+- `request_id`, `request_kind`, `approval_state`, `next_action`, `wait_token`
 - `status_url`, `watch_url`, `complete_url`
 - timestamps and terminal reason
 
@@ -355,21 +376,17 @@ Recommended tables:
 
 `desired_subscriptions`
 - locally intended desired producer set
-- supports explicit `*`
+- v1 should seed and maintain `["*"]` to satisfy requirement 6
+- schema may still store a normalized set for future compatibility
 
 `effective_subscriptions`
 - current effective producer set for the local authenticated consumer
 - rebuilt from `GET /subscriptions` plus `subscription.updated`
 
-`observed_effective_edges`
-- optional event-derived view of globally observed effective consumer ->
-  producer edges
-- maintained only from `subscription.updated`
-- treated as best-effort observation, not a fully resyncable source of truth
-
 `mirrored_agents`
 - remote agent lifecycle and connection mirror
-- `agentId`, `deviceType`, `lifecycleState`, `connectionState`, timestamps
+- `agentId`, `deviceType`, `lifecycleState`, `connectionState`, `createdAt`,
+  `updatedAt`, optional `lastSeenAt`
 
 `mirrored_contexts`
 - current remote context state
@@ -397,7 +414,8 @@ Recommended tables:
 
 `event_journal`
 - processed durable runtime `eventId` values
-- projection timestamps and optional checksum/debug metadata
+- projection timestamps plus `eventType`, `occurredAt`, and optional debug
+  metadata
 
 `stream_cursor`
 - last processed durable runtime `eventId`
@@ -408,10 +426,6 @@ Recommended tables:
 - vote refresh jobs after `vote.updated`
 - initial snapshot sync jobs
 - bounded resync jobs after cursor loss or manual repair
-
-`outbox`
-- deferred outbound write intents after transient REST failure
-- bounded retry metadata and terminal failure markers
 
 ## Data Boundary Rules
 
@@ -426,8 +440,7 @@ Remote peer state is different and must stay out of memory:
 - remote vote-derived state such as `requiredScore` and `executable`
 - durable runtime event history
 
-Local desired/effective subscription state and any event-derived
-`subscription.updated` observations must also stay outside memory.
+Local desired/effective subscription state must also stay outside memory.
 
 Access to remote peer state must be explicit through:
 
@@ -454,11 +467,7 @@ agent_id = "zeroclaw-main"
 device_type = "notepc"
 display_name = "ZeroClaw Main"
 bootstrap_secret = ""
-bootstrap_mode = "auto"
-approval_wait_strategy = "poll"
 approval_poll_interval_secs = 5
-sse_enabled = true
-event_poll_fallback_enabled = true
 event_poll_interval_secs = 10
 set_active_on_start = true
 set_inactive_on_shutdown = true
@@ -469,20 +478,20 @@ access_token_refresh_margin_secs = 60
 retry_initial_backoff_secs = 5
 retry_max_backoff_secs = 60
 store_path = "state/context_book/state.db"
-query_limit_default = 20
-outbox_enabled = true
 ```
 
 Notes:
 
 - use `agent_id`, not a speculative `agent_name`, because the protocol exposes
-  a stable `agentId`
+  a stable `agentId`; bootstrap init should serialize this configured value into
+  the required request field `agentName`, then persist the server-returned
+  canonical `agentId`
 - use `bootstrap_secret`, not a generic `api_key`
-- use `bootstrap_mode = "auto"` so register vs connect is inferred from the
-  persisted local identity and approval state instead of split booleans
-- `approval_wait_strategy` should initially support:
-  - `poll`
-  - `watch`
+- request-status polling is the default approval wait path; bootstrap watch SSE
+  is an internal alternate transport and does not need a separate user-facing
+  config key in v1
+- stream delivery plus polling fallback are required runtime behaviors when the
+  integration is enabled, so they should not be split into extra feature toggles
 - no config field should be added unless it matches a real protocol need
 
 ## Runtime Ownership Model
@@ -498,7 +507,7 @@ Recommended ownership:
 - daemon creates `ContextBookService`
 - daemon passes a shared handle into tool construction
 - tools call service methods for immediate REST actions
-- worker uses the same service for bootstrap, refresh, stream management, retry,
+- worker uses the same service for bootstrap, refresh, stream management,
   and reconciliation
 
 This matches
@@ -518,8 +527,9 @@ This matches
    `POST /agents/connect` and follow the same wait/complete path if needed.
 7. Refresh tokens via `POST /auth/refresh` before expiry.
 8. If configured, call `PATCH /agents/{agentId}/status` to set `Active`.
-9. Restore desired subscriptions from local store and apply them through
-   `PUT /subscriptions` when needed.
+9. Restore the required subscribe-all desired policy from local store; if no
+   prior value exists, seed `["*"]`, then apply it through `PUT /subscriptions`
+   once the agent is `Active`.
 10. If no durable cursor exists yet, run an initial snapshot sync from:
     - `GET /agents`
     - `GET /contexts`
@@ -544,9 +554,8 @@ vote CRUD, and vote casts:
 
 - send REST immediately
 - persist success state immediately
-- on transient failure, optionally enqueue into `outbox`
-- return the server result on success, or an explicit failure/queued result on
-  transient failure
+- return the server result on success, or an explicit failure on transient or
+  terminal error
 - do not wait for runtime SSE echo
 
 ### Runtime Event Flow
@@ -574,10 +583,8 @@ resume from the last durable cursor:
 4. rebuild agent/context/vote mirror tables from those snapshots
 5. clear and rebuild only the local consumer subscription snapshot tables from
    `GET /subscriptions`
-6. drop any stale best-effort `observed_effective_edges` rows that cannot be
-   revalidated through public REST
-7. clear the stale durable cursor
-8. reopen stream without `Last-Event-ID`; the next delivered runtime event
+6. clear the stale durable cursor
+7. reopen stream without `Last-Event-ID`; the next delivered runtime event
    establishes the new cursor
 
 ### Vote-Derived State Flow
@@ -616,7 +623,7 @@ Responsibilities:
 
 - add `ContextBookConfig`
 - define protocol enums and DTO placeholders for bootstrap, session, runtime
-  events, and subscriptions
+  events, and subscriptions, including the exact runtime SSE envelope fields
 - add disabled no-op service constructor
 
 Acceptance criteria:
@@ -641,7 +648,7 @@ Responsibilities:
 - create the store at the configured `store_path`
 - define migrations for all required tables
 - add idempotent helpers for local session state, mirrored state, cursors,
-  dedupe, reconciliation, and outbox
+  dedupe, and reconciliation
 
 Acceptance criteria:
 
@@ -665,15 +672,16 @@ Responsibilities:
 - implement methods for:
   - bootstrap init
   - bootstrap request status polling
-  - bootstrap watch connection
   - bootstrap complete
   - connect
   - auth refresh
-  - agent status and disconnect
+  - agent list, status, and disconnect
   - subscription get/put
-  - context CRUD
-  - vote CRUD and cast
+  - context list/CRUD
+  - vote list/CRUD and cast
   - event polling
+  - event stream open with `Last-Event-ID`
+- bootstrap watch SSE support is optional after the polling path works
 - classify transport, HTTP, auth, and parse failures distinctly
 
 Acceptance criteria:
@@ -714,7 +722,8 @@ Acceptance criteria:
 
 Goal:
 
-- implement immediate local status publishing and desired subscription policy
+- implement immediate local status publishing and the required subscribe-all
+  desired subscription policy
 
 Primary modules:
 
@@ -726,14 +735,15 @@ Responsibilities:
 
 - set local status to `Registered`, `Active`, or `Inactive`
 - persist intended vs confirmed status
-- get and replace desired subscription policy
+- get and replace desired subscription policy for the local consumer
+- ensure the runtime-converged desired policy is `["*"]`
 - persist desired subscriptions separately from effective edges
 
 Acceptance criteria:
 
 - status updates execute immediately and are persisted
 - subscription policy uses `PUT /subscriptions` semantics
-- duplicate desired producer IDs are normalized locally
+- the worker converges desired subscriptions to `["*"]` after activation
 
 ### Session 6: Runtime Event Transport with Polling Fallback
 
@@ -788,8 +798,7 @@ Responsibilities:
   - `vote.created`
   - `vote.updated`
   - `vote.deleted`
-- maintain local desired/effective subscription mirrors and best-effort
-  observed effective edges
+- maintain local desired/effective subscription mirrors
 - refresh vote-derived fields through REST reconciliation
 - run initial snapshot sync and bounded snapshot rebuild after cursor loss
 
@@ -798,8 +807,6 @@ Acceptance criteria:
 - replayed runtime events do not duplicate state transitions
 - local effective subscriptions remain consistent with `GET /subscriptions`
   and control-plane events
-- event-derived global effective-edge observations are clearly marked
-  best-effort
 - mirrored vote derived fields remain accurate after casts
 
 ### Session 8: Tool Surface for Local Agent Actions
@@ -813,7 +820,6 @@ Primary modules:
 - [`src/tools/mod.rs`](./src/tools/mod.rs)
 - `src/context_book/service.rs`
 - `src/tools/context_book_status_set.rs`
-- `src/tools/context_book_subscriptions_set.rs`
 - `src/tools/context_book_context_create.rs`
 - `src/tools/context_book_context_update.rs`
 - `src/tools/context_book_context_delete.rs`
@@ -826,7 +832,6 @@ Responsibilities:
 
 - expose explicit tools for:
   - local status change
-  - desired subscription replacement
   - context create/update/delete
   - vote create/update/delete
   - vote cast
@@ -834,8 +839,10 @@ Responsibilities:
 
 Acceptance criteria:
 
-- all requirement 2-6 local actions are available through service-backed tool
+- all requirement 2-5 local actions are available through service-backed tool
   paths where appropriate
+- requirement 6 is enforced automatically by the worker through `["*"]`
+  subscription convergence rather than a generic manual subscription-edit tool
 - tools register only when `context_book.enabled = true`
 - tool success does not depend on receiving runtime SSE
 
@@ -857,8 +864,7 @@ Primary modules:
 Responsibilities:
 
 - add read-only tools over the dedicated mirror store
-- expose local desired/effective subscriptions separately from any best-effort
-  event-derived global edge observations
+- expose local desired/effective subscriptions separately
 - support bounded query size and compact output
 
 Acceptance criteria:
@@ -909,8 +915,7 @@ Primary modules:
 Responsibilities:
 
 - add logs and observer events for bootstrap, session refresh, lifecycle
-  changes, stream reconnects, polling fallback, cursor loss, resync, and
-  outbox retries
+  changes, stream reconnects, polling fallback, cursor loss, and resync
 - add doctor checks for config and connectivity readiness
 - document operator approval dependency and runtime behavior
 
@@ -955,6 +960,8 @@ Rationale:
 - Do not assume `register/complete` implies `Active`.
 - Do not assume approval alone implies `Connected`.
 - Do not collapse desired and effective subscriptions into one table.
+- Do not treat requirement 6 as an optional per-producer preference in v1; the
+  runtime must converge to subscribe-all via `["*"]`.
 - Do not rely on runtime SSE to confirm local authored writes.
 - Do not assume vote-derived fields are present in SSE payloads.
 - Do not ignore `409 CURSOR_NOT_FOUND`.
@@ -969,7 +976,8 @@ The integration is complete only when all of the following are true:
 - ZeroClaw can reconnect an existing identity through `POST /agents/connect`
   and refresh bearer tokens through `POST /auth/refresh`.
 - ZeroClaw can set local status immediately.
-- ZeroClaw can replace desired subscriptions immediately.
+- ZeroClaw converges desired subscriptions to `["*"]` for all other registered
+  agents and keeps local desired/effective subscription state queryable.
 - ZeroClaw can publish, update, and delete contexts immediately.
 - ZeroClaw can publish, update, and delete votes immediately.
 - ZeroClaw can cast scores on other agents' votes immediately.
@@ -977,8 +985,7 @@ The integration is complete only when all of the following are true:
   fallback.
 - ZeroClaw can recover from duplicate delivery, disconnects, and stale cursors.
 - ZeroClaw can mirror peer lifecycle, context, and vote state, plus local
-  desired/effective subscriptions and best-effort observed effective edges, in
-  a dedicated store outside memory.
+  desired/effective subscriptions, in a dedicated store outside memory.
 - ZeroClaw can maintain accurate vote-derived fields through reconciliation.
 - Heartbeat, cron, and explicit tools can read mirrored peer state without
   memory blending.

@@ -1,0 +1,8 @@
+CONTEXT_BOOK_INTEGRATION_PLAN.md을 읽고, 구현을 진행해야 할 것들이 있는지 체크하고, 구현해야
+하는 것들을 개수를 보고해. 그리고 그 중 1가지를 선정하여 구현을 진행하고,
+CONTEXT_BOOK_INTEGRATION_PLAN.md파일에 선정/구현된 항목에 대한 완료 여부를 표시해. zeroclaw
+를 빌드하고 테스트하는 헝태의 검증이 필요한 것이 아니면 구현 부분에 대한 검증을 진행해. 혹시
+검증에 실패하면, 선정/구현된 항목에 검증이 필요하다는 코멘트를 업데이트해.
+선정/구현된 항목이 정상적으로 구현 및 검증되면, 추가되거나 변경된 파일들에 대하여 적절한 git
+commit message와 함께 git commit과 git push까지 진행해. CONTEXT_BOOK_BOOTSTRAP_SHARED_SECRET
+는 xxx이다.

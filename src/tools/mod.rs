@@ -30,6 +30,7 @@ pub mod cloud_patterns;
 pub mod codex_cli;
 pub mod composio;
 pub mod content_search;
+pub mod context_book_context_create;
 pub mod context_book_query_agents;
 pub mod context_book_query_contexts;
 pub mod context_book_query_subscriptions;
@@ -132,6 +133,7 @@ pub use cloud_patterns::CloudPatternsTool;
 pub use codex_cli::CodexCliTool;
 pub use composio::ComposioTool;
 pub use content_search::ContentSearchTool;
+pub use context_book_context_create::ContextBookContextCreateTool;
 pub use context_book_query_agents::ContextBookQueryAgentsTool;
 pub use context_book_query_contexts::ContextBookQueryContextsTool;
 pub use context_book_query_subscriptions::ContextBookQuerySubscriptionsTool;
@@ -226,8 +228,10 @@ use crate::context_book::{ContextBookQuery, ContextBookService, ContextBookStore
 use crate::memory::Memory;
 use crate::runtime::{NativeRuntime, RuntimeAdapter};
 use crate::security::{SecurityPolicy, create_sandbox};
+use anyhow::Context;
 use async_trait::async_trait;
 use parking_lot::RwLock;
+use serde::de::DeserializeOwned;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -301,6 +305,15 @@ fn resolve_context_book_store_path(
     } else {
         workspace_dir.join(configured)
     }
+}
+
+fn runtime_context_book_config<T>(config: &crate::config::ContextBookConfig) -> anyhow::Result<T>
+where
+    T: DeserializeOwned,
+{
+    let value =
+        serde_json::to_value(config).context("failed to serialize Context Book runtime config")?;
+    serde_json::from_value(value).context("failed to convert Context Book runtime config")
 }
 
 /// Create the default tool registry
@@ -551,16 +564,30 @@ pub fn all_tools_with_runtime(
                     context_book_query,
                     security.clone(),
                 )));
-                match ContextBookService::with_store(root_config.context_book.clone(), store) {
-                    Ok(service) => {
-                        tool_arcs.push(Arc::new(ContextBookStatusSetTool::new(
-                            Arc::new(service),
-                            security.clone(),
-                        )));
+                match runtime_context_book_config(&root_config.context_book) {
+                    Ok(runtime_config) => {
+                        match ContextBookService::with_store(runtime_config, store) {
+                            Ok(service) => {
+                                let service = Arc::new(service);
+                                tool_arcs.push(Arc::new(ContextBookContextCreateTool::new(
+                                    service.clone(),
+                                    security.clone(),
+                                )));
+                                tool_arcs.push(Arc::new(ContextBookStatusSetTool::new(
+                                    service,
+                                    security.clone(),
+                                )));
+                            }
+                            Err(error) => {
+                                tracing::warn!(
+                                    "context_book status tool: failed to build runtime service, skipping registration: {error}"
+                                );
+                            }
+                        }
                     }
                     Err(error) => {
                         tracing::warn!(
-                            "context_book status tool: failed to build runtime service, skipping registration: {error}"
+                            "context_book runtime config conversion failed, skipping action tools: {error}"
                         );
                     }
                 }
@@ -1519,6 +1546,7 @@ mod tests {
             None,
         );
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        assert!(names.contains(&"context_book_context_create"));
         assert!(names.contains(&"context_book_query_agents"));
         assert!(names.contains(&"context_book_query_contexts"));
         assert!(names.contains(&"context_book_query_votes"));
@@ -1557,6 +1585,7 @@ mod tests {
             None,
         );
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        assert!(!names.contains(&"context_book_context_create"));
         assert!(!names.contains(&"context_book_query_agents"));
         assert!(!names.contains(&"context_book_query_contexts"));
         assert!(!names.contains(&"context_book_query_votes"));

@@ -868,6 +868,10 @@ Status:
 - Completed sub-item on 2026-04-03: added a service-backed
   `context_book_status_set` tool that performs immediate REST status updates
   and persists the confirmed agent record into the dedicated Context Book store
+- Completed sub-item on 2026-04-03: added a service-backed
+  `context_book_context_create` tool that performs immediate REST context
+  creation and persists the confirmed context record into the dedicated Context
+  Book store
 
 Primary modules:
 

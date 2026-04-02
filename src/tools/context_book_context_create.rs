@@ -1,5 +1,5 @@
 use super::traits::{Tool, ToolResult};
-use crate::context_book::{AgentLifecycleState, ContextBookService};
+use crate::context_book::{ContextBookService, ContextCreateRequest, ContextStatus};
 use crate::security::SecurityPolicy;
 use crate::security::policy::ToolOperation;
 use async_trait::async_trait;
@@ -7,12 +7,12 @@ use serde::Deserialize;
 use serde_json::json;
 use std::sync::Arc;
 
-pub struct ContextBookStatusSetTool {
+pub struct ContextBookContextCreateTool {
     service: Arc<ContextBookService>,
     security: Arc<SecurityPolicy>,
 }
 
-impl ContextBookStatusSetTool {
+impl ContextBookContextCreateTool {
     pub fn new(service: Arc<ContextBookService>, security: Arc<SecurityPolicy>) -> Self {
         Self { service, security }
     }
@@ -20,48 +20,68 @@ impl ContextBookStatusSetTool {
 
 #[derive(Debug, Clone, Copy, Deserialize)]
 enum StatusArg {
-    Registered,
-    Active,
-    Inactive,
+    Published,
+    Archived,
 }
 
 impl StatusArg {
-    fn into_lifecycle_state(self) -> AgentLifecycleState {
+    fn into_context_status(self) -> ContextStatus {
         match self {
-            Self::Registered => AgentLifecycleState::Registered,
-            Self::Active => AgentLifecycleState::Active,
-            Self::Inactive => AgentLifecycleState::Inactive,
+            Self::Published => ContextStatus::Published,
+            Self::Archived => ContextStatus::Archived,
         }
     }
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct StatusSetArgs {
+struct ContextCreateArgs {
+    #[serde(default)]
+    context_id: Option<String>,
+    title: String,
+    contents: String,
+    #[serde(default)]
+    tag: Option<String>,
     status: StatusArg,
 }
 
 #[async_trait]
-impl Tool for ContextBookStatusSetTool {
+impl Tool for ContextBookContextCreateTool {
     fn name(&self) -> &str {
-        "context_book_status_set"
+        "context_book_context_create"
     }
 
     fn description(&self) -> &str {
-        "Set the local Context Book agent lifecycle state immediately via REST and persist the confirmed result into the dedicated store."
+        "Create a local Context Book context immediately via REST and persist the confirmed result into the dedicated store."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
         json!({
             "type": "object",
             "properties": {
+                "context_id": {
+                    "type": "string",
+                    "description": "Optional owner-scoped context ID to request during creation."
+                },
+                "title": {
+                    "type": "string",
+                    "description": "Context title."
+                },
+                "contents": {
+                    "type": "string",
+                    "description": "Context body contents."
+                },
+                "tag": {
+                    "type": "string",
+                    "description": "Optional context tag."
+                },
                 "status": {
                     "type": "string",
-                    "enum": ["Registered", "Active", "Inactive"],
-                    "description": "Local lifecycle state to publish."
+                    "enum": ["Published", "Archived"],
+                    "description": "Initial context status to publish."
                 }
             },
-            "required": ["status"],
+            "required": ["title", "contents", "status"],
             "additionalProperties": false
         })
     }
@@ -78,7 +98,7 @@ impl Tool for ContextBookStatusSetTool {
             });
         }
 
-        let args: StatusSetArgs = match serde_json::from_value(args) {
+        let args: ContextCreateArgs = match serde_json::from_value(args) {
             Ok(args) => args,
             Err(error) => {
                 return Ok(ToolResult {
@@ -89,22 +109,26 @@ impl Tool for ContextBookStatusSetTool {
             }
         };
 
-        match self
-            .service
-            .set_local_status(args.status.into_lifecycle_state())
-            .await
-        {
-            Ok(agent) => Ok(ToolResult {
+        let request = ContextCreateRequest {
+            context_id: args.context_id,
+            title: args.title,
+            contents: args.contents,
+            tag: args.tag,
+            status: args.status.into_context_status(),
+        };
+
+        match self.service.create_local_context(&request).await {
+            Ok(context) => Ok(ToolResult {
                 success: true,
                 output: serde_json::to_string_pretty(&json!({
-                    "agent": agent,
+                    "context": context,
                 }))?,
                 error: None,
             }),
             Err(error) => Ok(ToolResult {
                 success: false,
                 output: String::new(),
-                error: Some(format!("Context Book status update failed: {error}")),
+                error: Some(format!("Context Book context create failed: {error}")),
             }),
         }
     }
@@ -113,12 +137,14 @@ impl Tool for ContextBookStatusSetTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::context_book::{AuthSessionDto, ContextBookStore, LocalIdentityRecord};
+    use crate::context_book::{AuthSessionDto, ContextBookStore};
     use tempfile::TempDir;
     use wiremock::matchers::{body_partial_json, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    fn temp_service(server: &MockServer) -> (TempDir, Arc<ContextBookService>) {
+    fn temp_service(
+        server: &MockServer,
+    ) -> (TempDir, Arc<ContextBookService>, Arc<ContextBookStore>) {
         let tmp = TempDir::new().expect("temp dir");
         let db_path = tmp
             .path()
@@ -126,18 +152,6 @@ mod tests {
             .join("context_book")
             .join("state.db");
         let store = Arc::new(ContextBookStore::open_at(&db_path).expect("open store"));
-        store
-            .save_local_identity(&LocalIdentityRecord {
-                agent_id: "agent-1".into(),
-                device_type: "notepc".into(),
-                display_name: "ZeroClaw Main".into(),
-                bootstrap_approved: true,
-                last_bootstrap_request_id: Some("req-1".into()),
-                last_bootstrap_approval_state: None,
-                last_bootstrap_completed_at: Some("2026-04-03T00:00:00Z".into()),
-                updated_at: "2026-04-03T00:00:00Z".into(),
-            })
-            .expect("save identity");
         store
             .save_auth_session(
                 &AuthSessionDto {
@@ -157,56 +171,74 @@ mod tests {
             serde_json::from_value(serde_json::to_value(&config).expect("serialize config"))
                 .expect("convert config");
 
-        let service =
-            Arc::new(ContextBookService::with_store(runtime_config, store).expect("service"));
-        (tmp, service)
+        let service = Arc::new(
+            ContextBookService::with_store(runtime_config, store.clone()).expect("service"),
+        );
+        (tmp, service, store)
     }
 
     #[tokio::test]
-    async fn updates_local_status_via_service() {
+    async fn creates_context_via_service_and_persists_mirror() {
         let server = MockServer::start().await;
-        Mock::given(method("PATCH"))
-            .and(path("/agents/agent-1/status"))
+        Mock::given(method("POST"))
+            .and(path("/contexts"))
             .and(header("authorization", "Bearer access-token"))
             .and(body_partial_json(json!({
-                "status": "Inactive"
+                "contextId": "ctx-1",
+                "title": "Daily Summary",
+                "contents": "Agent heartbeat summary",
+                "tag": "ops",
+                "status": "Published"
             })))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "agentId": "agent-1",
-                "deviceType": "notepc",
-                "displayName": "ZeroClaw Main",
-                "lifecycleState": "Inactive",
-                "connectionState": "Disconnected",
+                "contextId": "ctx-1",
+                "authorAgentId": "agent-1",
+                "title": "Daily Summary",
+                "contents": "Agent heartbeat summary",
+                "tag": "ops",
+                "status": "Published",
                 "createdAt": "2026-04-03T00:00:00Z",
                 "updatedAt": "2026-04-03T00:00:10Z"
             })))
             .mount(&server)
             .await;
 
-        let (_tmp, service) = temp_service(&server);
-        let tool = ContextBookStatusSetTool::new(service, Arc::new(SecurityPolicy::default()));
+        let (_tmp, service, store) = temp_service(&server);
+        let tool = ContextBookContextCreateTool::new(service, Arc::new(SecurityPolicy::default()));
 
         let result = tool
             .execute(json!({
-                "status": "Inactive"
+                "context_id": "ctx-1",
+                "title": "Daily Summary",
+                "contents": "Agent heartbeat summary",
+                "tag": "ops",
+                "status": "Published"
             }))
             .await
             .expect("execute tool");
 
         assert!(result.success);
-        assert!(result.output.contains("\"lifecycleState\": \"Inactive\""));
-        assert!(result.output.contains("\"agentId\": \"agent-1\""));
+        assert!(result.output.contains("\"contextId\": \"ctx-1\""));
+
+        let mirrored = store
+            .list_mirrored_contexts()
+            .expect("list mirrored contexts");
+        assert_eq!(mirrored.len(), 1);
+        assert_eq!(mirrored[0].context_id, "ctx-1");
+        assert_eq!(mirrored[0].status, ContextStatus::Published);
     }
 
     #[tokio::test]
-    async fn rejects_unknown_status_argument() {
+    async fn rejects_unknown_context_status_argument() {
         let server = MockServer::start().await;
-        let (_tmp, service) = temp_service(&server);
-        let tool = ContextBookStatusSetTool::new(service, Arc::new(SecurityPolicy::default()));
+        let (_tmp, service, _store) = temp_service(&server);
+        let tool = ContextBookContextCreateTool::new(service, Arc::new(SecurityPolicy::default()));
 
         let result = tool
             .execute(json!({
-                "status": "Unregistered"
+                "title": "Daily Summary",
+                "contents": "Agent heartbeat summary",
+                "status": "Draft"
             }))
             .await
             .expect("execute tool");

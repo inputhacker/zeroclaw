@@ -58,7 +58,8 @@ Important protocol rules:
 - A pending bootstrap request is not a lifecycle state.
 - First-time bootstrap starts with `POST /bootstrap/register/init`.
 - Compatibility bootstrap also exists at `POST /agents/register`.
-- Both bootstrap entrypoints require trusted-network access and
+- `POST /bootstrap/register/init`, `POST /agents/register`, and
+  `POST /agents/connect` all require trusted-network access and
   `X-Context-Book-Bootstrap-Secret`.
 - Approval wait is request-scoped, not runtime SSE:
   - `GET /bootstrap/requests/{requestId}`
@@ -70,6 +71,10 @@ Important protocol rules:
 - Existing identities reconnect through `POST /agents/connect`.
 - `POST /agents/connect` may also force the agent back through approval wait if
   earlier bootstrap approval was expired or revoked.
+- When a `Connect` request is pushed back into approval wait, the runtime must
+  support both completion styles described by the dashboard reference:
+  `POST /bootstrap/register/complete` and a retried legacy
+  `POST /agents/connect`.
 - `POST /auth/refresh` rotates the access token for long-running agents.
 
 ### 2. Runtime Delivery Preconditions
@@ -321,6 +326,14 @@ It is a daemon-owned coordination subsystem with tool-facing service methods.
 [`src/config/schema.rs`](./src/config/schema.rs)
 - add `[context_book]` config schema
 
+[`src/onboard/wizard.rs`](./src/onboard/wizard.rs)
+- ask for required Context Book settings during interactive onboarding when the
+  feature is enabled
+
+[`src/main.rs`](./src/main.rs)
+- ensure `zeroclaw onboard` and related setup entrypoints can populate Context
+  Book config without requiring later manual edits
+
 [`src/lib.rs`](./src/lib.rs)
 - export the new module
 
@@ -345,6 +358,10 @@ It is a daemon-owned coordination subsystem with tool-facing service methods.
 
 [`src/security/secrets.rs`](./src/security/secrets.rs)
 - reuse the existing `SecretStore` for session token persistence
+
+[`install.sh`](./install.sh)
+- keep Context Book support present in normal installs and pass required values
+  into onboarding when available
 
 [`docs/architecture/adr-004-tool-shared-state-ownership.md`](./docs/architecture/adr-004-tool-shared-state-ownership.md)
 - use the documented shared-handle ownership model
@@ -490,6 +507,14 @@ Notes:
 - request-status polling is the default approval wait path; bootstrap watch SSE
   is an internal alternate transport and does not need a separate user-facing
   config key in v1
+- onboarding should ask only for fields that are operationally required to make
+  the feature usable:
+  - `enabled`
+  - `base_url`
+  - `agent_id`
+  - `device_type`
+  - `display_name`
+  - `bootstrap_secret`
 - stream delivery plus polling fallback are required runtime behaviors when the
   integration is enabled, so they should not be split into extra feature toggles
 - no config field should be added unless it matches a real protocol need
@@ -524,7 +549,9 @@ This matches
 4. Wait for approval using `GET /bootstrap/requests/{requestId}` by default.
 5. After approval, call `POST /bootstrap/register/complete` and persist tokens.
 6. If identity exists but session is absent or reapproval is required, call
-   `POST /agents/connect` and follow the same wait/complete path if needed.
+   `POST /agents/connect` and, if approval wait is required, complete via either
+   `POST /bootstrap/register/complete` or a retried legacy
+   `POST /agents/connect` after approval.
 7. Refresh tokens via `POST /auth/refresh` before expiry.
 8. If configured, call `PATCH /agents/{agentId}/status` to set `Active`.
 9. Restore the required subscribe-all desired policy from local store; if no
@@ -716,6 +743,8 @@ Acceptance criteria:
 - restart does not create duplicate first-registration requests when a usable
   local identity already exists
 - approval state survives restart
+- a reapproval-required connect flow can finish through either of the two
+  completion styles documented by the dashboard reference
 - session refresh survives long-running daemon execution
 
 ### Session 5: Lifecycle Status and Desired Subscription Management
@@ -872,7 +901,39 @@ Acceptance criteria:
 - agent can inspect mirrored peer state explicitly
 - no remote peer state is auto-written into memory
 
-### Session 10: Daemon, Heartbeat, and Cron Integration
+### Session 10: Onboarding and Installer Integration
+
+Goal:
+
+- satisfy requirement 14 by wiring required configuration into onboarding and
+  standard install flows
+
+Primary modules:
+
+- [`src/onboard/wizard.rs`](./src/onboard/wizard.rs)
+- [`src/main.rs`](./src/main.rs)
+- [`install.sh`](./install.sh)
+- docs
+
+Responsibilities:
+
+- add onboarding prompts for required Context Book fields when the user enables
+  the feature
+- make non-interactive and installer-driven setup able to seed the same config
+  keys without inventing extra protocol fields
+- document which values are mandatory for first bootstrap vs optional tuning
+- ensure Context Book support ships as part of the normal ZeroClaw install
+  footprint rather than as a separate plugin or post-install add-on
+
+Acceptance criteria:
+
+- `zeroclaw onboard` can produce a valid `[context_book]` section without manual
+  follow-up edits when the user opts in
+- install/onboarding flows do not require dashboard-private routes or browser
+  participation
+- requirement 14 is met without adding speculative install-time feature flags
+
+### Session 11: Daemon, Heartbeat, and Cron Integration
 
 Goal:
 
@@ -898,7 +959,7 @@ Acceptance criteria:
 - enabled config starts a supervised Context Book worker
 - heartbeat and cron can read mirrored state only through explicit calls
 
-### Session 11: Observability, Diagnostics, and Documentation
+### Session 12: Observability, Diagnostics, and Documentation
 
 Goal:
 
@@ -941,6 +1002,7 @@ Implement sessions in this order:
 9. Session 9
 10. Session 10
 11. Session 11
+12. Session 12
 
 Rationale:
 
@@ -949,6 +1011,8 @@ Rationale:
 - bootstrap and session handling must work before runtime delivery is useful
 - transport and projection must exist before peer-state query tools
 - tool exposure should happen only after the service contract stabilizes
+- onboarding/install integration should happen after config and service
+  contracts stabilize, but before final operational hardening
 - observability should document the real operating model, not a speculative one
 
 ## Explicit Anti-Patterns
@@ -966,6 +1030,8 @@ Rationale:
 - Do not assume vote-derived fields are present in SSE payloads.
 - Do not ignore `409 CURSOR_NOT_FOUND`.
 - Do not auto-delete the local agent on shutdown.
+- Do not make Context Book support depend on a dashboard-only onboarding or
+  install path.
 
 ## Done Definition
 
@@ -989,5 +1055,7 @@ The integration is complete only when all of the following are true:
 - ZeroClaw can maintain accurate vote-derived fields through reconciliation.
 - Heartbeat, cron, and explicit tools can read mirrored peer state without
   memory blending.
+- ZeroClaw install and `zeroclaw onboard` can enable the feature and capture the
+  required config without dashboard-private steps or manual config surgery.
 - The entire subsystem can be disabled cleanly with zero runtime impact on
   existing behavior.

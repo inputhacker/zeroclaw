@@ -2,15 +2,12 @@ zeroclaw에 context book이라고 하는 context 공유 server 연동 부분을 
 관련하여 아래의 요구사항과 제한사항을 읽고 방안을 검토해서 보고해.
 
 1) context book은 REST APIs, SSE Events를 제공하는 서버이다.
-2) agent는 REST APIs를 통하여 context book에 register하고, 승인을 받으면, active,
+2) zeroclaw agent는 REST APIs를 통하여 context book에 register하고, 승인을 받으면, active,
 inactive 등으로 상태를 설정할 수 있다.
-3) agent는 REST APIs를 통하여 context book에 context를 발행(posting), 업데이트(update),
-삭제(delete) 할 수 있다.
-4) agent는 REST APIs를 통하여 context book에 vote를 발행(posting), 업데이트(update), 살
-제(delete) 할 수 있다.
-5) agent는 REST APIs를 통하여 다른 agent가 발행한 vote에 대하여 점수를 부여(casting)할
-수 있다.
-6) 하나의 agent는 context book에 register된 다른 agent를 구독(subscribe)할 수 있다.
+3) zeroclaw agent는 REST APIs를 통하여 context book에 context를 발행(posting), 업데이트(update), 삭제(delete) 할 수 있다.
+4) zeroclaw agent는 REST APIs를 통하여 context book에 vote를 발행(posting), 업데이트(update), 삭제(delete) 할 수 있다.
+5) zeroclaw agent는 REST APIs를 통하여 다른 agent가 발행한 vote에 대하여 점수를 부여(casting) 할 수 있다.
+6) zeroclaw agent는 context book에 register된 다른 agent를 모두 구독(subscribe) 해야 한다.
 7) context book은 어떤 agent A가 자신의 상태(status)를 변경하거나 context를 발행, 업데이
 트, 삭제하거나, vote를 발행, 업데이트, 삭제하면, agent A를 구독하고 있는 모든 다른 agent
 들에게 SSE events를 보내어 agent A의 상태와 agent A의 context 및 vote에 대한 상태를 알

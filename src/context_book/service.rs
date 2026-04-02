@@ -3,7 +3,7 @@ use crate::context_book::client::ContextBookClient;
 use crate::context_book::store::ContextBookStore;
 use crate::context_book::types::{
     AgentLifecycleState, AgentRecordDto, AgentStatusUpdateRequest, ContextCreateRequest,
-    ContextRecordDto,
+    ContextRecordDto, ContextUpdateRequest,
 };
 use anyhow::{Context, Result, anyhow};
 use std::sync::Arc;
@@ -158,6 +158,28 @@ impl ContextBookService {
             .context("failed to persist Context Book context delete result")?;
 
         Ok(())
+    }
+
+    pub async fn update_local_context(
+        &self,
+        context_id: &str,
+        request: &ContextUpdateRequest,
+    ) -> Result<ContextRecordDto> {
+        let (client, store) = self.operational_parts()?;
+        let session = store
+            .load_auth_session()?
+            .ok_or_else(|| anyhow!("Context Book auth session is not available"))?;
+
+        let context = client
+            .update_context(&session.access_token, context_id, request)
+            .await
+            .with_context(|| format!("failed to update Context Book context {context_id}"))?;
+
+        store
+            .upsert_mirrored_context(&context)
+            .context("failed to persist Context Book context update result")?;
+
+        Ok(context)
     }
 
     fn operational_parts(&self) -> Result<(&ContextBookClient, &Arc<ContextBookStore>)> {
@@ -422,5 +444,87 @@ mod tests {
             .list_mirrored_contexts()
             .expect("list mirrored contexts");
         assert!(mirrored.is_empty());
+    }
+
+    #[tokio::test]
+    async fn runtime_service_updates_context_and_persists_mirror() {
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path("/contexts/ctx-1"))
+            .and(header("authorization", "Bearer access-token"))
+            .and(body_partial_json(serde_json::json!({
+                "title": "Updated Summary",
+                "status": "Archived"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "contextId": "ctx-1",
+                "authorAgentId": "agent-1",
+                "title": "Updated Summary",
+                "contents": "Agent heartbeat summary",
+                "tag": "ops",
+                "status": "Archived",
+                "createdAt": "2026-04-03T00:00:00Z",
+                "updatedAt": "2026-04-03T00:00:30Z"
+            })))
+            .mount(&server)
+            .await;
+
+        let (_tmp, store) = temp_store();
+        store
+            .save_auth_session(
+                &AuthSessionDto {
+                    agent_id: "agent-1".into(),
+                    access_token: "access-token".into(),
+                    refresh_token: "refresh-token".into(),
+                    access_token_expires_at: "2026-04-04T00:00:00Z".into(),
+                },
+                "2026-04-03T00:00:00Z",
+            )
+            .expect("save session");
+        store
+            .upsert_mirrored_context(&ContextRecordDto {
+                context_id: "ctx-1".into(),
+                author_agent_id: "agent-1".into(),
+                title: "Daily Summary".into(),
+                contents: "Agent heartbeat summary".into(),
+                tag: Some("ops".into()),
+                status: crate::context_book::ContextStatus::Published,
+                created_at: "2026-04-03T00:00:00Z".into(),
+                updated_at: "2026-04-03T00:00:10Z".into(),
+            })
+            .expect("seed mirrored context");
+
+        let mut config = ContextBookConfig::default();
+        config.enabled = true;
+        config.base_url = server.uri();
+
+        let service = ContextBookService::with_store(config, store.clone()).expect("service");
+        let updated = service
+            .update_local_context(
+                "ctx-1",
+                &ContextUpdateRequest {
+                    title: Some("Updated Summary".into()),
+                    contents: None,
+                    tag: None,
+                    status: Some(crate::context_book::ContextStatus::Archived),
+                },
+            )
+            .await
+            .expect("update context");
+
+        assert_eq!(updated.context_id, "ctx-1");
+        assert_eq!(updated.title, "Updated Summary");
+        assert_eq!(updated.status, crate::context_book::ContextStatus::Archived);
+
+        let mirrored = store
+            .list_mirrored_contexts()
+            .expect("list mirrored contexts");
+        assert_eq!(mirrored.len(), 1);
+        assert_eq!(mirrored[0].context_id, "ctx-1");
+        assert_eq!(mirrored[0].title, "Updated Summary");
+        assert_eq!(
+            mirrored[0].status,
+            crate::context_book::ContextStatus::Archived
+        );
     }
 }

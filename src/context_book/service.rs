@@ -142,6 +142,24 @@ impl ContextBookService {
         Ok(context)
     }
 
+    pub async fn delete_local_context(&self, context_id: &str) -> Result<()> {
+        let (client, store) = self.operational_parts()?;
+        let session = store
+            .load_auth_session()?
+            .ok_or_else(|| anyhow!("Context Book auth session is not available"))?;
+
+        client
+            .delete_context(&session.access_token, context_id)
+            .await
+            .with_context(|| format!("failed to delete Context Book context {context_id}"))?;
+
+        store
+            .delete_mirrored_context(context_id)
+            .context("failed to persist Context Book context delete result")?;
+
+        Ok(())
+    }
+
     fn operational_parts(&self) -> Result<(&ContextBookClient, &Arc<ContextBookStore>)> {
         if !self.config().enabled {
             return Err(anyhow!("Context Book is disabled in config"));
@@ -353,5 +371,56 @@ mod tests {
         assert_eq!(mirrored.len(), 1);
         assert_eq!(mirrored[0].context_id, "ctx-1");
         assert_eq!(mirrored[0].author_agent_id, "agent-1");
+    }
+
+    #[tokio::test]
+    async fn runtime_service_deletes_context_and_removes_mirror() {
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(path("/contexts/ctx-1"))
+            .and(header("authorization", "Bearer access-token"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+
+        let (_tmp, store) = temp_store();
+        store
+            .save_auth_session(
+                &AuthSessionDto {
+                    agent_id: "agent-1".into(),
+                    access_token: "access-token".into(),
+                    refresh_token: "refresh-token".into(),
+                    access_token_expires_at: "2026-04-04T00:00:00Z".into(),
+                },
+                "2026-04-03T00:00:00Z",
+            )
+            .expect("save session");
+        store
+            .upsert_mirrored_context(&ContextRecordDto {
+                context_id: "ctx-1".into(),
+                author_agent_id: "agent-1".into(),
+                title: "Daily Summary".into(),
+                contents: "Agent heartbeat summary".into(),
+                tag: Some("ops".into()),
+                status: crate::context_book::ContextStatus::Published,
+                created_at: "2026-04-03T00:00:00Z".into(),
+                updated_at: "2026-04-03T00:00:10Z".into(),
+            })
+            .expect("seed mirrored context");
+
+        let mut config = ContextBookConfig::default();
+        config.enabled = true;
+        config.base_url = server.uri();
+
+        let service = ContextBookService::with_store(config, store.clone()).expect("service");
+        service
+            .delete_local_context("ctx-1")
+            .await
+            .expect("delete context");
+
+        let mirrored = store
+            .list_mirrored_contexts()
+            .expect("list mirrored contexts");
+        assert!(mirrored.is_empty());
     }
 }

@@ -31,6 +31,7 @@ pub mod codex_cli;
 pub mod composio;
 pub mod content_search;
 pub mod context_book_context_create;
+pub mod context_book_context_delete;
 pub mod context_book_query_agents;
 pub mod context_book_query_contexts;
 pub mod context_book_query_subscriptions;
@@ -134,6 +135,7 @@ pub use codex_cli::CodexCliTool;
 pub use composio::ComposioTool;
 pub use content_search::ContentSearchTool;
 pub use context_book_context_create::ContextBookContextCreateTool;
+pub use context_book_context_delete::ContextBookContextDeleteTool;
 pub use context_book_query_agents::ContextBookQueryAgentsTool;
 pub use context_book_query_contexts::ContextBookQueryContextsTool;
 pub use context_book_query_subscriptions::ContextBookQuerySubscriptionsTool;
@@ -570,6 +572,10 @@ pub fn all_tools_with_runtime(
                             Ok(service) => {
                                 let service = Arc::new(service);
                                 tool_arcs.push(Arc::new(ContextBookContextCreateTool::new(
+                                    service.clone(),
+                                    security.clone(),
+                                )));
+                                tool_arcs.push(Arc::new(ContextBookContextDeleteTool::new(
                                     service.clone(),
                                     security.clone(),
                                 )));
@@ -1547,6 +1553,7 @@ mod tests {
         );
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"context_book_context_create"));
+        assert!(names.contains(&"context_book_context_delete"));
         assert!(names.contains(&"context_book_query_agents"));
         assert!(names.contains(&"context_book_query_contexts"));
         assert!(names.contains(&"context_book_query_votes"));
@@ -1586,6 +1593,7 @@ mod tests {
         );
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(!names.contains(&"context_book_context_create"));
+        assert!(!names.contains(&"context_book_context_delete"));
         assert!(!names.contains(&"context_book_query_agents"));
         assert!(!names.contains(&"context_book_query_contexts"));
         assert!(!names.contains(&"context_book_query_votes"));

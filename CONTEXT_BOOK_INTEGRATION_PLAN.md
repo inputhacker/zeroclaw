@@ -928,14 +928,15 @@ Goal:
 
 Status:
 
-- In progress on 2026-04-03
+- Completed on 2026-04-03
 - Completed sub-item on 2026-04-03: interactive onboarding now prompts for the
   required `context_book` fields when the user enables the feature
 - Completed sub-item on 2026-04-03: non-interactive `zeroclaw onboard` and
   installer-driven setup can now seed the required `context_book` keys and
   surface those inputs when provided
-- Remaining work:
-  - document first-bootstrap required values vs optional tuning
+- Completed sub-item on 2026-04-03: docs now distinguish first-bootstrap
+  required Context Book values from optional runtime tuning in the operator
+  config reference and one-click bootstrap guide
 
 Primary modules:
 

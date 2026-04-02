@@ -249,6 +249,59 @@ allowed_tools = ["file_read", "shell"]
 skills_directory = "skills/code-review"
 ```
 
+## `[context_book]`
+
+Context Book stays fully disabled unless `enabled = true`.
+
+### First-bootstrap required values
+
+These are the minimum values needed to complete the first public agent bootstrap:
+
+| Key | Required for first bootstrap | Purpose |
+|---|---|---|
+| `enabled` | Yes | Turns on the dedicated Context Book runtime subsystem |
+| `base_url` | Yes | Base URL for the public agent-facing Context Book API |
+| `agent_id` | Yes | Stable local identity; serialized into bootstrap `agentName` and then reconciled with the canonical server-side `agentId` |
+| `device_type` | Yes | Declares the local device class for the agent record |
+| `display_name` | Yes | Human-readable label shown to operators |
+| `bootstrap_secret` | Yes | Trusted-network bootstrap secret required by `POST /bootstrap/register/init` and `POST /agents/connect` |
+
+Operational notes:
+
+- Use the public agent API base URL, not dashboard-private operator routes.
+- Interactive `zeroclaw onboard`, non-interactive `zeroclaw onboard`, and `./install.sh` accept the same five required Context Book inputs.
+- If any required value is missing, ZeroClaw should be left with `enabled = false` until the operator can provide a complete set.
+
+### Optional tuning
+
+These settings are not required to establish identity, approval, tokens, or the initial subscribe-all policy:
+
+| Key | Default | Purpose |
+|---|---|---|
+| `approval_poll_interval_secs` | `5` | Poll cadence for bootstrap approval status |
+| `event_poll_interval_secs` | `10` | Poll cadence for durable event fallback when SSE is unavailable |
+| `set_active_on_start` | `true` | Set local lifecycle to `Active` during startup |
+| `set_inactive_on_shutdown` | `true` | Set local lifecycle to `Inactive` during shutdown |
+| `disconnect_on_shutdown` | `true` | Disconnect the transport session during shutdown |
+| `rest_timeout_secs` | `15` | HTTP timeout for REST requests |
+| `stream_connect_timeout_secs` | `30` | Connect timeout when opening the runtime SSE stream |
+| `access_token_refresh_margin_secs` | `60` | Refresh lead time before access-token expiry |
+| `retry_initial_backoff_secs` | `5` | Initial retry delay for worker reconnect/backoff loops |
+| `retry_max_backoff_secs` | `60` | Maximum retry delay for worker reconnect/backoff loops |
+| `store_path` | `state/context_book/state.db` | Dedicated SQLite path for mirrored state and session metadata |
+
+Example:
+
+```toml
+[context_book]
+enabled = true
+base_url = "https://context-book.example"
+agent_id = "zeroclaw-main"
+device_type = "notepc"
+display_name = "ZeroClaw Main"
+bootstrap_secret = "super-secret"
+```
+
 ## `[runtime]`
 
 | Key | Default | Purpose |

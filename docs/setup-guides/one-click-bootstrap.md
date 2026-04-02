@@ -207,6 +207,46 @@ Or with environment variables:
 ZEROCLAW_API_KEY="sk-..." ZEROCLAW_PROVIDER="openrouter" ./install.sh
 ```
 
+### Quick onboarding with Context Book
+
+For first bootstrap, provide all required Context Book values together:
+
+```bash
+./install.sh \
+  --api-key "sk-..." \
+  --provider openrouter \
+  --context-book-base-url "https://context-book.example" \
+  --context-book-agent-id "zeroclaw-main" \
+  --context-book-device-type "notepc" \
+  --context-book-display-name "ZeroClaw Main" \
+  --context-book-bootstrap-secret "super-secret"
+```
+
+Environment-variable form:
+
+```bash
+ZEROCLAW_API_KEY="sk-..." \
+ZEROCLAW_PROVIDER="openrouter" \
+ZEROCLAW_CONTEXT_BOOK_BASE_URL="https://context-book.example" \
+ZEROCLAW_CONTEXT_BOOK_AGENT_ID="zeroclaw-main" \
+ZEROCLAW_CONTEXT_BOOK_DEVICE_TYPE="notepc" \
+ZEROCLAW_CONTEXT_BOOK_DISPLAY_NAME="ZeroClaw Main" \
+ZEROCLAW_CONTEXT_BOOK_BOOTSTRAP_SECRET="super-secret" \
+./install.sh
+```
+
+Required for first bootstrap:
+
+- `base_url`
+- `agent_id`
+- `device_type`
+- `display_name`
+- `bootstrap_secret`
+
+Optional tuning such as polling intervals, retry backoff, and store path can be
+adjusted later in `config.toml` after the initial approval and token exchange
+work once.
+
 ## Useful flags
 
 - `--install-system-deps`

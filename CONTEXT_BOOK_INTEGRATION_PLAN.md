@@ -899,6 +899,12 @@ Goal:
 
 - make remote peer state explicitly accessible without memory injection
 
+Status:
+
+- Completed sub-item on 2026-04-03: added a dedicated read-only query layer in
+  `src/context_book/query.rs` with bounded mirrored-agent/context/vote queries
+  and mirrored subscription snapshots backed by `src/context_book/store.rs`
+
 Primary modules:
 
 - `src/context_book/query.rs`

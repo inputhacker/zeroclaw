@@ -5,7 +5,8 @@ use crate::context_book::types::{
 };
 use anyhow::{Context, Result};
 use parking_lot::Mutex;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{params, Connection, OptionalExtension};
+use serde::de::DeserializeOwned;
 use std::path::{Path, PathBuf};
 
 const CONTEXT_BOOK_SCHEMA_VERSION: i64 = 1;
@@ -392,6 +393,75 @@ impl ContextBookStore {
         Ok(())
     }
 
+    pub fn list_mirrored_agents(&self) -> Result<Vec<AgentRecordDto>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT
+                    agent_id,
+                    device_type,
+                    display_name,
+                    lifecycle_state,
+                    connection_state,
+                    created_at,
+                    updated_at,
+                    last_seen_at
+                 FROM mirrored_agents
+                 ORDER BY updated_at DESC, agent_id ASC",
+            )
+            .context("failed to prepare mirrored agent query")?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                ))
+            })
+            .context("failed to query mirrored agents")?;
+
+        let rows = rows
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .context("failed to read mirrored agent rows")?;
+
+        rows.into_iter()
+            .map(
+                |(
+                    agent_id,
+                    device_type,
+                    display_name,
+                    lifecycle_state,
+                    connection_state,
+                    created_at,
+                    updated_at,
+                    last_seen_at,
+                )| {
+                    Ok(AgentRecordDto {
+                        agent_id,
+                        device_type,
+                        display_name,
+                        lifecycle_state: parse_json_column(
+                            lifecycle_state,
+                            "mirrored agent lifecycle_state",
+                        )?,
+                        connection_state: parse_json_column(
+                            connection_state,
+                            "mirrored agent connection_state",
+                        )?,
+                        created_at,
+                        updated_at,
+                        last_seen_at,
+                    })
+                },
+            )
+            .collect()
+    }
+
     pub fn upsert_mirrored_context(&self, context_record: &ContextRecordDto) -> Result<()> {
         let conn = self.conn.lock();
         conn.execute(
@@ -427,6 +497,69 @@ impl ContextBookStore {
         )
         .context("failed to upsert Context Book mirrored context")?;
         Ok(())
+    }
+
+    pub fn list_mirrored_contexts(&self) -> Result<Vec<ContextRecordDto>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT
+                    context_id,
+                    author_agent_id,
+                    title,
+                    contents,
+                    tag,
+                    status,
+                    created_at,
+                    updated_at
+                 FROM mirrored_contexts
+                 ORDER BY updated_at DESC, context_id ASC",
+            )
+            .context("failed to prepare mirrored context query")?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                ))
+            })
+            .context("failed to query mirrored contexts")?;
+
+        let rows = rows
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .context("failed to read mirrored context rows")?;
+
+        rows.into_iter()
+            .map(
+                |(
+                    context_id,
+                    author_agent_id,
+                    title,
+                    contents,
+                    tag,
+                    status,
+                    created_at,
+                    updated_at,
+                )| {
+                    Ok(ContextRecordDto {
+                        context_id,
+                        author_agent_id,
+                        title,
+                        contents,
+                        tag,
+                        status: parse_json_column(status, "mirrored context status")?,
+                        created_at,
+                        updated_at,
+                    })
+                },
+            )
+            .collect()
     }
 
     pub fn delete_mirrored_context(&self, context_id: &str) -> Result<()> {
@@ -484,6 +617,76 @@ impl ContextBookStore {
         )
         .context("failed to upsert Context Book mirrored vote")?;
         Ok(())
+    }
+
+    pub fn list_mirrored_votes(&self) -> Result<Vec<VoteRecordDto>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT
+                    vote_id,
+                    owner_agent_id,
+                    vote_score,
+                    vote_context,
+                    voter_agent_ids,
+                    required_score,
+                    executable,
+                    created_at,
+                    updated_at
+                 FROM mirrored_votes
+                 ORDER BY updated_at DESC, vote_id ASC",
+            )
+            .context("failed to prepare mirrored vote query")?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<f64>>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<f64>>(5)?,
+                    row.get::<_, Option<bool>>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, String>(8)?,
+                ))
+            })
+            .context("failed to query mirrored votes")?;
+
+        let rows = rows
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .context("failed to read mirrored vote rows")?;
+
+        rows.into_iter()
+            .map(
+                |(
+                    vote_id,
+                    owner_agent_id,
+                    vote_score,
+                    vote_context,
+                    voter_agent_ids,
+                    required_score,
+                    executable,
+                    created_at,
+                    updated_at,
+                )| {
+                    Ok(VoteRecordDto {
+                        vote_id,
+                        owner_agent_id,
+                        vote_score,
+                        vote_context,
+                        voter_agent_ids: parse_json_column(
+                            voter_agent_ids,
+                            "mirrored vote voter_agent_ids",
+                        )?,
+                        required_score,
+                        executable,
+                        created_at,
+                        updated_at,
+                    })
+                },
+            )
+            .collect()
     }
 
     pub fn delete_mirrored_vote(&self, vote_id: &str) -> Result<()> {
@@ -645,6 +848,13 @@ fn resolve_store_path(workspace_dir: &Path, store_path: &str) -> PathBuf {
     } else {
         workspace_dir.join(store_path)
     }
+}
+
+fn parse_json_column<T>(raw: String, column_name: &str) -> Result<T>
+where
+    T: DeserializeOwned,
+{
+    serde_json::from_str(&raw).with_context(|| format!("failed to decode {column_name}: {raw}"))
 }
 
 fn configure_connection(conn: &Connection) -> Result<()> {
@@ -935,11 +1145,9 @@ mod tests {
         };
 
         assert!(store.mark_event_processed(&entry).expect("first insert"));
-        assert!(
-            !store
-                .mark_event_processed(&entry)
-                .expect("duplicate insert")
-        );
+        assert!(!store
+            .mark_event_processed(&entry)
+            .expect("duplicate insert"));
         assert!(store.is_event_processed("evt-1").expect("event exists"));
         assert_eq!(store.event_journal_count().expect("journal count"), 1);
     }

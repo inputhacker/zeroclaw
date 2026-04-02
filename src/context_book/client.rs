@@ -7,10 +7,10 @@ use crate::context_book::types::{
     SubscriptionReplaceRequest, SubscriptionStateDto, VoteCastRequest, VoteCreateRequest,
     VoteRecordDto, VoteUpdateRequest,
 };
-use reqwest::header::{ACCEPT, HeaderValue};
+use reqwest::header::{HeaderValue, ACCEPT};
 use reqwest::{Client, Method, StatusCode, Url};
-use serde::Serialize;
 use serde::de::DeserializeOwned;
+use serde::Serialize;
 use std::time::Duration;
 use thiserror::Error;
 
@@ -921,10 +921,8 @@ mod tests {
 
         assert!(vote_json.contains("\"voteId\":\"vote-1\""));
         assert!(event_json.contains("\"eventType\":\"vote.updated\""));
-        assert!(
-            serde_json::to_string(&ContextStatus::Published)
-                .expect("serialize context status")
-                .contains("Published")
-        );
+        assert!(serde_json::to_string(&ContextStatus::Published)
+            .expect("serialize context status")
+            .contains("Published"));
     }
 }

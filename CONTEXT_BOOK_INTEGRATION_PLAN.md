@@ -701,6 +701,12 @@ Goal:
 
 - implement a typed client for the confirmed REST API surface
 
+Status:
+
+- Completed on 2026-04-02: typed `reqwest` client for bootstrap, connect,
+  refresh, agent/status, subscriptions, context CRUD, vote CRUD/cast, event
+  polling, and SSE stream-open requests landed with focused client tests.
+
 Primary modules:
 
 - `src/context_book/client.rs`

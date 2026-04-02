@@ -613,6 +613,8 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
             ));
         }
     }
+
+    check_context_book_semantics(config, items);
 }
 
 fn provider_validation_error(name: &str) -> Option<String> {
@@ -650,6 +652,137 @@ fn embedding_provider_validation_error(name: &str) -> Option<String> {
             parsed.scheme()
         )),
         Err(err) => Some(format!("invalid custom provider URL: {err}")),
+    }
+}
+
+fn check_context_book_semantics(config: &Config, items: &mut Vec<DiagItem>) {
+    let cat = "config";
+    let context_book = &config.context_book;
+
+    if !context_book.enabled {
+        items.push(DiagItem::ok(cat, "Context Book: disabled"));
+        return;
+    }
+
+    items.push(DiagItem::ok(cat, "Context Book: enabled"));
+
+    match validate_context_book_base_url(&context_book.base_url) {
+        Ok(url) => items.push(DiagItem::ok(cat, format!("Context Book base URL: {url}"))),
+        Err(reason) => items.push(DiagItem::error(
+            cat,
+            format!("Context Book base URL is invalid: {reason}"),
+        )),
+    }
+
+    for (label, value) in [
+        ("agent_id", context_book.agent_id.as_str()),
+        ("device_type", context_book.device_type.as_str()),
+        ("display_name", context_book.display_name.as_str()),
+        ("bootstrap_secret", context_book.bootstrap_secret.as_str()),
+    ] {
+        if value.trim().is_empty() {
+            items.push(DiagItem::error(
+                cat,
+                format!("Context Book {label} is required when enabled"),
+            ));
+        } else {
+            items.push(DiagItem::ok(
+                cat,
+                format!("Context Book {label}: configured"),
+            ));
+        }
+    }
+
+    for (label, value) in [
+        (
+            "approval_poll_interval_secs",
+            context_book.approval_poll_interval_secs,
+        ),
+        (
+            "event_poll_interval_secs",
+            context_book.event_poll_interval_secs,
+        ),
+        ("rest_timeout_secs", context_book.rest_timeout_secs),
+        (
+            "stream_connect_timeout_secs",
+            context_book.stream_connect_timeout_secs,
+        ),
+        (
+            "access_token_refresh_margin_secs",
+            context_book.access_token_refresh_margin_secs,
+        ),
+        (
+            "retry_initial_backoff_secs",
+            context_book.retry_initial_backoff_secs,
+        ),
+        (
+            "retry_max_backoff_secs",
+            context_book.retry_max_backoff_secs,
+        ),
+    ] {
+        if value == 0 {
+            items.push(DiagItem::error(
+                cat,
+                format!("Context Book {label} must be greater than 0"),
+            ));
+        }
+    }
+
+    if context_book.retry_max_backoff_secs < context_book.retry_initial_backoff_secs {
+        items.push(DiagItem::error(
+            cat,
+            format!(
+                "Context Book retry_max_backoff_secs ({}) must be >= retry_initial_backoff_secs ({})",
+                context_book.retry_max_backoff_secs, context_book.retry_initial_backoff_secs
+            ),
+        ));
+    } else {
+        items.push(DiagItem::ok(
+            cat,
+            format!(
+                "Context Book retry backoff: {}s..{}s",
+                context_book.retry_initial_backoff_secs, context_book.retry_max_backoff_secs
+            ),
+        ));
+    }
+
+    if context_book.store_path.trim().is_empty() {
+        items.push(DiagItem::error(
+            cat,
+            "Context Book store_path is required when enabled",
+        ));
+    } else {
+        let store_path =
+            resolve_context_book_store_path(&config.workspace_dir, &context_book.store_path);
+        items.push(DiagItem::ok(
+            cat,
+            format!("Context Book store path: {}", store_path.display()),
+        ));
+    }
+}
+
+fn validate_context_book_base_url(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("missing value".into());
+    }
+
+    match reqwest::Url::parse(trimmed) {
+        Ok(parsed) if matches!(parsed.scheme(), "http" | "https") => Ok(trimmed.to_string()),
+        Ok(parsed) => Err(format!(
+            "expected http/https URL, got '{}'",
+            parsed.scheme()
+        )),
+        Err(err) => Err(err.to_string()),
+    }
+}
+
+fn resolve_context_book_store_path(workspace_dir: &Path, store_path: &str) -> std::path::PathBuf {
+    let configured = std::path::PathBuf::from(store_path);
+    if configured.is_absolute() {
+        configured
+    } else {
+        workspace_dir.join(configured)
     }
 }
 
@@ -1260,12 +1393,10 @@ mod tests {
         let second = workspace_probe_path(tmp.path());
 
         assert_ne!(first, second);
-        assert!(
-            first
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with(".zeroclaw_doctor_probe_"))
-        );
+        assert!(first
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with(".zeroclaw_doctor_probe_")));
     }
 
     #[test]
@@ -1318,5 +1449,101 @@ mod tests {
         assert_eq!(agent_messages.len(), 2);
         assert!(agent_messages[0].contains("agent \"alpha\""));
         assert!(agent_messages[1].contains("agent \"zeta\""));
+    }
+
+    #[test]
+    fn context_book_disabled_reports_disabled_status() {
+        let config = Config::default();
+        let mut items = Vec::new();
+
+        check_config_semantics(&config, &mut items);
+
+        let item = items
+            .iter()
+            .find(|item| item.message == "Context Book: disabled")
+            .expect("disabled status item");
+        assert_eq!(item.severity, Severity::Ok);
+    }
+
+    #[test]
+    fn context_book_enabled_requires_protocol_fields() {
+        let mut config = Config::default();
+        config.context_book.enabled = true;
+        config.context_book.base_url = String::new();
+        config.context_book.agent_id = " ".into();
+        config.context_book.device_type = "\t".into();
+        config.context_book.display_name = "\n".into();
+        config.context_book.bootstrap_secret = String::new();
+        config.context_book.store_path = String::new();
+
+        let mut items = Vec::new();
+        check_config_semantics(&config, &mut items);
+
+        for expected in [
+            "Context Book base URL is invalid",
+            "Context Book agent_id is required when enabled",
+            "Context Book device_type is required when enabled",
+            "Context Book display_name is required when enabled",
+            "Context Book bootstrap_secret is required when enabled",
+            "Context Book store_path is required when enabled",
+        ] {
+            let item = items
+                .iter()
+                .find(|item| item.message.contains(expected))
+                .unwrap_or_else(|| {
+                    panic!("missing Context Book diagnostic containing '{expected}'")
+                });
+            assert_eq!(item.severity, Severity::Error);
+        }
+    }
+
+    #[test]
+    fn context_book_enabled_accepts_valid_readiness_config() {
+        let mut config = Config::default();
+        config.context_book.enabled = true;
+        config.context_book.base_url = "https://context-book.example".into();
+        config.context_book.agent_id = "zeroclaw-main".into();
+        config.context_book.device_type = "notepc".into();
+        config.context_book.display_name = "ZeroClaw Main".into();
+        config.context_book.bootstrap_secret = "super-secret".into();
+
+        let mut items = Vec::new();
+        check_config_semantics(&config, &mut items);
+
+        let enabled = items
+            .iter()
+            .find(|item| item.message == "Context Book: enabled")
+            .expect("enabled status item");
+        assert_eq!(enabled.severity, Severity::Ok);
+
+        let base_url = items
+            .iter()
+            .find(|item| item.message.contains("Context Book base URL"))
+            .expect("base URL item");
+        assert_eq!(base_url.severity, Severity::Ok);
+
+        let has_context_book_error = items.iter().any(|item| {
+            item.message.starts_with("Context Book") && item.severity == Severity::Error
+        });
+        assert!(!has_context_book_error);
+    }
+
+    #[test]
+    fn context_book_enabled_rejects_inverted_retry_backoff_range() {
+        let mut config = Config::default();
+        config.context_book.enabled = true;
+        config.context_book.base_url = "https://context-book.example".into();
+        config.context_book.bootstrap_secret = "super-secret".into();
+        config.context_book.retry_initial_backoff_secs = 30;
+        config.context_book.retry_max_backoff_secs = 5;
+
+        let mut items = Vec::new();
+        check_config_semantics(&config, &mut items);
+
+        let item = items
+            .iter()
+            .find(|item| item.message.contains("retry_max_backoff_secs"))
+            .expect("retry backoff item");
+        assert_eq!(item.severity, Severity::Error);
     }
 }

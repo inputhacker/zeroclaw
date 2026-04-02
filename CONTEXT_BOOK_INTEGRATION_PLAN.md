@@ -1005,6 +1005,14 @@ Goal:
 
 - make the subsystem operable and supportable
 
+Status:
+
+- In progress
+- Completed sub-item on 2026-04-03: added `zeroclaw doctor` Context Book
+  readiness checks for the enabled config path, covering required protocol
+  fields, base URL validation, retry/backoff sanity, and resolved store path
+  reporting
+
 Primary modules:
 
 - `src/context_book/worker.rs`

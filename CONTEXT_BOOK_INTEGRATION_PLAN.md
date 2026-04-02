@@ -670,6 +670,13 @@ Goal:
 
 - build the separate persistence layer required by requirement 13
 
+Status:
+
+- Completed on 2026-04-02: dedicated SQLite store, schema migration v1, and
+  idempotent helpers for local identity/session state, subscriptions, mirrored
+  state, stream cursor, event dedupe, and reconciliation queue landed with
+  focused store tests.
+
 Primary modules:
 
 - `src/context_book/store.rs`

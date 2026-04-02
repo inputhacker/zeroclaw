@@ -901,9 +901,13 @@ Goal:
 
 Status:
 
+- Completed on 2026-04-03
 - Completed sub-item on 2026-04-03: added a dedicated read-only query layer in
   `src/context_book/query.rs` with bounded mirrored-agent/context/vote queries
   and mirrored subscription snapshots backed by `src/context_book/store.rs`
+- Completed sub-item on 2026-04-03: registered dedicated read-only Context Book
+  query tools for mirrored agents, contexts, votes, and local
+  desired/effective subscriptions under `src/tools/`
 
 Primary modules:
 

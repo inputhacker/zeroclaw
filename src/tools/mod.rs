@@ -30,6 +30,10 @@ pub mod cloud_patterns;
 pub mod codex_cli;
 pub mod composio;
 pub mod content_search;
+pub mod context_book_query_agents;
+pub mod context_book_query_contexts;
+pub mod context_book_query_subscriptions;
+pub mod context_book_query_votes;
 pub mod cron_add;
 pub mod cron_list;
 pub mod cron_remove;
@@ -127,6 +131,10 @@ pub use cloud_patterns::CloudPatternsTool;
 pub use codex_cli::CodexCliTool;
 pub use composio::ComposioTool;
 pub use content_search::ContentSearchTool;
+pub use context_book_query_agents::ContextBookQueryAgentsTool;
+pub use context_book_query_contexts::ContextBookQueryContextsTool;
+pub use context_book_query_subscriptions::ContextBookQuerySubscriptionsTool;
+pub use context_book_query_votes::ContextBookQueryVotesTool;
 pub use cron_add::CronAddTool;
 pub use cron_list::CronListTool;
 pub use cron_remove::CronRemoveTool;
@@ -212,6 +220,7 @@ pub use web_search_tool::WebSearchTool;
 pub use workspace_tool::WorkspaceTool;
 
 use crate::config::{Config, DelegateAgentConfig};
+use crate::context_book::{ContextBookQuery, ContextBookStore};
 use crate::memory::Memory;
 use crate::runtime::{NativeRuntime, RuntimeAdapter};
 use crate::security::{SecurityPolicy, create_sandbox};
@@ -278,6 +287,18 @@ impl Tool for ArcDelegatingTool {
 
 fn boxed_registry_from_arcs(tools: Vec<Arc<dyn Tool>>) -> Vec<Box<dyn Tool>> {
     tools.into_iter().map(ArcDelegatingTool::boxed).collect()
+}
+
+fn resolve_context_book_store_path(
+    workspace_dir: &std::path::Path,
+    store_path: &str,
+) -> std::path::PathBuf {
+    let configured = std::path::PathBuf::from(store_path);
+    if configured.is_absolute() {
+        configured
+    } else {
+        workspace_dir.join(configured)
+    }
 }
 
 /// Create the default tool registry
@@ -501,6 +522,39 @@ pub fn all_tools_with_runtime(
             root_config.skills.open_skills_enabled,
             root_config.skills.open_skills_dir.clone(),
         )));
+    }
+
+    if root_config.context_book.enabled {
+        let db_path = resolve_context_book_store_path(
+            &root_config.workspace_dir,
+            &root_config.context_book.store_path,
+        );
+        match ContextBookStore::open_at(&db_path) {
+            Ok(store) => {
+                let context_book_query = Arc::new(ContextBookQuery::new(Arc::new(store)));
+                tool_arcs.push(Arc::new(ContextBookQueryAgentsTool::new(
+                    context_book_query.clone(),
+                    security.clone(),
+                )));
+                tool_arcs.push(Arc::new(ContextBookQueryContextsTool::new(
+                    context_book_query.clone(),
+                    security.clone(),
+                )));
+                tool_arcs.push(Arc::new(ContextBookQueryVotesTool::new(
+                    context_book_query.clone(),
+                    security.clone(),
+                )));
+                tool_arcs.push(Arc::new(ContextBookQuerySubscriptionsTool::new(
+                    context_book_query,
+                    security.clone(),
+                )));
+            }
+            Err(error) => {
+                tracing::warn!(
+                    "context_book query tools: failed to open dedicated store, skipping registration: {error}"
+                );
+            }
+        }
     }
 
     if browser_config.enabled {
@@ -1414,5 +1468,80 @@ mod tests {
         );
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(!names.contains(&"read_skill"));
+    }
+
+    #[test]
+    fn all_tools_registers_context_book_query_tools_when_enabled() {
+        let tmp = TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy::default());
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(crate::memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+
+        let browser = BrowserConfig::default();
+        let http = crate::config::HttpRequestConfig::default();
+        let mut cfg = test_config(&tmp);
+        cfg.context_book.enabled = true;
+
+        let (tools, _, _, _, _, _) = all_tools(
+            Arc::new(cfg.clone()),
+            &security,
+            mem,
+            None,
+            None,
+            &browser,
+            &http,
+            &crate::config::WebFetchConfig::default(),
+            tmp.path(),
+            &HashMap::new(),
+            None,
+            &cfg,
+            None,
+        );
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        assert!(names.contains(&"context_book_query_agents"));
+        assert!(names.contains(&"context_book_query_contexts"));
+        assert!(names.contains(&"context_book_query_votes"));
+        assert!(names.contains(&"context_book_query_subscriptions"));
+    }
+
+    #[test]
+    fn all_tools_skips_context_book_query_tools_when_disabled() {
+        let tmp = TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy::default());
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(crate::memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+
+        let browser = BrowserConfig::default();
+        let http = crate::config::HttpRequestConfig::default();
+        let cfg = test_config(&tmp);
+
+        let (tools, _, _, _, _, _) = all_tools(
+            Arc::new(cfg.clone()),
+            &security,
+            mem,
+            None,
+            None,
+            &browser,
+            &http,
+            &crate::config::WebFetchConfig::default(),
+            tmp.path(),
+            &HashMap::new(),
+            None,
+            &cfg,
+            None,
+        );
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        assert!(!names.contains(&"context_book_query_agents"));
+        assert!(!names.contains(&"context_book_query_contexts"));
+        assert!(!names.contains(&"context_book_query_votes"));
+        assert!(!names.contains(&"context_book_query_subscriptions"));
     }
 }

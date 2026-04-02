@@ -80,6 +80,9 @@ mod commands;
 mod rag {
     pub use zeroclaw::rag::*;
 }
+mod context_book {
+    pub use zeroclaw::context_book::*;
+}
 mod config;
 mod cost;
 mod cron;

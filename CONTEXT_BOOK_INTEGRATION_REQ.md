@@ -28,5 +28,6 @@ context book이 보내는 SSE events들을 받고, 처리할 수 있는 기능�
 cron등에 포함될 수 있는 task나 사용자의 요청에 의해서 agent의 status 변경, context/vote
 관련 내용 참조가 필요할 때, 참조할 수 있도록 해야 한다. 그리고 이전까지 수신한 내용과 이
 후에 수신은 내용들은 중복없이 처리될 수 있어야 한다.
+14) context book 연동 부분(구현)은 zeroclaw install시에 함께 설치되어야 하고, configuration측면에서 필수적으로 설정이 필요한 부분은 zeroclaw onboarding시에 질문을 통해 설정될 수 있어야 한다.
 
 위의 요구사항을 반영하여 context book 연동 구조를 검토해서 보고해.

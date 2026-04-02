@@ -6,9 +6,10 @@ use crate::config::schema::{
 #[cfg(feature = "channel-nostr")]
 use crate::config::schema::{NostrConfig, default_nostr_relays};
 use crate::config::{
-    AutonomyConfig, BrowserConfig, ChannelsConfig, ComposioConfig, Config, DiscordConfig,
-    HeartbeatConfig, IMessageConfig, LarkConfig, MatrixConfig, MemoryConfig, ObservabilityConfig,
-    RuntimeConfig, SecretsConfig, SlackConfig, StorageConfig, TelegramConfig, WebhookConfig,
+    AutonomyConfig, BrowserConfig, ChannelsConfig, ComposioConfig, Config, ContextBookConfig,
+    DiscordConfig, HeartbeatConfig, IMessageConfig, LarkConfig, MatrixConfig, MemoryConfig,
+    ObservabilityConfig, RuntimeConfig, SecretsConfig, SlackConfig, StorageConfig, TelegramConfig,
+    WebhookConfig,
 };
 use crate::hardware::{self, HardwareConfig};
 use crate::memory::{
@@ -91,7 +92,7 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
     );
     println!();
 
-    print_step(1, 9, "Workspace Setup");
+    print_step(1, 10, "Workspace Setup");
     let (workspace_dir, config_path) = setup_workspace().await?;
     match resolve_interactive_onboarding_mode(&config_path, force)? {
         InteractiveOnboardingMode::FullOnboarding => {}
@@ -100,28 +101,31 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
         }
     }
 
-    print_step(2, 9, "AI Provider & API Key");
+    print_step(2, 10, "AI Provider & API Key");
     let (provider, api_key, model, provider_api_url) = setup_provider(&workspace_dir).await?;
 
-    print_step(3, 9, "Channels (How You Talk to ZeroClaw)");
+    print_step(3, 10, "Channels (How You Talk to ZeroClaw)");
     let channels_config = setup_channels()?;
 
-    print_step(4, 9, "Tunnel (Expose to Internet)");
+    print_step(4, 10, "Tunnel (Expose to Internet)");
     let tunnel_config = setup_tunnel()?;
 
-    print_step(5, 9, "Tool Mode & Security");
+    print_step(5, 10, "Tool Mode & Security");
     let (composio_config, secrets_config) = setup_tool_mode()?;
 
-    print_step(6, 9, "Hardware (Physical World)");
+    print_step(6, 10, "Context Book (Optional Peer Runtime)");
+    let context_book_config = setup_context_book()?;
+
+    print_step(7, 10, "Hardware (Physical World)");
     let hardware_config = setup_hardware()?;
 
-    print_step(7, 9, "Memory Configuration");
+    print_step(8, 10, "Memory Configuration");
     let memory_config = setup_memory()?;
 
-    print_step(8, 9, "Project Context (Personalize Your Agent)");
+    print_step(9, 10, "Project Context (Personalize Your Agent)");
     let project_ctx = setup_project_context()?;
 
-    print_step(9, 9, "Workspace Files");
+    print_step(10, 10, "Workspace Files");
     scaffold_workspace(&workspace_dir, &project_ctx, &memory_config.backend).await?;
 
     // ── Build config ──
@@ -152,7 +156,7 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
         conversational_ai: crate::config::ConversationalAiConfig::default(),
         security: crate::config::SecurityConfig::default(),
         security_ops: crate::config::SecurityOpsConfig::default(),
-        context_book: crate::config::ContextBookConfig::default(),
+        context_book: context_book_config,
         runtime: RuntimeConfig::default(),
         reliability: crate::config::ReliabilityConfig::default(),
         scheduler: crate::config::schema::SchedulerConfig::default(),
@@ -3212,7 +3216,127 @@ fn setup_tool_mode() -> Result<(ComposioConfig, SecretsConfig)> {
     Ok((composio_config, secrets_config))
 }
 
-// ── Step 6: Hardware (Physical World) ───────────────────────────
+// ── Step 6: Context Book ────────────────────────────────────────
+
+fn setup_context_book() -> Result<ContextBookConfig> {
+    let defaults = ContextBookConfig::default();
+    let enabled = Confirm::new()
+        .with_prompt("  Enable Context Book integration?")
+        .default(false)
+        .interact()?;
+
+    if !enabled {
+        println!(
+            "  {} Context Book: {}",
+            style("✓").green().bold(),
+            style("disabled").dim()
+        );
+        return Ok(defaults);
+    }
+
+    print_bullet("Context Book uses the public agent REST/SSE API surface.");
+    print_bullet("You'll need a reachable base URL and the bootstrap secret.");
+
+    let base_url = prompt_required_text("  Base URL (e.g. https://context-book.example)")?;
+    let agent_id = prompt_text_with_default("  Agent ID", &defaults.agent_id)?;
+    let device_type = prompt_text_with_default("  Device type", &defaults.device_type)?;
+    let display_name = prompt_text_with_default("  Display name", &defaults.display_name)?;
+    let bootstrap_secret = prompt_required_secret("  Bootstrap secret")?;
+
+    println!(
+        "  {} Context Book: {} ({})",
+        style("✓").green().bold(),
+        style("enabled").green(),
+        style(&base_url).dim()
+    );
+
+    build_context_book_config(
+        &defaults,
+        &base_url,
+        &agent_id,
+        &device_type,
+        &display_name,
+        &bootstrap_secret,
+    )
+}
+
+fn prompt_text_with_default(prompt: &str, default: &str) -> Result<String> {
+    let value: String = Input::new()
+        .with_prompt(prompt)
+        .default(default.to_string())
+        .interact_text()?;
+    Ok(value.trim().to_string())
+}
+
+fn prompt_required_text(prompt: &str) -> Result<String> {
+    loop {
+        let value: String = Input::new().with_prompt(prompt).interact_text()?;
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            return Ok(trimmed.to_string());
+        }
+
+        println!("  {} This field is required.", style("!").yellow().bold());
+    }
+}
+
+fn prompt_required_secret(prompt: &str) -> Result<String> {
+    loop {
+        let value: String = dialoguer::Password::new()
+            .with_prompt(prompt)
+            .allow_empty_password(true)
+            .interact()?;
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            return Ok(trimmed.to_string());
+        }
+
+        println!("  {} This field is required.", style("!").yellow().bold());
+    }
+}
+
+fn build_context_book_config(
+    defaults: &ContextBookConfig,
+    base_url: &str,
+    agent_id: &str,
+    device_type: &str,
+    display_name: &str,
+    bootstrap_secret: &str,
+) -> Result<ContextBookConfig> {
+    let base_url = base_url.trim();
+    let agent_id = agent_id.trim();
+    let device_type = device_type.trim();
+    let display_name = display_name.trim();
+    let bootstrap_secret = bootstrap_secret.trim();
+
+    if base_url.is_empty() {
+        bail!("Context Book base URL is required when the integration is enabled.");
+    }
+    if agent_id.is_empty() {
+        bail!("Context Book agent ID is required when the integration is enabled.");
+    }
+    if device_type.is_empty() {
+        bail!("Context Book device type is required when the integration is enabled.");
+    }
+    if display_name.is_empty() {
+        bail!("Context Book display name is required when the integration is enabled.");
+    }
+    if bootstrap_secret.is_empty() {
+        bail!("Context Book bootstrap secret is required when the integration is enabled.");
+    }
+
+    Ok(ContextBookConfig {
+        enabled: true,
+        base_url: base_url.to_string(),
+        agent_id: agent_id.to_string(),
+        device_type: device_type.to_string(),
+        display_name: display_name.to_string(),
+        bootstrap_secret: bootstrap_secret.to_string(),
+        ..defaults.clone()
+    })
+}
+
+// ── Step 7: Hardware (Physical World) ───────────────────────────
 
 fn setup_hardware() -> Result<HardwareConfig> {
     print_bullet("ZeroClaw can talk to physical hardware (LEDs, sensors, motors).");
@@ -5899,6 +6023,19 @@ fn print_summary(config: &Config) {
 
     // Secrets
     println!("    {} Secrets:       configured", style("🔒").cyan());
+    println!(
+        "    {} Context Book:  {}",
+        style("📚").cyan(),
+        if config.context_book.enabled {
+            format!(
+                "{} ({})",
+                style("enabled").green(),
+                config.context_book.base_url
+            )
+        } else {
+            "disabled".to_string()
+        }
+    );
 
     // Gateway
     println!(
@@ -6145,6 +6282,56 @@ mod tests {
         );
         assert!(config.api_key.is_none());
         assert!(config.api_url.is_none());
+    }
+
+    #[test]
+    fn build_context_book_config_rejects_blank_required_fields() {
+        let defaults = ContextBookConfig::default();
+        let err = build_context_book_config(&defaults, "", "agent", "notepc", "ZeroClaw", "secret")
+            .expect_err("blank base URL should be rejected");
+        assert!(
+            err.to_string()
+                .contains("Context Book base URL is required")
+        );
+
+        let err = build_context_book_config(
+            &defaults,
+            "https://context-book.example",
+            "agent",
+            "notepc",
+            "ZeroClaw",
+            "",
+        )
+        .expect_err("blank bootstrap secret should be rejected");
+        assert!(
+            err.to_string()
+                .contains("Context Book bootstrap secret is required")
+        );
+    }
+
+    #[test]
+    fn build_context_book_config_trims_and_enables_settings() {
+        let defaults = ContextBookConfig::default();
+        let config = build_context_book_config(
+            &defaults,
+            " https://context-book.example ",
+            " zeroclaw-main ",
+            " notepc ",
+            " ZeroClaw Main ",
+            " super-secret ",
+        )
+        .expect("valid Context Book config should build");
+
+        assert!(config.enabled);
+        assert_eq!(config.base_url, "https://context-book.example");
+        assert_eq!(config.agent_id, "zeroclaw-main");
+        assert_eq!(config.device_type, "notepc");
+        assert_eq!(config.display_name, "ZeroClaw Main");
+        assert_eq!(config.bootstrap_secret, "super-secret");
+        assert_eq!(
+            config.approval_poll_interval_secs,
+            defaults.approval_poll_interval_secs
+        );
     }
 
     #[tokio::test]

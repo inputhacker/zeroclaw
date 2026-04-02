@@ -926,6 +926,16 @@ Goal:
 - satisfy requirement 14 by wiring required configuration into onboarding and
   standard install flows
 
+Status:
+
+- In progress on 2026-04-03
+- Completed sub-item on 2026-04-03: interactive onboarding now prompts for the
+  required `context_book` fields when the user enables the feature
+- Remaining work:
+  - make non-interactive and installer-driven setup seed the same keys
+  - document first-bootstrap required values vs optional tuning
+  - ensure installer flow surfaces Context Book inputs when provided
+
 Primary modules:
 
 - [`src/onboard/wizard.rs`](./src/onboard/wizard.rs)

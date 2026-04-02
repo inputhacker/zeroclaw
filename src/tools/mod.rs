@@ -34,6 +34,7 @@ pub mod context_book_query_agents;
 pub mod context_book_query_contexts;
 pub mod context_book_query_subscriptions;
 pub mod context_book_query_votes;
+pub mod context_book_status_set;
 pub mod cron_add;
 pub mod cron_list;
 pub mod cron_remove;
@@ -135,6 +136,7 @@ pub use context_book_query_agents::ContextBookQueryAgentsTool;
 pub use context_book_query_contexts::ContextBookQueryContextsTool;
 pub use context_book_query_subscriptions::ContextBookQuerySubscriptionsTool;
 pub use context_book_query_votes::ContextBookQueryVotesTool;
+pub use context_book_status_set::ContextBookStatusSetTool;
 pub use cron_add::CronAddTool;
 pub use cron_list::CronListTool;
 pub use cron_remove::CronRemoveTool;
@@ -220,7 +222,7 @@ pub use web_search_tool::WebSearchTool;
 pub use workspace_tool::WorkspaceTool;
 
 use crate::config::{Config, DelegateAgentConfig};
-use crate::context_book::{ContextBookQuery, ContextBookStore};
+use crate::context_book::{ContextBookQuery, ContextBookService, ContextBookStore};
 use crate::memory::Memory;
 use crate::runtime::{NativeRuntime, RuntimeAdapter};
 use crate::security::{SecurityPolicy, create_sandbox};
@@ -531,7 +533,8 @@ pub fn all_tools_with_runtime(
         );
         match ContextBookStore::open_at(&db_path) {
             Ok(store) => {
-                let context_book_query = Arc::new(ContextBookQuery::new(Arc::new(store)));
+                let store = Arc::new(store);
+                let context_book_query = Arc::new(ContextBookQuery::new(store.clone()));
                 tool_arcs.push(Arc::new(ContextBookQueryAgentsTool::new(
                     context_book_query.clone(),
                     security.clone(),
@@ -548,6 +551,19 @@ pub fn all_tools_with_runtime(
                     context_book_query,
                     security.clone(),
                 )));
+                match ContextBookService::with_store(root_config.context_book.clone(), store) {
+                    Ok(service) => {
+                        tool_arcs.push(Arc::new(ContextBookStatusSetTool::new(
+                            Arc::new(service),
+                            security.clone(),
+                        )));
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            "context_book status tool: failed to build runtime service, skipping registration: {error}"
+                        );
+                    }
+                }
             }
             Err(error) => {
                 tracing::warn!(
@@ -1485,6 +1501,7 @@ mod tests {
         let http = crate::config::HttpRequestConfig::default();
         let mut cfg = test_config(&tmp);
         cfg.context_book.enabled = true;
+        cfg.context_book.base_url = "https://context-book.example".into();
 
         let (tools, _, _, _, _, _) = all_tools(
             Arc::new(cfg.clone()),
@@ -1506,6 +1523,7 @@ mod tests {
         assert!(names.contains(&"context_book_query_contexts"));
         assert!(names.contains(&"context_book_query_votes"));
         assert!(names.contains(&"context_book_query_subscriptions"));
+        assert!(names.contains(&"context_book_status_set"));
     }
 
     #[test]
@@ -1543,5 +1561,6 @@ mod tests {
         assert!(!names.contains(&"context_book_query_contexts"));
         assert!(!names.contains(&"context_book_query_votes"));
         assert!(!names.contains(&"context_book_query_subscriptions"));
+        assert!(!names.contains(&"context_book_status_set"));
     }
 }

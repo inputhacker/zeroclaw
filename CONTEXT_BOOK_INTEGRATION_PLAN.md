@@ -862,6 +862,13 @@ Goal:
 
 - expose Context Book actions as explicit tools for the local agent
 
+Status:
+
+- In progress
+- Completed sub-item on 2026-04-03: added a service-backed
+  `context_book_status_set` tool that performs immediate REST status updates
+  and persists the confirmed agent record into the dedicated Context Book store
+
 Primary modules:
 
 - [`src/tools/mod.rs`](./src/tools/mod.rs)

@@ -1,10 +1,15 @@
 use crate::config::ContextBookConfig;
+use crate::context_book::client::ContextBookClient;
+use crate::context_book::store::ContextBookStore;
+use crate::context_book::types::{AgentLifecycleState, AgentRecordDto, AgentStatusUpdateRequest};
+use anyhow::{Context, Result, anyhow};
 use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContextBookServiceMode {
     Disabled,
     EnabledPlaceholder,
+    EnabledRuntime,
 }
 
 #[derive(Debug, Clone)]
@@ -16,6 +21,8 @@ pub struct ContextBookService {
 struct ContextBookServiceState {
     config: ContextBookConfig,
     mode: ContextBookServiceMode,
+    client: Option<ContextBookClient>,
+    store: Option<Arc<ContextBookStore>>,
 }
 
 impl ContextBookService {
@@ -27,11 +34,31 @@ impl ContextBookService {
         }
     }
 
+    pub fn with_store(config: ContextBookConfig, store: Arc<ContextBookStore>) -> Result<Self> {
+        if !config.enabled {
+            return Ok(Self::disabled(config));
+        }
+
+        let client = ContextBookClient::new(&config)
+            .context("failed to build Context Book service client")?;
+
+        Ok(Self {
+            inner: Arc::new(ContextBookServiceState {
+                config,
+                mode: ContextBookServiceMode::EnabledRuntime,
+                client: Some(client),
+                store: Some(store),
+            }),
+        })
+    }
+
     pub fn disabled(config: ContextBookConfig) -> Self {
         Self {
             inner: Arc::new(ContextBookServiceState {
                 config,
                 mode: ContextBookServiceMode::Disabled,
+                client: None,
+                store: None,
             }),
         }
     }
@@ -41,6 +68,8 @@ impl ContextBookService {
             inner: Arc::new(ContextBookServiceState {
                 config,
                 mode: ContextBookServiceMode::EnabledPlaceholder,
+                client: None,
+                store: None,
             }),
         }
     }
@@ -50,11 +79,58 @@ impl ContextBookService {
     }
 
     pub fn is_enabled(&self) -> bool {
-        self.mode() == ContextBookServiceMode::EnabledPlaceholder
+        self.mode() != ContextBookServiceMode::Disabled
+    }
+
+    pub fn is_operational(&self) -> bool {
+        self.mode() == ContextBookServiceMode::EnabledRuntime
     }
 
     pub fn config(&self) -> &ContextBookConfig {
         &self.inner.config
+    }
+
+    pub async fn set_local_status(&self, status: AgentLifecycleState) -> Result<AgentRecordDto> {
+        let (client, store) = self.operational_parts()?;
+        let session = store
+            .load_auth_session()?
+            .ok_or_else(|| anyhow!("Context Book auth session is not available"))?;
+        let local_agent_id = store
+            .load_local_identity()?
+            .map(|identity| identity.agent_id)
+            .unwrap_or_else(|| session.agent_id.clone());
+
+        let agent = client
+            .update_agent_status(
+                &session.access_token,
+                &local_agent_id,
+                &AgentStatusUpdateRequest { status },
+            )
+            .await
+            .with_context(|| {
+                format!("failed to update Context Book agent status for {local_agent_id}")
+            })?;
+
+        store
+            .upsert_mirrored_agent(&agent)
+            .context("failed to persist Context Book status update result")?;
+
+        Ok(agent)
+    }
+
+    fn operational_parts(&self) -> Result<(&ContextBookClient, &Arc<ContextBookStore>)> {
+        if !self.config().enabled {
+            return Err(anyhow!("Context Book is disabled in config"));
+        }
+
+        let client = self.inner.client.as_ref().ok_or_else(|| {
+            anyhow!("Context Book service is enabled in config but not wired for runtime actions")
+        })?;
+        let store = self.inner.store.as_ref().ok_or_else(|| {
+            anyhow!("Context Book service is enabled in config but no dedicated store is attached")
+        })?;
+
+        Ok((client, store))
     }
 }
 
@@ -67,6 +143,22 @@ impl Default for ContextBookService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::context_book::store::LocalIdentityRecord;
+    use crate::context_book::types::{AuthSessionDto, TransportConnectionState};
+    use tempfile::TempDir;
+    use wiremock::matchers::{body_partial_json, header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn temp_store() -> (TempDir, Arc<ContextBookStore>) {
+        let tmp = TempDir::new().expect("temp dir");
+        let db_path = tmp
+            .path()
+            .join("state")
+            .join("context_book")
+            .join("state.db");
+        let store = Arc::new(ContextBookStore::open_at(&db_path).expect("open store"));
+        (tmp, store)
+    }
 
     #[test]
     fn default_service_is_disabled_noop() {
@@ -74,6 +166,7 @@ mod tests {
 
         assert_eq!(service.mode(), ContextBookServiceMode::Disabled);
         assert!(!service.is_enabled());
+        assert!(!service.is_operational());
     }
 
     #[test]
@@ -85,6 +178,93 @@ mod tests {
 
         assert_eq!(service.mode(), ContextBookServiceMode::EnabledPlaceholder);
         assert!(service.is_enabled());
+        assert!(!service.is_operational());
         assert_eq!(service.config().agent_id, config.agent_id);
+    }
+
+    #[tokio::test]
+    async fn runtime_service_updates_status_and_persists_mirror() {
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path("/agents/agent-1/status"))
+            .and(header("authorization", "Bearer access-token"))
+            .and(body_partial_json(serde_json::json!({
+                "status": "Active"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "agentId": "agent-1",
+                "deviceType": "notepc",
+                "displayName": "ZeroClaw Main",
+                "lifecycleState": "Active",
+                "connectionState": "Connected",
+                "createdAt": "2026-04-03T00:00:00Z",
+                "updatedAt": "2026-04-03T00:00:10Z",
+                "lastSeenAt": "2026-04-03T00:00:10Z"
+            })))
+            .mount(&server)
+            .await;
+
+        let (_tmp, store) = temp_store();
+        store
+            .save_local_identity(&LocalIdentityRecord {
+                agent_id: "agent-1".into(),
+                device_type: "notepc".into(),
+                display_name: "ZeroClaw Main".into(),
+                bootstrap_approved: true,
+                last_bootstrap_request_id: Some("req-1".into()),
+                last_bootstrap_approval_state: None,
+                last_bootstrap_completed_at: Some("2026-04-03T00:00:00Z".into()),
+                updated_at: "2026-04-03T00:00:00Z".into(),
+            })
+            .expect("save identity");
+        store
+            .save_auth_session(
+                &AuthSessionDto {
+                    agent_id: "agent-1".into(),
+                    access_token: "access-token".into(),
+                    refresh_token: "refresh-token".into(),
+                    access_token_expires_at: "2026-04-04T00:00:00Z".into(),
+                },
+                "2026-04-03T00:00:00Z",
+            )
+            .expect("save session");
+
+        let mut config = ContextBookConfig::default();
+        config.enabled = true;
+        config.base_url = server.uri();
+
+        let service = ContextBookService::with_store(config, store.clone()).expect("service");
+        let updated = service
+            .set_local_status(AgentLifecycleState::Active)
+            .await
+            .expect("set status");
+
+        assert_eq!(service.mode(), ContextBookServiceMode::EnabledRuntime);
+        assert!(service.is_operational());
+        assert_eq!(updated.agent_id, "agent-1");
+        assert_eq!(updated.lifecycle_state, AgentLifecycleState::Active);
+
+        let mirrored = store.list_mirrored_agents().expect("list mirrored agents");
+        assert_eq!(mirrored.len(), 1);
+        assert_eq!(mirrored[0].lifecycle_state, AgentLifecycleState::Active);
+        assert_eq!(
+            mirrored[0].connection_state,
+            TransportConnectionState::Connected
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_service_requires_saved_auth_session() {
+        let (_tmp, store) = temp_store();
+        let mut config = ContextBookConfig::default();
+        config.enabled = true;
+
+        let service = ContextBookService::with_store(config, store).expect("service");
+        let error = service
+            .set_local_status(AgentLifecycleState::Active)
+            .await
+            .expect_err("missing session should fail");
+
+        assert!(error.to_string().contains("auth session"));
     }
 }

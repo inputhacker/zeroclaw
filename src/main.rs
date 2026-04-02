@@ -192,6 +192,26 @@ enum Commands {
         #[arg(long)]
         memory: Option<String>,
 
+        /// Context Book base URL for non-interactive setup
+        #[arg(long)]
+        context_book_base_url: Option<String>,
+
+        /// Context Book agent ID override for non-interactive setup
+        #[arg(long)]
+        context_book_agent_id: Option<String>,
+
+        /// Context Book device type override for non-interactive setup
+        #[arg(long)]
+        context_book_device_type: Option<String>,
+
+        /// Context Book display name override for non-interactive setup
+        #[arg(long)]
+        context_book_display_name: Option<String>,
+
+        /// Context Book bootstrap secret for non-interactive setup
+        #[arg(long)]
+        context_book_bootstrap_secret: Option<String>,
+
         /// Skip interactive prompts and use quick setup with defaults
         #[arg(long)]
         quick: bool,
@@ -872,6 +892,11 @@ async fn main() -> Result<()> {
         provider,
         model,
         memory,
+        context_book_base_url,
+        context_book_agent_id,
+        context_book_device_type,
+        context_book_display_name,
+        context_book_bootstrap_secret,
         quick,
     } = &cli.command
     {
@@ -882,15 +907,29 @@ async fn main() -> Result<()> {
         let provider = provider.clone();
         let model = model.clone();
         let memory = memory.clone();
+        let context_book_base_url = context_book_base_url.clone();
+        let context_book_agent_id = context_book_agent_id.clone();
+        let context_book_device_type = context_book_device_type.clone();
+        let context_book_display_name = context_book_display_name.clone();
+        let context_book_bootstrap_secret = context_book_bootstrap_secret.clone();
         let quick = *quick;
+        let has_context_book_flags = context_book_base_url.is_some()
+            || context_book_agent_id.is_some()
+            || context_book_device_type.is_some()
+            || context_book_display_name.is_some()
+            || context_book_bootstrap_secret.is_some();
 
         if reinit && channels_only {
             bail!("--reinit and --channels-only cannot be used together");
         }
         if channels_only
-            && (api_key.is_some() || provider.is_some() || model.is_some() || memory.is_some())
+            && (api_key.is_some()
+                || provider.is_some()
+                || model.is_some()
+                || memory.is_some()
+                || has_context_book_flags)
         {
-            bail!("--channels-only does not accept --api-key, --provider, --model, or --memory");
+            bail!("--channels-only does not accept provider or Context Book quick-setup flags");
         }
         if channels_only && force {
             bail!("--channels-only does not accept --force");
@@ -942,8 +981,11 @@ async fn main() -> Result<()> {
 
         // Auto-detect: run the interactive wizard when in a TTY with no
         // provider flags, quick setup otherwise (scriptable path).
-        let has_provider_flags =
-            api_key.is_some() || provider.is_some() || model.is_some() || memory.is_some();
+        let has_provider_flags = api_key.is_some()
+            || provider.is_some()
+            || model.is_some()
+            || memory.is_some()
+            || has_context_book_flags;
         let is_tty = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
         let env_interactive = std::env::var("ZEROCLAW_INTERACTIVE").as_deref() == Ok("1");
 
@@ -955,6 +997,13 @@ async fn main() -> Result<()> {
                 provider.as_deref(),
                 model.as_deref(),
                 memory.as_deref(),
+                onboard::QuickSetupContextBookOverrides {
+                    base_url: context_book_base_url.as_deref(),
+                    agent_id: context_book_agent_id.as_deref(),
+                    device_type: context_book_device_type.as_deref(),
+                    display_name: context_book_display_name.as_deref(),
+                    bootstrap_secret: context_book_bootstrap_secret.as_deref(),
+                },
                 force,
             ))
             .await
@@ -966,6 +1015,13 @@ async fn main() -> Result<()> {
                 provider.as_deref(),
                 model.as_deref(),
                 memory.as_deref(),
+                onboard::QuickSetupContextBookOverrides {
+                    base_url: context_book_base_url.as_deref(),
+                    agent_id: context_book_agent_id.as_deref(),
+                    device_type: context_book_device_type.as_deref(),
+                    display_name: context_book_display_name.as_deref(),
+                    bootstrap_secret: context_book_bootstrap_secret.as_deref(),
+                },
                 force,
             ))
             .await
@@ -2641,6 +2697,25 @@ mod tests {
     }
 
     #[test]
+    fn onboard_help_includes_context_book_base_url_flag() {
+        let cmd = Cli::command();
+        let onboard = cmd
+            .get_subcommands()
+            .find(|subcommand| subcommand.get_name() == "onboard")
+            .expect("onboard subcommand must exist");
+
+        let has_context_book_flag = onboard.get_arguments().any(|arg| {
+            arg.get_id().as_str() == "context_book_base_url"
+                && arg.get_long() == Some("context-book-base-url")
+        });
+
+        assert!(
+            has_context_book_flag,
+            "onboard help should include --context-book-base-url for quick setup"
+        );
+    }
+
+    #[test]
     fn onboard_cli_accepts_model_provider_and_api_key_in_quick_mode() {
         let cli = Cli::try_parse_from([
             "zeroclaw",
@@ -2668,6 +2743,53 @@ mod tests {
                 assert_eq!(provider.as_deref(), Some("openrouter"));
                 assert_eq!(model.as_deref(), Some("custom-model-946"));
                 assert_eq!(api_key.as_deref(), Some("sk-issue946"));
+            }
+            other => panic!("expected onboard command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn onboard_cli_accepts_context_book_quick_setup_flags() {
+        let cli = Cli::try_parse_from([
+            "zeroclaw",
+            "onboard",
+            "--provider",
+            "openrouter",
+            "--context-book-base-url",
+            "https://context-book.example",
+            "--context-book-agent-id",
+            "zeroclaw-main",
+            "--context-book-device-type",
+            "notepc",
+            "--context-book-display-name",
+            "ZeroClaw Main",
+            "--context-book-bootstrap-secret",
+            "super-secret",
+        ])
+        .expect("context book quick onboard invocation should parse");
+
+        match cli.command {
+            Commands::Onboard {
+                provider,
+                context_book_base_url,
+                context_book_agent_id,
+                context_book_device_type,
+                context_book_display_name,
+                context_book_bootstrap_secret,
+                ..
+            } => {
+                assert_eq!(provider.as_deref(), Some("openrouter"));
+                assert_eq!(
+                    context_book_base_url.as_deref(),
+                    Some("https://context-book.example")
+                );
+                assert_eq!(context_book_agent_id.as_deref(), Some("zeroclaw-main"));
+                assert_eq!(context_book_device_type.as_deref(), Some("notepc"));
+                assert_eq!(context_book_display_name.as_deref(), Some("ZeroClaw Main"));
+                assert_eq!(
+                    context_book_bootstrap_secret.as_deref(),
+                    Some("super-secret")
+                );
             }
             other => panic!("expected onboard command, got {other:?}"),
         }

@@ -460,6 +460,7 @@ pub async fn run_quick_setup(
     provider: Option<&str>,
     model_override: Option<&str>,
     memory_backend: Option<&str>,
+    context_book: QuickSetupContextBookOverrides<'_>,
     force: bool,
 ) -> Result<Config> {
     let home = directories::UserDirs::new()
@@ -471,10 +472,20 @@ pub async fn run_quick_setup(
         provider,
         model_override,
         memory_backend,
+        context_book,
         force,
         &home,
     ))
     .await
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct QuickSetupContextBookOverrides<'a> {
+    pub base_url: Option<&'a str>,
+    pub agent_id: Option<&'a str>,
+    pub device_type: Option<&'a str>,
+    pub display_name: Option<&'a str>,
+    pub bootstrap_secret: Option<&'a str>,
 }
 
 fn resolve_quick_setup_dirs_with_home(home: &Path) -> (PathBuf, PathBuf) {
@@ -547,6 +558,7 @@ async fn run_quick_setup_with_home(
     provider: Option<&str>,
     model_override: Option<&str>,
     memory_backend: Option<&str>,
+    context_book: QuickSetupContextBookOverrides<'_>,
     force: bool,
     home: &Path,
 ) -> Result<Config> {
@@ -574,6 +586,14 @@ async fn run_quick_setup_with_home(
     let memory_backend_name = memory_backend
         .unwrap_or(default_memory_backend_key())
         .to_string();
+    let context_book_config = build_quick_setup_context_book_config(
+        &crate::config::ContextBookConfig::default(),
+        context_book.base_url,
+        context_book.agent_id,
+        context_book.device_type,
+        context_book.display_name,
+        context_book.bootstrap_secret,
+    )?;
 
     // Create memory config based on backend choice
     let memory_config = memory_config_defaults_for_backend(&memory_backend_name);
@@ -604,7 +624,7 @@ async fn run_quick_setup_with_home(
         conversational_ai: crate::config::ConversationalAiConfig::default(),
         security: crate::config::SecurityConfig::default(),
         security_ops: crate::config::SecurityOpsConfig::default(),
-        context_book: crate::config::ContextBookConfig::default(),
+        context_book: context_book_config.clone(),
         runtime: RuntimeConfig::default(),
         reliability: crate::config::ReliabilityConfig::default(),
         scheduler: crate::config::schema::SchedulerConfig::default(),
@@ -740,6 +760,15 @@ async fn run_quick_setup_with_home(
         "  {} Composio:   {}",
         style("✓").green().bold(),
         style("disabled (sovereign mode)").dim()
+    );
+    println!(
+        "  {} Context Book: {}",
+        style("✓").green().bold(),
+        if context_book_config.enabled {
+            style(format!("enabled ({})", context_book_config.base_url)).green()
+        } else {
+            style("disabled".to_string()).dim()
+        }
     );
     println!();
     println!(
@@ -3334,6 +3363,34 @@ fn build_context_book_config(
         bootstrap_secret: bootstrap_secret.to_string(),
         ..defaults.clone()
     })
+}
+
+fn build_quick_setup_context_book_config(
+    defaults: &ContextBookConfig,
+    base_url: Option<&str>,
+    agent_id: Option<&str>,
+    device_type: Option<&str>,
+    display_name: Option<&str>,
+    bootstrap_secret: Option<&str>,
+) -> Result<ContextBookConfig> {
+    let has_context_book_input = base_url.is_some()
+        || agent_id.is_some()
+        || device_type.is_some()
+        || display_name.is_some()
+        || bootstrap_secret.is_some();
+
+    if !has_context_book_input {
+        return Ok(defaults.clone());
+    }
+
+    build_context_book_config(
+        defaults,
+        base_url.unwrap_or_default(),
+        agent_id.unwrap_or(defaults.agent_id.as_str()),
+        device_type.unwrap_or(defaults.device_type.as_str()),
+        display_name.unwrap_or(defaults.display_name.as_str()),
+        bootstrap_secret.unwrap_or_default(),
+    )
 }
 
 // ── Step 7: Hardware (Physical World) ───────────────────────────
@@ -6346,6 +6403,7 @@ mod tests {
             Some("openrouter"),
             Some("custom-model-946"),
             Some("sqlite"),
+            QuickSetupContextBookOverrides::default(),
             false,
             tmp.path(),
         ))
@@ -6373,6 +6431,7 @@ mod tests {
             Some("anthropic"),
             None,
             Some("sqlite"),
+            QuickSetupContextBookOverrides::default(),
             false,
             tmp.path(),
         ))
@@ -6403,6 +6462,7 @@ mod tests {
             Some("openrouter"),
             Some("custom-model"),
             Some("sqlite"),
+            QuickSetupContextBookOverrides::default(),
             false,
             tmp.path(),
         ))
@@ -6436,6 +6496,7 @@ mod tests {
             Some("openrouter"),
             Some("custom-model-fresh"),
             Some("sqlite"),
+            QuickSetupContextBookOverrides::default(),
             true,
             tmp.path(),
         ))
@@ -6470,6 +6531,7 @@ mod tests {
             Some("openrouter"),
             Some("model-env"),
             Some("sqlite"),
+            QuickSetupContextBookOverrides::default(),
             false,
             tmp.path(),
         ))
@@ -6478,6 +6540,45 @@ mod tests {
 
         assert_eq!(config.workspace_dir, workspace_dir);
         assert_eq!(config.config_path, expected_config_path);
+    }
+
+    #[tokio::test]
+    async fn quick_setup_context_book_overrides_enable_config() {
+        let _env_guard = env_lock().lock().await;
+        let _workspace_env = EnvVarGuard::unset("ZEROCLAW_WORKSPACE");
+        let _config_env = EnvVarGuard::unset("ZEROCLAW_CONFIG_DIR");
+        let tmp = TempDir::new().unwrap();
+
+        let config = Box::pin(run_quick_setup_with_home(
+            Some("sk-context-book"),
+            Some("openrouter"),
+            None,
+            Some("sqlite"),
+            QuickSetupContextBookOverrides {
+                base_url: Some("https://context-book.example"),
+                agent_id: Some("zeroclaw-main"),
+                device_type: Some("notepc"),
+                display_name: Some("ZeroClaw Main"),
+                bootstrap_secret: Some("super-secret"),
+            },
+            false,
+            tmp.path(),
+        ))
+        .await
+        .expect("quick setup should accept context book overrides");
+
+        assert!(config.context_book.enabled);
+        assert_eq!(config.context_book.base_url, "https://context-book.example");
+        assert_eq!(config.context_book.agent_id, "zeroclaw-main");
+        assert_eq!(config.context_book.device_type, "notepc");
+        assert_eq!(config.context_book.display_name, "ZeroClaw Main");
+        assert_eq!(config.context_book.bootstrap_secret, "super-secret");
+
+        let config_raw = tokio::fs::read_to_string(config.config_path).await.unwrap();
+        assert!(config_raw.contains("[context_book]"));
+        assert!(config_raw.contains("enabled = true"));
+        assert!(config_raw.contains("base_url = \"https://context-book.example\""));
+        assert!(config_raw.contains("agent_id = \"zeroclaw-main\""));
     }
 
     #[test]

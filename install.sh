@@ -109,6 +109,16 @@ Options:
   --api-key <key>            API key (skips interactive prompt)
   --provider <id>            Provider (default: openrouter)
   --model <id>               Model (optional)
+  --context-book-base-url <url>
+                             Context Book base URL for non-interactive setup
+  --context-book-agent-id <id>
+                             Context Book agent ID override
+  --context-book-device-type <type>
+                             Context Book device type override
+  --context-book-display-name <name>
+                             Context Book display name override
+  --context-book-bootstrap-secret <secret>
+                             Context Book bootstrap secret for non-interactive setup
   --cargo-features <list>    Extra cargo features (comma/space separated)
   --skip-onboard             Skip provider/API key configuration
   --skip-build               Skip build step
@@ -139,6 +149,16 @@ Environment:
   ZEROCLAW_API_KEY           Used when --api-key is not provided
   ZEROCLAW_PROVIDER          Used when --provider is not provided (default: openrouter)
   ZEROCLAW_MODEL             Used when --model is not provided
+  ZEROCLAW_CONTEXT_BOOK_BASE_URL
+                            Context Book base URL for scripted onboarding
+  ZEROCLAW_CONTEXT_BOOK_AGENT_ID
+                            Context Book agent ID override for scripted onboarding
+  ZEROCLAW_CONTEXT_BOOK_DEVICE_TYPE
+                            Context Book device type override for scripted onboarding
+  ZEROCLAW_CONTEXT_BOOK_DISPLAY_NAME
+                            Context Book display name override for scripted onboarding
+  ZEROCLAW_CONTEXT_BOOK_BOOTSTRAP_SECRET
+                            Context Book bootstrap secret for scripted onboarding
   ZEROCLAW_CARGO_FEATURES    Extra cargo features for source builds (comma/space separated)
   ZEROCLAW_BOOTSTRAP_MIN_RAM_MB   Minimum RAM threshold for source build preflight (default: 2048)
   ZEROCLAW_BOOTSTRAP_MIN_DISK_MB  Minimum free disk threshold for source build preflight (default: 6144)
@@ -991,6 +1011,26 @@ You are **${agent_name}**. Built in Rust. 3MB binary. Zero bloat.
   unset -f _write_if_missing
 }
 
+append_context_book_onboard_args() {
+  local -n cmd_ref="$1"
+
+  if [[ -n "${CONTEXT_BOOK_BASE_URL:-}" ]]; then
+    cmd_ref+=(--context-book-base-url "$CONTEXT_BOOK_BASE_URL")
+  fi
+  if [[ -n "${CONTEXT_BOOK_AGENT_ID:-}" ]]; then
+    cmd_ref+=(--context-book-agent-id "$CONTEXT_BOOK_AGENT_ID")
+  fi
+  if [[ -n "${CONTEXT_BOOK_DEVICE_TYPE:-}" ]]; then
+    cmd_ref+=(--context-book-device-type "$CONTEXT_BOOK_DEVICE_TYPE")
+  fi
+  if [[ -n "${CONTEXT_BOOK_DISPLAY_NAME:-}" ]]; then
+    cmd_ref+=(--context-book-display-name "$CONTEXT_BOOK_DISPLAY_NAME")
+  fi
+  if [[ -n "${CONTEXT_BOOK_BOOTSTRAP_SECRET:-}" ]]; then
+    cmd_ref+=(--context-book-bootstrap-secret "$CONTEXT_BOOK_BOOTSTRAP_SECRET")
+  fi
+}
+
 _is_wsl() {
   # Detect Windows Subsystem for Linux (WSL)
   # WSL typically has microsoft-standard or microsoft in the kernel release
@@ -1114,9 +1154,11 @@ run_docker_bootstrap() {
     if [[ -n "$MODEL" ]]; then
       onboard_cmd+=(--model "$MODEL")
     fi
+    append_context_book_onboard_args onboard_cmd
   else
     info "Launching setup in container"
     onboard_cmd=(onboard --provider "$PROVIDER")
+    append_context_book_onboard_args onboard_cmd
   fi
 
   if [[ ${#onboard_cmd[@]} -gt 0 ]]; then
@@ -1162,6 +1204,11 @@ CONTAINER_CLI="${ZEROCLAW_CONTAINER_CLI:-docker}"
 API_KEY="${ZEROCLAW_API_KEY:-}"
 PROVIDER="${ZEROCLAW_PROVIDER:-openrouter}"
 MODEL="${ZEROCLAW_MODEL:-}"
+CONTEXT_BOOK_BASE_URL="${ZEROCLAW_CONTEXT_BOOK_BASE_URL:-}"
+CONTEXT_BOOK_AGENT_ID="${ZEROCLAW_CONTEXT_BOOK_AGENT_ID:-}"
+CONTEXT_BOOK_DEVICE_TYPE="${ZEROCLAW_CONTEXT_BOOK_DEVICE_TYPE:-}"
+CONTEXT_BOOK_DISPLAY_NAME="${ZEROCLAW_CONTEXT_BOOK_DISPLAY_NAME:-}"
+CONTEXT_BOOK_BOOTSTRAP_SECRET="${ZEROCLAW_CONTEXT_BOOK_BOOTSTRAP_SECRET:-}"
 CARGO_FEATURES_INPUT="${ZEROCLAW_CARGO_FEATURES:-}"
 CARGO_NO_DEFAULT_FEATURES=false
 CARGO_FEATURES_CSV=""
@@ -1225,6 +1272,46 @@ while [[ $# -gt 0 ]]; do
       MODEL="${2:-}"
       [[ -n "$MODEL" ]] || {
         error "--model requires a value"
+        exit 1
+      }
+      shift 2
+      ;;
+    --context-book-base-url)
+      CONTEXT_BOOK_BASE_URL="${2:-}"
+      [[ -n "$CONTEXT_BOOK_BASE_URL" ]] || {
+        error "--context-book-base-url requires a value"
+        exit 1
+      }
+      shift 2
+      ;;
+    --context-book-agent-id)
+      CONTEXT_BOOK_AGENT_ID="${2:-}"
+      [[ -n "$CONTEXT_BOOK_AGENT_ID" ]] || {
+        error "--context-book-agent-id requires a value"
+        exit 1
+      }
+      shift 2
+      ;;
+    --context-book-device-type)
+      CONTEXT_BOOK_DEVICE_TYPE="${2:-}"
+      [[ -n "$CONTEXT_BOOK_DEVICE_TYPE" ]] || {
+        error "--context-book-device-type requires a value"
+        exit 1
+      }
+      shift 2
+      ;;
+    --context-book-display-name)
+      CONTEXT_BOOK_DISPLAY_NAME="${2:-}"
+      [[ -n "$CONTEXT_BOOK_DISPLAY_NAME" ]] || {
+        error "--context-book-display-name requires a value"
+        exit 1
+      }
+      shift 2
+      ;;
+    --context-book-bootstrap-secret)
+      CONTEXT_BOOK_BOOTSTRAP_SECRET="${2:-}"
+      [[ -n "$CONTEXT_BOOK_BOOTSTRAP_SECRET" ]] || {
+        error "--context-book-bootstrap-secret requires a value"
         exit 1
       }
       shift 2
@@ -1678,6 +1765,7 @@ if [[ "$SKIP_ONBOARD" == false && -n "$ZEROCLAW_BIN" ]]; then
     if [[ -n "$MODEL" ]]; then
       ONBOARD_CMD+=(--model "$MODEL")
     fi
+    append_context_book_onboard_args ONBOARD_CMD
     if "${ONBOARD_CMD[@]}" 2>/dev/null; then
       step_ok "Provider configured"
     else
@@ -1685,14 +1773,28 @@ if [[ "$SKIP_ONBOARD" == false && -n "$ZEROCLAW_BIN" ]]; then
     fi
   elif [[ "$PROVIDER" == "ollama" ]]; then
     step_dot "Configuring Ollama (no API key needed)"
-    if "$ZEROCLAW_BIN" onboard --provider ollama 2>/dev/null; then
+    ONBOARD_CMD=("$ZEROCLAW_BIN" onboard --provider ollama)
+    append_context_book_onboard_args ONBOARD_CMD
+    if "${ONBOARD_CMD[@]}" 2>/dev/null; then
       step_ok "Ollama configured"
     else
       step_fail "Ollama configuration failed — run zeroclaw onboard to retry"
     fi
   else
+    if [[ -n "$CONTEXT_BOOK_BASE_URL" || -n "$CONTEXT_BOOK_AGENT_ID" || -n "$CONTEXT_BOOK_DEVICE_TYPE" || -n "$CONTEXT_BOOK_DISPLAY_NAME" || -n "$CONTEXT_BOOK_BOOTSTRAP_SECRET" ]]; then
+      step_dot "Configuring provider defaults and Context Book"
+      ONBOARD_CMD=("$ZEROCLAW_BIN" onboard --provider "$PROVIDER")
+      if [[ -n "$MODEL" ]]; then
+        ONBOARD_CMD+=(--model "$MODEL")
+      fi
+      append_context_book_onboard_args ONBOARD_CMD
+      if "${ONBOARD_CMD[@]}" 2>/dev/null; then
+        step_ok "Provider defaults and Context Book configured"
+      else
+        step_fail "Provider/Context Book configuration failed — run zeroclaw onboard to retry"
+      fi
     # No API key and not ollama — prompt inline if interactive, skip otherwise
-    if [[ -t 0 && -t 1 ]]; then
+    elif [[ -t 0 && -t 1 ]]; then
       prompt_provider
       prompt_api_key
       if [[ -n "$API_KEY" ]]; then
@@ -1700,6 +1802,7 @@ if [[ "$SKIP_ONBOARD" == false && -n "$ZEROCLAW_BIN" ]]; then
         if [[ -n "$MODEL" ]]; then
           ONBOARD_CMD+=(--model "$MODEL")
         fi
+        append_context_book_onboard_args ONBOARD_CMD
         if "${ONBOARD_CMD[@]}" 2>/dev/null; then
           step_ok "Provider configured"
         else
